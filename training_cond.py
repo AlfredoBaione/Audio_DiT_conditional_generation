@@ -54,6 +54,13 @@ if os.path.isdir(_IRCAM_LOCAL):
     os.environ["HOME"] = _IRCAM_LOCAL
     os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_IRCAM_LOCAL, ".cache"))
 
+# 3. IRCAM: force transformers to use the PyTorch backend only. Without this,
+#    `transformers` (pulled in via metrics.py -> FAD / laion_clap and via
+#    conditions.py) tries to import TensorFlow from the tf2.18 base and
+#    crashes on protobuf. Must be set BEFORE importing torch/transformers.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
 import copy
 import argparse
 from datetime import datetime

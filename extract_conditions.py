@@ -28,6 +28,15 @@ Uso:
     python extract_conditions.py dataset_ready --force    # ricalcola tutto
 """
 
+# IRCAM: force transformers to use the PyTorch backend only. Without this,
+# `transformers` (pulled in via conditions.py -> laion_clap / FAD) tries to
+# import TensorFlow from the tf2.18 base and crashes on protobuf. Must be set
+# BEFORE any transformers import.
+import os
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
+
 import argparse
 import tempfile
 from pathlib import Path
