@@ -51,8 +51,10 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 #    untouched and DAC uses the platform default cache location.
 _IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
 if os.path.isdir(_IRCAM_LOCAL):
+    _cache = os.path.join(_IRCAM_LOCAL, ".cache")
     os.environ["HOME"] = _IRCAM_LOCAL
-    os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_IRCAM_LOCAL, ".cache"))
+    os.environ.setdefault("XDG_CACHE_HOME", _cache)
+    os.environ.setdefault("HF_HOME", os.path.join(_cache, "huggingface"))
 
 # 3. IRCAM: force transformers to use the PyTorch backend only. Without this,
 #    `transformers` (pulled in via metrics.py -> FAD / laion_clap and via
