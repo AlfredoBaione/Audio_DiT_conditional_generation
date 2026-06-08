@@ -1,0 +1,158 @@
+# requirements_ircam.txt  (conditioned Audio DiT, IRCAM Linux)
+# ---------------------------------------------------------------
+# Generated from the Windows venv freeze (requirements_venv312.txt),
+# converted UTF-16 -> UTF-8, with the three +cu128 torch wheels REMOVED.
+#
+# INSTALL ORDER (do NOT pip install this file before torch):
+#   1) conda activate tf2.18
+#   2) python -m venv --system-site-packages /data/anasynth_nonbp/baione/envs/genaudio_cond_env
+#      source /data/anasynth_nonbp/baione/envs/genaudio_cond_env/bin/activate
+#   3) install torch/vision/audio for the MACHINE you are on, e.g.
+#        chichibu (CUDA 13.x):  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+#        gaogu/gudi (CUDA 12.x): pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#   4) pip install -r requirements_ircam.txt
+#
+# NOTE on numpy: this freeze pins numpy==2.4.3, while the UNCONDITIONAL env
+# used numpy<2. Verify DAC/encodec/numba import cleanly here before any long
+# job:  python -c "import numpy, dac, encodec, basic_pitch; print(numpy.__version__)"
+# If something breaks, downgrade with: pip install "numpy<2"
+# ---------------------------------------------------------------
+
+﻿absl-py==2.4.0
+annotated-doc==0.0.4
+annotated-types==0.7.0
+antlr4-python3-runtime==4.9.3
+anyio==4.13.0
+argbind==0.3.9
+asttokens==3.0.1
+audioop-lts==0.2.2
+audioread==3.1.0
+braceexpand==0.1.7
+certifi==2026.2.25
+cffi==2.0.0
+charset-normalizer==3.4.6
+click==8.3.3
+colorama==0.4.6
+contourpy==1.3.3
+cycler==0.12.1
+decorator==5.2.1
+descript-audio-codec==1.0.0
+descript-audiotools==0.7.2
+docstring_parser==0.17.0
+einops==0.8.2
+encodec==0.1.1
+executing==2.2.1
+ffmpy==1.0.0
+filelock==3.25.2
+fire==0.7.1
+flatten-dict==0.4.2
+fonttools==4.62.1
+frechet_audio_distance==0.3.4
+fsspec==2026.2.0
+ftfy==6.3.1
+gitdb==4.0.12
+GitPython==3.1.47
+grpcio==1.78.0
+h11==0.16.0
+h5py==3.16.0
+hf-xet==1.4.3
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.12.0
+idna==3.11
+importlib_resources==6.5.2
+ipython==9.11.0
+ipython_pygments_lexers==1.1.1
+jedi==0.19.2
+Jinja2==3.1.6
+joblib==1.5.3
+julius==0.2.7
+kiwisolver==1.5.0
+laion_clap==1.1.5
+lazy-loader==0.5
+librosa==0.11.0
+llvmlite==0.46.0
+Markdown==3.10.2
+markdown-it-py==4.0.0
+markdown2==2.5.5
+MarkupSafe==3.0.3
+matplotlib==3.10.8
+matplotlib-inline==0.2.1
+mdurl==0.1.2
+mpmath==1.3.0
+msgpack==1.1.2
+networkx==3.6.1
+numba==0.64.0
+numpy==2.4.3
+omegaconf==2.3.0
+packaging==26.0
+pandas==3.0.2
+parso==0.8.6
+pillow==12.1.1
+platformdirs==4.9.4
+pooch==1.9.0
+progressbar==2.5
+prompt_toolkit==3.0.52
+protobuf==7.34.1
+pure_eval==0.2.3
+pycparser==3.0
+pydantic==2.13.3
+pydantic_core==2.46.3
+Pygments==2.19.2
+pyloudnorm==0.2.0
+pyparsing==3.3.2
+pystoi==0.4.1
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+randomname==0.2.1
+regex==2026.4.4
+requests==2.32.5
+resampy==0.4.3
+rich==14.3.3
+safetensors==0.7.0
+scikit-learn==1.8.0
+scipy==1.17.1
+sentence-transformers==5.4.1
+sentry-sdk==2.58.0
+setuptools==69.0.3
+shellingham==1.5.4
+six==1.17.0
+smmap==5.0.3
+soundfile==0.13.1
+soxr==1.0.0
+stack-data==0.6.3
+standard-aifc==3.13.0
+standard-chunk==3.13.0
+standard-sunau==3.13.0
+sympy==1.14.0
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
+termcolor==3.3.0
+threadpoolctl==3.6.0
+tokenizers==0.22.2
+torch-stoi==0.2.3
+torchcrepe==0.0.24
+torchlibrosa==0.1.0
+tqdm==4.67.3
+traitlets==5.14.3
+transformers==5.6.2
+typer==0.25.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+tzdata==2026.2
+urllib3==2.6.3
+wandb==0.26.1
+wcwidth==0.6.0
+webdataset==1.0.2
+Werkzeug==3.1.6
+wget==3.2
+
+# ---------------------------------------------------------------
+# Condition-extraction deps MISSING from the Windows freeze but
+# IMPORTED by conditions.py / condition_metrics.py. Left unpinned so
+# pip resolves versions compatible with the torch/numpy above.
+# ---------------------------------------------------------------
+basic-pitch            # melody (note posteriorgram) -- conditions.py
+onnxruntime            # basic-pitch backend on Linux/Py>=3.11 (avoids pulling TensorFlow)
+beat_this              # rhythm (beat + downbeat) -- conditions.py
+mir_eval               # melody RPA/RCA -- condition_metrics.py

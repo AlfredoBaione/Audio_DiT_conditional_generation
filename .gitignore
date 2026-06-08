@@ -1,0 +1,37 @@
+# ---- Runtime outputs (never commit; they live on local disk anyway) ----
+runs/
+runs_cond/
+cache/
+cache_cond/
+*.pt
+*.pth
+*.ckpt
+
+# ---- Datasets / latents / conditions / audio ----
+dataset_ready*/
+raw_audio/
+image_dataset*/
+*.npy
+*.npz
+*.wav
+*.flac
+*.mp3
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+env/
+venv/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+
+# ---- Logs / TensorBoard ----
+events.out.tfevents.*
+*.log
+wandb/
