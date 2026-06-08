@@ -1,22 +1,22 @@
 # audio_dataset_cond.py
 #
-# Dataset condizionato multi-modale per il training del ConditionedAudioDiT.
+# Multi-modal conditioned dataset for training the ConditionedAudioDiT.
 #
-# Carica per ogni sample:
-#   - frames:       (n_frames, 1024)  latenti DAC normalizzate
-#   - frame_conds:  {melody, chroma, rhythm, ...} condizioni pre-estratte
-#   - label_idx:    int                 indice classe
-#   - text_emb:     (text_dim,)         embedding sentence-transformer (pre-calcolato)
-#   - image_emb:    (image_dim,)        embedding CLIP (pre-calcolato)
+# Loads for each sample:
+#   - frames:       (n_frames, 1024)  normalized DAC latents
+#   - frame_conds:  {melody, chroma, rhythm, ...} pre-extracted conditions
+#   - label_idx:    int                 class index
+#   - text_emb:     (text_dim,)         sentence-transformer embedding (pre-computed)
+#   - image_emb:    (image_dim,)        CLIP embedding (pre-computed)
 #
-# Text e image embeddings vengono pre-calcolati all'init.
-# Condizioni frame-level vengono caricate da .npz come abbiamo già fatto.
+# Text and image embeddings are pre-computed at init.
+# Frame-level conditions are loaded from .npz.
 #
-# Compatibile con la nuova struttura:
+# Compatible with the dataset structure:
 #   dataset_root/
 #       latents/train|val|test/class/*.npy
-#       wav/val|test/class/*.wav              ← per FAD
-#       conditions/train|val|test/class/*.npz ← melody, chroma, rhythm, ...
+#       wav/train|val|test/class/*.wav         <- val/test used for FAD
+#       conditions/train|val|test/class/*.npz  <- melody, chroma, rhythm, ...
 
 import random
 from pathlib import Path
@@ -42,14 +42,14 @@ from conditions import (
 
 class ConditionedAudioDataset(Dataset):
     """
-    Dataset multi-modale per training condizionato.
+    Multi-modal dataset for conditioned training.
 
-    Per ogni sample restituisce:
+    For each sample returns:
         frames:      (n_frames, 1024)
-        frame_conds: Dict[str, Tensor] — es. {"melody": (n_frames, 88), "chroma": (n_frames, 12), "rhythm": (n_frames, 2)}
+        frame_conds: Dict[str, Tensor] — e.g. {"melody": (n_frames, 88), "chroma": (n_frames, 12), "rhythm": (n_frames, 2)}
         label_idx:   int
-        text_emb:    (text_dim,) — embedding del nome classe
-        image_emb:   (image_dim,) — embedding immagine random della classe
+        text_emb:    (text_dim,) — embedding of the class name
+        image_emb:   (image_dim,) — random image embedding of the class
     """
 
     def __init__(
@@ -83,17 +83,17 @@ class ConditionedAudioDataset(Dataset):
 
         self._scan()
 
-        # Cache dei latenti in fp16
+        # Latent cache in fp16
         self._latent_cache: dict = {}
         if preload_latents:
             self._preload_latents()
 
-        # Pre-calcolo embedding testuali (uno per classe)
+        # Pre-compute text embeddings (one per class)
         self._text_embeddings: Dict[str, np.ndarray] = {}
         self._text_dim: int = 0
         self._precompute_text_embeddings()
 
-        # Pre-calcolo embedding immagini (N per classe, scelta random al getitem)
+        # Pre-compute image embeddings (N per class, random choice at getitem)
         self._image_embeddings: Dict[str, List[np.ndarray]] = {}
         self._image_dim: int = 0
         self._precompute_image_embeddings()
@@ -121,12 +121,12 @@ class ConditionedAudioDataset(Dataset):
                 if f.suffix.lower() in SUPPORTED_EXTS:
                     z = np.load(str(f), mmap_mode='r')
                     return z.shape[1]
-        raise FileNotFoundError(f"Nessun .npy in {split_dir}")
+        raise FileNotFoundError(f"No .npy in {split_dir}")
 
     def _scan(self):
         split_dir = self.latent_root / self.split
         if not split_dir.exists():
-            raise FileNotFoundError(f"Non trovata: {split_dir}")
+            raise FileNotFoundError(f"Not found: {split_dir}")
 
         self._actual_file_frames = self._detect_file_frames(split_dir)
 
@@ -138,11 +138,11 @@ class ConditionedAudioDataset(Dataset):
         n_chunks_ref = self._actual_file_frames // self.n_frames
         if n_chunks_ref == 0:
             raise ValueError(
-                f"File ha {self._actual_file_frames} frame, "
-                f"duration_s={self.duration_s}s richiede {self.n_frames} frame"
+                f"File has {self._actual_file_frames} frames, "
+                f"duration_s={self.duration_s}s requires {self.n_frames} frames"
             )
 
-        # Scan per-file: controlla lunghezza reale di ogni file
+        # Per-file scan: check the actual length of each file
         n_files_total = 0
         n_files_short = 0
 
@@ -155,7 +155,7 @@ class ConditionedAudioDataset(Dataset):
                     continue
                 n_files_total += 1
 
-                # Leggi solo lo shape senza caricare in RAM
+                # Read only the shape without loading into RAM
                 try:
                     file_frames = np.load(str(f), mmap_mode='r').shape[1]
                 except Exception:
@@ -180,12 +180,12 @@ class ConditionedAudioDataset(Dataset):
                         self.samples.append((f, cond_path, start, label_idx, class_name))
 
         if n_files_short > 0:
-            print(f"[CondDataset/{self.split}] ATTENZIONE: {n_files_short}/{n_files_total} "
-                  f"file troppo corti per {self.n_frames} frame → skippati")
+            print(f"[CondDataset/{self.split}] WARNING: {n_files_short}/{n_files_total} "
+                  f"files too short for {self.n_frames} frames -> skipped")
 
     def _preload_latents(self):
         unique = set(str(p) for p, _, _, _, _ in self.samples)
-        print(f"[CondDataset/{self.split}] Preloading {len(unique)} latenti (fp16)...")
+        print(f"[CondDataset/{self.split}] Preloading {len(unique)} latents (fp16)...")
         from tqdm import tqdm
         for p in tqdm(sorted(unique), desc=f"Preload {self.split}"):
             z = np.load(p)
@@ -199,22 +199,22 @@ class ConditionedAudioDataset(Dataset):
         text_ext: CLAPTextCondition = self.registry.global_extractors["text"]
         self._text_dim = text_ext.dim
 
-        # Costruisci i prompt: nome classe -> testo leggibile
+        # Build the prompts: class name -> readable text
         # (a inferenza si possono passare prompt liberi; qui partiamo
-        # dalla classe per il primo training)
+        # from the class for the first training)
         class_names = list(self.label_to_idx.keys())
         prompts = [c.replace("_", " ") for c in class_names]
 
-        # Batch encoding di tutti i prompt in un colpo solo (piu' efficiente)
+        # Batch-encode all prompts at once (more efficient)
         embs = text_ext.encode_batch(prompts)   # (n_classes, dim)
         for class_name, emb in zip(class_names, embs):
             self._text_embeddings[class_name] = emb
 
         print(f"[CondDataset/{self.split}] CLAP text embeddings: "
-              f"{len(self._text_embeddings)} classi (dim={self._text_dim})")
+              f"{len(self._text_embeddings)} classes (dim={self._text_dim})")
 
-        # CLAP e' grosso (~300MB su GPU): scarica dopo aver pre-calcolato.
-        # Gli embedding sono cached come np.ndarray, non serve piu' il modello.
+        # CLAP is large (~300MB on GPU): offload after pre-computing.
+        # The embeddings are cached as np.ndarray; the model is no longer needed.
         text_ext.unload()
 
     def _precompute_image_embeddings(self, max_per_class: int = 10):
@@ -234,7 +234,7 @@ class ConditionedAudioDataset(Dataset):
                 try:
                     embs.append(img_ext.encode_image(str(img_path)))
                 except Exception as e:
-                    print(f"  [WARN] Immagine non caricata {img_path}: {e}")
+                    print(f"  [WARN] Image not loaded {img_path}: {e}")
             if embs:
                 self._image_embeddings[class_name] = embs
             else:
@@ -242,11 +242,11 @@ class ConditionedAudioDataset(Dataset):
 
         total = sum(len(v) for v in self._image_embeddings.values())
         print(f"[CondDataset/{self.split}] Image embeddings: "
-              f"{total} immagini in {len(self._image_embeddings)}/{len(self.label_to_idx)} classi "
+              f"{total} images in {len(self._image_embeddings)}/{len(self.label_to_idx)} classes "
               f"(dim={self._image_dim})")
         if orphan_classes:
-            print(f"[CondDataset/{self.split}] WARNING: {len(orphan_classes)} classi senza "
-                  f"immagini → useranno null fallback (image=zeros): {orphan_classes}")
+            print(f"[CondDataset/{self.split}] WARNING: {len(orphan_classes)} classes without "
+                  f"images -> will use null fallback (image=zeros): {orphan_classes}")
 
     def __len__(self):
         return len(self.samples)
@@ -270,8 +270,8 @@ class ConditionedAudioDataset(Dataset):
         if frames.shape[0] != self.n_frames:
             raise RuntimeError(
                 f"Sample {npy_path.name} @ start={start}: "
-                f"shape attesa ({self.n_frames}, 1024), ottenuta {tuple(frames.shape)}. "
-                f"Il file ha meno frame del previsto."
+                f"expected shape ({self.n_frames}, 1024), got {tuple(frames.shape)}. "
+                f"The file has fewer frames than expected."
             )
 
         # 2. FRAME CONDITIONS (da .npz)
@@ -294,7 +294,7 @@ class ConditionedAudioDataset(Dataset):
             except Exception:
                 pass
 
-        # Fallback zeri per condizioni mancanti
+        # Zero fallback for missing conditions
         for name in frame_names:
             if name not in frame_cond:
                 dim = self.registry.frame_cond_dims[name]
@@ -309,8 +309,8 @@ class ConditionedAudioDataset(Dataset):
             text_emb = torch.zeros(1)  # placeholder
 
         # 4. IMAGE EMBEDDING
-        # train: random fra le pre-calcolate (data augmentation di fatto)
-        # val/test: sempre la prima → val loss deterministica
+        # train: random among the pre-computed ones (effectively data augmentation)
+        # val/test: always the first -> deterministic val loss
         if class_name in self._image_embeddings:
             if self.split == "train":
                 img_emb = torch.from_numpy(
@@ -331,7 +331,7 @@ class ConditionedAudioDataset(Dataset):
 # ============================================================
 
 def collate_conditioned(batch):
-    """Collate custom per il DataLoader."""
+    """Custom collate for the DataLoader."""
     frames_l, conds_l, labels_l, text_l, image_l = zip(*batch)
 
     frames = torch.stack(frames_l)
@@ -339,7 +339,7 @@ def collate_conditioned(batch):
     text_embs = torch.stack(text_l)
     image_embs = torch.stack(image_l)
 
-    # Frame conditions: stack per chiave
+    # Frame conditions: stack per key
     frame_conds = {}
     if conds_l and conds_l[0]:
         for name in conds_l[0].keys():
@@ -362,15 +362,15 @@ def build_conditioned_datasets(
     preload:         bool = True,
 ) -> Tuple[ConditionedAudioDataset, ConditionedAudioDataset, LatentNormalizer, dict]:
     """
-    Costruisce train + val dataset condizionati, calcolando il normalizer
-    se non esiste.
+    Builds the conditioned train + val datasets, computing the normalizer
+    if it does not exist.
     """
     # Normalizer
     normalizer = LatentNormalizer()
     if normalizer_path and Path(normalizer_path).exists():
         normalizer.load(normalizer_path)
     else:
-        print("[build_conditioned_datasets] Calcolo normalizer su train set...")
+        print("[build_conditioned_datasets] Computing normalizer on the train set...")
         raw = AudioLatentDataset(
             root_dir=latent_root, split="train",
             duration_s=duration_s, normalizer=None, preload=False,
@@ -378,7 +378,7 @@ def build_conditioned_datasets(
         chunks = raw.get_chunks_for_normalizer()
         normalizer.fit_from_chunks(chunks, n_frames=raw.n_frames)
 
-    # Image manager: uno per split (rispetta image_root/{train,val}/<class>/)
+    # Image manager: one per split (respects image_root/{train,val}/<class>/)
     train_image_mgr = None
     val_image_mgr = None
     if image_root and Path(image_root).exists():

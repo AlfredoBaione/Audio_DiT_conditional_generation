@@ -279,7 +279,7 @@ Examples:
     for split in args.splits:
         split_latent_dir = latent_root / split
         if not split_latent_dir.exists():
-            print(f"[SKIP] Split {split} non trovato")
+            print(f"[SKIP] Split {split} not found")
             continue
 
         # Collect all the .npy files of the split

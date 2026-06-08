@@ -1,12 +1,12 @@
 # sampling_cond.py
 #
-# Sampling condizionato standalone con CFG e editing.
+# Standalone conditioned sampling with CFG and editing.
 #
-# Modalità:
-#   1. generate: da rumore → audio con condizioni
-#   2. edit:     audio esistente → corruzione parziale → ricostruzione con nuove condizioni
+# Modes:
+#   1. generate: from noise -> audio with conditions
+#   2. edit:     existing audio -> partial corruption -> reconstruction with new conditions
 #
-# Uso:
+# Usage:
 #   python sampling_cond.py checkpoint.pt generate \
 #       --label "Baroque_sacred" --guidance 3.0 --n_samples 4
 #
@@ -48,7 +48,7 @@ def euler_sampling_cfg(
 ):
     """
     Euler sampling con CFG.
-    x_start + t_start: per editing (corruzione parziale).
+    x_start + t_start: for editing (partial corruption).
     """
     model.eval()
 
@@ -94,12 +94,12 @@ def edit_audio(
     use_amp=True,
 ):
     """
-    Editing: audio reale → corruzione parziale → ricostruzione.
+    Editing: real audio -> partial corruption -> reconstruction.
     edit_strength: 0.0 = no change, 1.0 = full regeneration.
     """
     import dac
 
-    # Encode sorgente
+    # Encode source
     dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
     dac_model.to(device); dac_model.eval()
 
@@ -124,12 +124,12 @@ def edit_audio(
     z_norm = normalizer.normalize(z)
     x1 = z_norm.T.unsqueeze(0)
 
-    # Corruzione parziale
+    # Partial corruption
     t_start = 1.0 - edit_strength
     noise = torch.randn_like(x1)
     x_corrupted = (1 - t_start) * noise + t_start * x1
 
-    # Reintegrazione con nuove condizioni
+    # Re-integration with new conditions
     frames = euler_sampling_cfg(
         model, n_frames, device,
         frame_cond=frame_cond, global_cond=global_cond,
@@ -153,24 +153,24 @@ def build_global_cond(
     label_name, ckpt, device, image_path=None, prompt=None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Costruisce il dizionario global_cond per una classe o per un prompt libero.
+    Builds the global_cond dictionary for a class or for a free-form prompt.
 
     Args:
-        label_name: nome classe (es. "Baroque_sacred"). Se prompt non e' passato,
-                    viene usato per costruire automaticamente il testo CLAP
-                    ("baroque sacred"). Usato anche per naming dei file.
-        ckpt:       checkpoint dict (per leggere global_configs)
-        image_path: path opzionale a un'immagine di conditioning
-        prompt:     testo libero per CLAP. Se passato, OVERRIDE il label_name
-                    come fonte del text embedding (es. "slow piano in C minor").
+        label_name: class name (e.g. "Baroque_sacred"). If prompt is not passed,
+                    it is used to automatically build the CLAP text
+                    ("baroque sacred"). Also used for file naming.
+        ckpt:       checkpoint dict (to read global_configs)
+        image_path: optional path to a conditioning image
+        prompt:     free-form text for CLAP. If passed, it OVERRIDES label_name
+                    as the source of the text embedding (e.g. "slow piano in C minor").
 
-    Per il modello la "classe" non e' piu' un input diretto: tutto il segnale
-    semantico passa per CLAP-text e/o CLIP-image.
+    For the model the "class" is no longer a direct input: all the semantic
+    signal flows through CLAP-text and/or CLIP-image.
     """
     gc = {}
     global_configs = ckpt.get("global_configs", {})
 
-    # Text (CLAP): prompt libero se passato, altrimenti deriva dal label
+    # Text (CLAP): free-form prompt if passed, otherwise derived from the label
     if "text" in global_configs:
         if prompt is not None:
             text_input = prompt
@@ -248,16 +248,16 @@ def main():
     parser.add_argument("checkpoint", type=str)
     parser.add_argument("mode", choices=["generate", "edit"])
     parser.add_argument("--source", type=str, default=None,
-                        help="Audio sorgente per edit mode")
+                        help="Source audio for edit mode")
     parser.add_argument("--label", type=str, default=None,
-                        help="Nome classe (sara' usato come prompt CLAP "
-                             "se --prompt non e' passato)")
+                        help="Class name (will be used as the CLAP prompt "
+                             "if --prompt is not passed)")
     parser.add_argument("--prompt", type=str, default=None,
-                        help="Prompt testuale libero per CLAP "
-                             "(es. 'slow piano in C minor'). Se passato, "
-                             "OVERRIDE --label come fonte del text embedding.")
+                        help="Free-form text prompt for CLAP "
+                             "(e.g. 'slow piano in C minor'). If passed, it "
+                             "OVERRIDES --label as the source of the text embedding.")
     parser.add_argument("--image", type=str, default=None,
-                        help="Path immagine per conditioning visivo")
+                        help="Image path for visual conditioning")
     parser.add_argument("--guidance", type=float, default=3.0)
     parser.add_argument("--strength", type=float, default=0.3,
                         help="Edit strength 0-1")

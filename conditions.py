@@ -50,7 +50,7 @@ from abc import ABC, abstractmethod
 
 
 # ============================================================
-# COSTANTI DAC (coerenti con audio_dataset_npy)
+# DAC CONSTANTS (consistent with audio_dataset_npy)
 # ============================================================
 DAC_SAMPLE_RATE  = 44100
 DAC_HOP_LENGTH   = 512
@@ -63,11 +63,11 @@ DAC_FRAMES_PER_S = DAC_SAMPLE_RATE / DAC_HOP_LENGTH
 
 class FrameConditionExtractor(ABC):
     """
-    Estrae una condizione frame-level da audio.
+    Extracts a frame-level condition from audio.
     Output shape: (n_frames, dim)
 
-    Viene usato da extract_conditions.py per pre-calcolare le condizioni
-    e salvarle su disco (.npz) — così il training è veloce.
+    Used by extract_conditions.py to pre-compute the conditions and save them
+    to disk (.npz), so that training is fast.
     """
 
     @property
@@ -86,7 +86,7 @@ class FrameConditionExtractor(ABC):
         Args:
             audio: (T,) waveform mono
             sr:    sample rate
-            n_frames: numero di frame target (allineamento con latenti DAC)
+            n_frames: target number of frames (alignment with DAC latents)
         Returns:
             (n_frames, self.dim) float32
         """
@@ -106,10 +106,10 @@ class FrameConditionExtractor(ABC):
 
 class GlobalConditionExtractor(ABC):
     """
-    Codifica una condizione globale (un vettore continuous per sample).
+    Encodes a global condition (one continuous vector per sample).
 
-    NB: con la rimozione di LabelCondition, tutte le condizioni globali
-    sono ora continuous. Niente categorical -> niente Embedding lookup.
+    NB: with LabelCondition removed, all global conditions are now continuous.
+    No categorical branch -> no Embedding lookup.
     """
 
     @property
@@ -120,7 +120,7 @@ class GlobalConditionExtractor(ABC):
     @property
     @abstractmethod
     def dim(self) -> int:
-        """Dimensionalità dell'embedding."""
+        """Embedding dimensionality."""
         ...
 
 
@@ -260,7 +260,7 @@ class MelodyExtractor(FrameConditionExtractor):
 # ============================================================
 
 class ChromaExtractor(FrameConditionExtractor):
-    """Chromagram CQT. Output: (n_frames, 12) -> distribuzione sui 12 semitoni."""
+    """Chromagram CQT. Output: (n_frames, 12) -> distribution over 12 pitch classes."""
 
     @property
     def name(self): return "chroma"
@@ -350,29 +350,28 @@ class RhythmExtractor(FrameConditionExtractor):
 
 
 # ============================================================
-# GLOBAL: TEXT con CLAP (musica-aware)
+# GLOBAL: TEXT with CLAP (music-aware)
 # ============================================================
 
 class CLAPTextCondition(GlobalConditionExtractor):
     """
-    Codifica testo con il text-encoder di CLAP.
+    Encodes text with the CLAP text encoder.
 
-    CLAP e' un modello dual-encoder (audio + testo) addestrato su coppie
-    audio-testo. Il text-encoder vive nello stesso spazio dell'audio-encoder,
-    quindi gli embedding di "baroque sacred music" sono *vicini* agli
-    embedding audio di musica barocca sacra. Per il conditioning di un
-    modello generativo musicale e' piu' appropriato di un sentence-transformer
-    generico.
+    CLAP is a dual-encoder model (audio + text) trained on audio-text pairs.
+    The text encoder lives in the same space as the audio encoder, so the
+    embedding of "baroque sacred music" is *close* to the audio embeddings of
+    baroque sacred music. For conditioning a musical generative model this is
+    more appropriate than a generic sentence-transformer.
 
-    Implementazione: usa ClapTextModelWithProjection (non ClapModel), che e'
-    l'API canonica per estrarre l'embedding testuale proiettato. Espone un
-    campo .text_embeds esplicito, robusto rispetto ai cambi di firma di
-    ClapModel.get_text_features tra versioni di transformers.
+    Implementation: uses ClapTextModelWithProjection (not ClapModel), which is
+    the canonical API to extract the projected text embedding. It exposes an
+    explicit .text_embeds field, robust to signature changes of
+    ClapModel.get_text_features across transformers versions.
 
-    Modelli disponibili:
-        - 'laion/larger_clap_music'      (specializzato musica) <- default
-        - 'laion/larger_clap_general'    (audio generale)
-        - 'laion/clap-htsat-fused'       (piu' piccolo, generale)
+    Available models:
+        - 'laion/larger_clap_music'      (music-specialised) <- default
+        - 'laion/larger_clap_general'    (general audio)
+        - 'laion/clap-htsat-fused'       (smaller, general)
     """
 
     def __init__(self, model_name: str = "laion/larger_clap_music"):
@@ -385,11 +384,11 @@ class CLAPTextCondition(GlobalConditionExtractor):
     def _load(self):
         if self._model is not None:
             return
-        # ClapTextModelWithProjection e' l'API canonica per estrarre l'embedding
-        # testuale proiettato nello spazio condiviso audio-testo.
-        # Ritorna un oggetto con campo .text_embeds, indipendente dalla versione
-        # di transformers (ClapModel.get_text_features ha avuto cambi di firma
-        # tra versioni recenti).
+        # ClapTextModelWithProjection is the canonical API to extract the
+        # projected text embedding in the shared audio-text space. It returns an
+        # object with a .text_embeds field, independent of the transformers
+        # version (ClapModel.get_text_features changed signature across recent
+        # versions).
         from transformers import ClapTextModelWithProjection, AutoTokenizer
         self._model = ClapTextModelWithProjection.from_pretrained(self.model_name)
         self._processor = AutoTokenizer.from_pretrained(self.model_name)
@@ -397,7 +396,7 @@ class CLAPTextCondition(GlobalConditionExtractor):
         self._dim = int(self._model.config.projection_dim)
         self._model.to(self._device)
         print(f"[CLAPTextCondition] '{self.model_name}' "
-              f"caricato su {self._device} (dim={self._dim})")
+              f"loaded on {self._device} (dim={self._dim})")
 
     @property
     def name(self): return "text"
@@ -409,7 +408,7 @@ class CLAPTextCondition(GlobalConditionExtractor):
 
     @torch.no_grad()
     def encode_text(self, text: str) -> np.ndarray:
-        """Codifica una singola stringa -> (dim,) embedding L2-normalizzato."""
+        """Encode a single string -> (dim,) L2-normalized embedding."""
         self._load()
         inputs = self._processor([text], return_tensors="pt", padding=True)
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
@@ -420,7 +419,7 @@ class CLAPTextCondition(GlobalConditionExtractor):
 
     @torch.no_grad()
     def encode_batch(self, texts: List[str]) -> np.ndarray:
-        """Codifica una lista di stringhe -> (N, dim) tutti L2-normalizzati."""
+        """Encode a list of strings -> (N, dim) all L2-normalized."""
         self._load()
         inputs = self._processor(list(texts), return_tensors="pt", padding=True)
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
@@ -430,7 +429,7 @@ class CLAPTextCondition(GlobalConditionExtractor):
         return feat.cpu().numpy().astype(np.float32)
 
     def unload(self):
-        """Libera memoria GPU dopo aver pre-calcolato gli embedding."""
+        """Free GPU memory after pre-computing the embeddings."""
         if self._model is not None:
             self._model.cpu()
             del self._model
@@ -444,7 +443,7 @@ class CLAPTextCondition(GlobalConditionExtractor):
 # ============================================================
 
 class ImageCondition(GlobalConditionExtractor):
-    """Codifica immagine con CLIP."""
+    """Encodes an image with CLIP."""
 
     def __init__(self, model_name: str = "openai/clip-vit-base-patch32"):
         self.model_name = model_name
@@ -460,7 +459,7 @@ class ImageCondition(GlobalConditionExtractor):
         self._processor = CLIPProcessor.from_pretrained(self.model_name)
         self._model.eval()
         self._dim = int(self._model.config.projection_dim)
-        print(f"[ImageCondition] CLIP '{self.model_name}' caricato (dim={self._dim})")
+        print(f"[ImageCondition] CLIP '{self.model_name}' loaded (dim={self._dim})")
 
     @property
     def name(self): return "image"
@@ -493,15 +492,15 @@ class ImageCondition(GlobalConditionExtractor):
 
 class ImageDatasetManager:
     """
-    Gestisce un dataset di immagini con struttura parallela all'audio.
+    Manages an image dataset with a structure parallel to the audio.
 
-    Layout supportato (con split):
+    Supported layout (with split):
         image_root/{train,val,test}/<class_name>/*.jpg
-    Layout legacy (senza split):
+    Legacy layout (without split):
         image_root/<class_name>/*.jpg
 
-    Se passi `split`, usa il layout con split. Se la cartella dello split
-    non esiste, ricade automaticamente sul layout legacy con un warning.
+    If you pass `split`, the split layout is used. If the split folder
+    does not exist, it automatically falls back to the legacy layout with a warning.
     """
 
     EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -514,13 +513,13 @@ class ImageDatasetManager:
 
     def _scan(self):
         if not self.image_root.exists():
-            print(f"[ImageDataset] ATTENZIONE: {self.image_root} non trovata")
+            print(f"[ImageDataset] WARNING: {self.image_root} not found")
             return
 
         if self.split is not None:
             base = self.image_root / self.split
             if not base.exists():
-                print(f"[ImageDataset/{self.split}] {base} non esiste, "
+                print(f"[ImageDataset/{self.split}] {base} does not exist, "
                       f"uso layout legacy {self.image_root}")
                 base = self.image_root
         else:
@@ -553,15 +552,15 @@ class ImageDatasetManager:
 # CONDITION CONFIG -- UNICO PUNTO DI VERITA
 # ============================================================
 #
-# Per abilitare/disabilitare una condizione: cambia "enabled".
-# Per aggiungere una nuova condizione:
-#   1. Crea una classe che estende FrameConditionExtractor o GlobalConditionExtractor
+# To enable/disable a condition: change "enabled".
+# To add a new condition:
+#   1. Create a class extending FrameConditionExtractor or GlobalConditionExtractor
 #   2. Aggiungila in CONDITION_CONFIG con "enabled": True
-#   3. Fine -- tutto il resto si adatta automaticamente
+#   3. Done -- everything else adapts automatically
 #
-# RIMOZIONE LABEL: la condizione `label` (categorical) e' stata rimossa.
-# La modalita' `text` con CLAP la sostituisce: a training riceve il nome
-# della classe come stringa, a inferenza puo' ricevere prompt liberi.
+# LABEL REMOVAL: the `label` (categorical) condition has been removed.
+# The `text` modality with CLAP replaces it: at training it receives the name
+# the class name as a string at training; at inference it can take free prompts.
 # ============================================================
 
 CONDITION_CONFIG = {
@@ -594,7 +593,7 @@ CONDITION_CONFIG = {
         # which failed on polyphonic material. It was removed and replaced by
         # MelodyExtractor above (basic-pitch + JASCO argmax reduction), which
         # matches JASCO's preprocessing on a polyphony-robust model.
-        # Esempio per aggiungere MFCC in futuro:
+        # Example for adding MFCC in the future:
         # "mfcc": {
         #     "class": MFCCExtractor,
         #     "kwargs": {"n_mfcc": 20},
@@ -729,7 +728,7 @@ class ConditionRegistry:
 
     @property
     def global_cond_configs(self) -> Dict[str, dict]:
-        """Ora tutte le condizioni globali sono continuous -> solo `dim`."""
+        """All global conditions are now continuous -> only `dim`."""
         return {n: {"dim": e.dim} for n, e in self.global_extractors.items()}
 
     def extract_frame_conditions(
@@ -747,7 +746,7 @@ class ConditionRegistry:
 
 
 # ============================================================
-# ENCODERS nn.Module (usati dal DiT)
+# ENCODERS nn.Module (used by the DiT)
 # ============================================================
 
 class FrameConditionEncoder(nn.Module):
@@ -799,11 +798,11 @@ class FrameConditionEncoder(nn.Module):
 
 class GlobalConditionEncoder(nn.Module):
     """
-    Proietta condizioni globali (continuous) -> hidden_size.
-    Somma le proiezioni e applica LayerNorm finale per bilanciare le scale
-    tra modalita' diverse (es. text CLAP vs image CLIP).
+    Projects global conditions (continuous) -> hidden_size.
+    Sums the projections and applies a final LayerNorm to balance the scales
+    across different modalities (e.g. text CLAP vs image CLIP).
 
-    NB: niente piu' ramo categorical (LabelCondition rimossa).
+    NB: no more categorical branch (LabelCondition removed).
     """
 
     def __init__(self, global_configs: Dict[str, dict], hidden_size: int):
@@ -827,7 +826,7 @@ class GlobalConditionEncoder(nn.Module):
 
 
 # ============================================================
-# NULL CONDITIONS (per CFG)
+# NULL CONDITIONS (for CFG)
 # ============================================================
 
 def make_null_frame_conditions(B: int, n_frames: int,
@@ -841,12 +840,12 @@ def make_null_global_conditions(B: int,
                                   global_configs: Dict[str, dict],
                                   device) -> Dict[str, torch.Tensor]:
     """
-    Crea condizioni globali "null" per il CFG: vettori di zeri.
+    Create "null" global conditions for CFG: zero vectors.
 
-    text (CLAP) e image (CLIP) sono entrambi L2-normalizzati nello spazio
-    proiettato, quindi un vettore di zeri e' OOD rispetto a qualsiasi
-    condizione reale e funge da pseudo-null token. Questa e' la scelta
-    standard nei modelli generativi con embedding continuous.
+    text (CLAP) and image (CLIP) are both L2-normalized in the projected
+    space, so a zero vector is OOD with respect to any
+    real condition and acts as a pseudo-null token. This is the standard
+    choice in generative models with continuous embeddings.
     """
     return {n: torch.zeros(B, cfg["dim"], device=device)
             for n, cfg in global_configs.items()}
@@ -865,12 +864,12 @@ if __name__ == "__main__":
     print(f"\nFrame cond dims:    {reg.frame_cond_dims}")
     print(f"Global cond configs: {reg.global_cond_configs}")
 
-    # Test text encoding (richiede internet la prima volta)
-    print("\n--- Test CLAP text encoding (un solo prompt) ---")
+    # Test text encoding (requires internet the first time)
+    print("\n--- Test CLAP text encoding (single prompt) ---")
     if "text" in reg.global_extractors:
         t = reg.global_extractors["text"]
         emb = t.encode_text("baroque sacred music")
         print(f"  Embedding shape: {emb.shape}, "
-              f"norm: {np.linalg.norm(emb):.4f} (atteso ~1.0)")
+              f"norm: {np.linalg.norm(emb):.4f} (expected ~1.0)")
         t.unload()
-        print("  CLAP scaricato dalla GPU.")
+        print("  CLAP offloaded from GPU.")

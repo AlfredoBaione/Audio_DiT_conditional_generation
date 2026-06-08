@@ -663,7 +663,7 @@ if __name__ == "__main__":
     B = torch.randn(d, d).double()
     sigma2 = (B @ B.T) / d
     fd = compute_frechet_distance(mu1, sigma1, mu2, sigma2)
-    print(f"  FD: {fd.item():.4f} (deve essere > 0)")
+    print(f"  FD: {fd.item():.4f} (should be > 0)")
     assert fd.item() > 0
     print("  OK!\n")
 
