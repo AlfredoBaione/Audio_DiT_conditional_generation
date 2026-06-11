@@ -13,9 +13,9 @@
 #   - EMA
 #   - Conditioned audio generated every intervals.audio step on TensorBoard
 #     (conditions taken from val-set samples)
-#   - FD-DAC + FAD computed every intervals.metrics step on conditioned
-#     samples, with reference pre-computed on the full validation set
-#     (reference is unchanged: real validation latents / WAVs)
+#   - FD-DAC + KL (both directions) computed every intervals.metrics step on
+#     conditioned samples, with reference pre-computed on the full validation
+#     set (real validation latents, normalized space)
 #   - Loss train + val on TensorBoard
 #   - Configuration with OmegaConf YAML (configs/cond_default.yaml)
 #
@@ -51,17 +51,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 #    untouched and DAC uses the platform default cache location.
 _IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
 if os.path.isdir(_IRCAM_LOCAL):
-    _cache = os.path.join(_IRCAM_LOCAL, ".cache")
     os.environ["HOME"] = _IRCAM_LOCAL
-    os.environ.setdefault("XDG_CACHE_HOME", _cache)
-    os.environ.setdefault("HF_HOME", os.path.join(_cache, "huggingface"))
-
-# 3. IRCAM: force transformers to use the PyTorch backend only. Without this,
-#    `transformers` (pulled in via metrics.py -> FAD / laion_clap and via
-#    conditions.py) tries to import TensorFlow from the tf2.18 base and
-#    crashes on protobuf. Must be set BEFORE importing torch/transformers.
-os.environ.setdefault("USE_TF", "0")
-os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+    os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_IRCAM_LOCAL, ".cache"))
 
 import copy
 import argparse
@@ -96,12 +87,13 @@ from audio_dataset_cond import (
 )
 from conditions import (
     ConditionRegistry,
+    CONDITION_CONFIG,
     make_null_frame_conditions, make_null_global_conditions,
 )
 from metrics import (
-    FADCalculator,
-    precompute_fd_dac_reference,
+    precompute_latent_reference,
     compute_fd_dac,
+    compute_kl_both,
 )
 
 
@@ -351,20 +343,6 @@ def make_spectrogram(waveform, sr, title=""):
     return img
 
 
-def make_pianoroll(melody_onehot, title=""):
-    """Render an (T, 88) one-hot melody as a piano-roll image (pitch x time).
-    Row 0 = MIDI 21 (A0), row 87 = MIDI 108 (C8). Uses plot_to_image."""
-    import numpy as _np
-    m = _np.asarray(melody_onehot, dtype=_np.float32)
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.imshow(m.T, aspect='auto', origin='lower', interpolation='nearest',
-              cmap='magma', vmin=0.0, vmax=1.0)
-    ax.set_title(title)
-    ax.set_xlabel("Frame")
-    ax.set_ylabel("Pitch bin (0=A0 .. 87=C8)")
-    img = plot_to_image(fig)
-    plt.close(fig)
-    return img
 @torch.no_grad()
 def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
                       frame_cond, global_cond, guidance,
@@ -533,15 +511,15 @@ def log_real_audio_samples(val_dataset, normalizer, writer, n_samples):
 
 
 # ======================
-# METRICS EVALUATION (conditioned generation, FD-DAC + FAD)
+# METRICS EVALUATION (conditioned generation, FD-DAC + KL)
 # ======================
 @torch.no_grad()
 def evaluate_and_log_metrics(
     model, normalizer, val_dataset, step, writer, device, output_dir,
-    fad_calculator, fd_dac_ref_stats, n_samples,
+    fd_dac_ref_stats, n_samples,
     sampling_cfg, conditioning_cfg, use_amp,
     frame_dims, global_configs,
-    fidelity_evaluator=None, compute_uncond=True,
+    fidelity_evaluator=None, clap_audio_embedder=None, compute_uncond=True,
     prefix="EMA",
 ):
     """
@@ -549,25 +527,33 @@ def evaluate_and_log_metrics(
     (deterministic linspace indices, so the curves are comparable across steps),
     in three independent axes:
 
-      1. UNCONDITIONAL generation  -> Fd_dac_uncond / Fad_uncond
+      1. UNCONDITIONAL generation  -> Fd_dac_uncond / Kl_uncond
          Generated with NULL conditions (no CFG). This is the ONLY metric that
          is apples-to-apples comparable with the unconditional model: it answers
          "how well does this (conditioned-trained) model generate freely?".
 
-      2. CONDITIONAL generation    -> Fd_dac_cond / Fad_cond
+      2. CONDITIONAL generation    -> Fd_dac_cond / Kl_cond
          Each sample generated from one specific validation condition (with CFG
          guidance). Distributional fidelity of the conditioned generations to
          the real data. NOT comparable with the unconditional model (the
          conditioning restricts the distribution).
 
-      3. CONDITIONING FIDELITY     -> Cond_fidelity/<name>/<metric>
-         Paired: re-extract the condition from each conditioned generation and
-         compare it one-to-one with the input condition (melody RPA/RCA, chroma
-         cosine, rhythm correlation). Answers "does it follow the condition?".
+      3. CONDITION INFLUENCE       -> Validation/Condition_influence (text panel)
+         Paired delta: re-extract each condition from the conditioned AND the
+         null generations, score adherence on both (melody RPA/RCA, chroma
+         cosine, rhythm/energy correlation, text CLAP audio-text cosine), and
+         report Δ = with-cond - null. Answers "how much does the condition pull
+         the generation toward its target?". Consolidated into a single Markdown
+         table (no separate scalar curves), built only from the conditions
+         ACTIVE in the run, so it adapts automatically. Image (CLIP) is shown as
+         n/a until an audio-visual model (e.g. Wav2CLIP) is wired in.
 
-    FD-DAC / FAD references stay the real validation latents / WAVs in both the
-    cond and uncond cases. `prefix` ("EMA" / "Model") tags the audio/spectrogram
-    by the generating weights. Returns (fd_dac_cond, fad_cond) for the caller.
+    FD-DAC and KL (both directions, real||gen and gen||real) share the SAME real
+    validation latent reference (fd_dac_ref_stats) in both the cond and uncond
+    cases; the distributional metrics are latent-only (audio is decoded only for
+    the influence re-extraction and the audio/spectrogram previews). `prefix`
+    ("EMA" / "Model") tags the previews by the generating weights. Returns
+    (fd_dac_cond, kl_cond_real_gen, kl_cond_gen_real) for the caller.
     """
     guidance = float(conditioning_cfg.guidance_scale)
     n_frames = val_dataset.n_frames
@@ -575,18 +561,21 @@ def evaluate_and_log_metrics(
     indices = torch.linspace(0, total - 1, n_samples).long().tolist()
     n_log = min(2, n_samples)   # how many samples to log richly (audio/specs/rolls)
 
+    ref_frames = (fd_dac_ref_stats["n_total"]
+                  if fd_dac_ref_stats is not None else "n/a")
     print(f"\n  Compute metrics @ step {step}: {n_samples} generations "
           f"(cond guidance={guidance}"
           f"{', + uncond' if compute_uncond else ''}) "
-          f"vs reference ({fad_calculator.ref_n_samples} samples)...")
+          f"vs reference ({ref_frames} frames)...")
 
     # ---- generate n_samples latents, conditioned or unconditional ----
     # For the conditioned pass we also keep, for the first n_log samples, the
     # real latent (to decode the real audio) and the target condition.
     def _generate(conditioned):
         lat_list = []
-        targets = []        # paired input conditions (cpu numpy); cond only
+        targets = []        # paired frame conditions (cpu numpy); cond only
         real_frames = []    # real latents of the first n_log samples; cond only
+        global_targets = [] # paired global conds (text/image emb); cond only
         for j, idx in enumerate(indices):
             frames_real, frame_cond_real, _lab, text_emb, image_emb = val_dataset[idx]
             if conditioned:
@@ -600,6 +589,10 @@ def evaluate_and_log_metrics(
                 g = guidance
                 targets.append({k: v.cpu().numpy()
                                 for k, v in frame_cond_real.items()})
+                global_targets.append({
+                    "text":  text_emb.cpu().numpy()  if "text"  in global_configs else None,
+                    "image": image_emb.cpu().numpy() if "image" in global_configs else None,
+                })
                 if j < n_log:
                     real_frames.append(frames_real)
             else:
@@ -615,7 +608,7 @@ def evaluate_and_log_metrics(
             lat_list.append(gen)
             if device == "cuda":
                 torch.cuda.empty_cache()
-        return lat_list, targets, real_frames
+        return lat_list, targets, real_frames, global_targets
 
     # ---- DAC decode helpers (model loaded once, reused) ----
     def _decode_one(frames, dac_model):
@@ -626,93 +619,176 @@ def evaluate_and_log_metrics(
     def _decode(lat_list, dac_model):
         return [_decode_one(f, dac_model) for f in lat_list]
 
-    # FAD only needs the reference STATISTICS to be loaded (mu_ref / sigma_ref).
-    # `ref_dir` is the reference-WAV folder, used ONLY when (re)computing those
-    # stats from disk; on a cache-hit it may be None even though the stats are
-    # loaded, so gating FAD on ref_dir wrongly skips it. Gate on mu_ref instead.
-    has_fad = (fad_calculator is not None and fad_calculator.mu_ref is not None)
+    has_ref = fd_dac_ref_stats is not None
 
     # ===== CONDITIONAL generation =====
-    cond_lat, cond_targets, real_frames = _generate(conditioned=True)
-    fd_dac_cond = (compute_fd_dac(torch.stack(cond_lat), fd_dac_ref_stats, device=device)
-                   if fd_dac_ref_stats is not None else None)
+    # Distributional metrics (FD-DAC + KL both directions) are latent-only and
+    # share the SAME real reference (fd_dac_ref_stats). The DAC decode below is
+    # needed ONLY for conditioning fidelity (re-extract from audio) and for the
+    # rich audio/spectrogram logging -- NOT for the distributional metrics.
+    cond_lat, cond_targets, real_frames, cond_globals = _generate(conditioned=True)
+    cond_stack = torch.stack(cond_lat)
+    fd_dac_cond = (compute_fd_dac(cond_stack, fd_dac_ref_stats, device=device)
+                   if has_ref else None)
+    kl_cond = (compute_kl_both(cond_stack, fd_dac_ref_stats, device=device)
+               if has_ref else {"kl_real_gen": None, "kl_gen_real": None})
 
     import dac
     dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
     dac_model.to("cpu")
     dac_model.eval()
 
+    # All conditioned wavs are decoded: fidelity evaluates every generation.
     cond_wavs = _decode(cond_lat, dac_model)
-    fad_cond = (fad_calculator.compute_fad_against_reference(cond_wavs, sr=DAC_SAMPLE_RATE)
-                if has_fad else None)
 
     # ===== UNCONDITIONAL generation (comparable to the unconditional model) =====
+    # The null generations serve two roles: the uncond distributional metrics,
+    # AND the baseline for the condition-INFLUENCE measure (how much closer to
+    # the target the conditioned generation gets vs the unconditioned one).
+    frame_active = (fidelity_evaluator is not None and fidelity_evaluator.active)
+    text_active  = ("text" in (global_configs or {})) and (clap_audio_embedder is not None)
+    influence_active = frame_active or text_active
+
     fd_dac_uncond = None
-    fad_uncond = None
+    kl_uncond = {"kl_real_gen": None, "kl_gen_real": None}
     unc_wavs = []
     if compute_uncond:
-        unc_lat, _, _ = _generate(conditioned=False)
-        fd_dac_uncond = (compute_fd_dac(torch.stack(unc_lat), fd_dac_ref_stats, device=device)
-                         if fd_dac_ref_stats is not None else None)
-        unc_wavs = _decode(unc_lat, dac_model)
-        fad_uncond = (fad_calculator.compute_fad_against_reference(unc_wavs, sr=DAC_SAMPLE_RATE)
-                      if has_fad else None)
+        unc_lat, _, _, _ = _generate(conditioned=False)
+        unc_stack = torch.stack(unc_lat)
+        fd_dac_uncond = (compute_fd_dac(unc_stack, fd_dac_ref_stats, device=device)
+                         if has_ref else None)
+        kl_uncond = (compute_kl_both(unc_stack, fd_dac_ref_stats, device=device)
+                     if has_ref else {"kl_real_gen": None, "kl_gen_real": None})
+        # For the influence baseline we re-extract conditions from EVERY null
+        # generation, so decode all of them; otherwise only the first n_log are
+        # needed for the audio/spectrogram previews.
+        unc_wavs = _decode(unc_lat if influence_active else unc_lat[:n_log], dac_model)
 
-    # ===== CONDITIONING FIDELITY (paired, on the conditioned generations) =====
-    fidelity = {}
-    if fidelity_evaluator is not None and fidelity_evaluator.active:
-        print(f"    re-extracting conditions from {len(cond_wavs)} generations "
-              f"for fidelity ({list(fidelity_evaluator.extractors)})...")
+    # ===== CONDITION INFLUENCE (delta: with-cond vs null, paired) =====
+    # influence[cond_name][metric] = {"cond":.., "null":.., "delta":..}.
+    # Higher fidelity = better for all current metrics, so delta>0 means the
+    # condition pulled the generation toward its target. The panel is built only
+    # from the conditions ACTIVE in this run (registry-driven), so it adapts
+    # automatically when conditions are added/removed.
+    influence = {}
+
+    # ---- frame conditions: re-extract from cond and from null, then diff ----
+    if frame_active:
+        print(f"    measuring frame-condition influence on {len(cond_wavs)} "
+              f"generations ({list(fidelity_evaluator.extractors)})...")
         fidelity_evaluator.reset()
         for wav, tgt in zip(cond_wavs, cond_targets):
             fidelity_evaluator.add_sample(wav.numpy(), DAC_SAMPLE_RATE, n_frames, tgt)
-        fidelity = fidelity_evaluator.results()
+        fid_cond = fidelity_evaluator.results()
 
-    # ===== LOG SCALARS =====
+        fid_null = {}
+        if compute_uncond and unc_wavs:
+            fidelity_evaluator.reset()
+            for wav, tgt in zip(unc_wavs, cond_targets):
+                fidelity_evaluator.add_sample(wav.numpy(), DAC_SAMPLE_RATE, n_frames, tgt)
+            fid_null = fidelity_evaluator.results()
+
+        for key, cval in fid_cond.items():
+            name, _, metric = key.partition("/")
+            nval = fid_null.get(key)
+            influence.setdefault(name, {})[metric] = {
+                "cond": cval,
+                "null": nval,
+                "delta": (cval - nval) if (nval is not None) else None,
+            }
+
+    # ---- text (CLAP): cosine(audio, text) for cond vs null ----
+    if text_active:
+        print(f"    measuring text (CLAP) influence on {len(cond_wavs)} generations...")
+        def _clap_sim(wavs):
+            sims = []
+            for wav, gt in zip(wavs, cond_globals):
+                t = gt.get("text") if gt else None
+                if t is None:
+                    continue
+                a = wav.numpy() if hasattr(wav, "numpy") else wav
+                emb = clap_audio_embedder.embed(a, DAC_SAMPLE_RATE)   # L2-norm
+                sims.append(float(np.dot(emb, t)))                    # cosine
+            return float(np.mean(sims)) if sims else None
+        sim_cond = _clap_sim(cond_wavs)
+        sim_null = _clap_sim(unc_wavs) if (compute_uncond and unc_wavs) else None
+        influence["text"] = {"clap_sim": {
+            "cond": sim_cond, "null": sim_null,
+            "delta": (sim_cond - sim_null) if (sim_cond is not None and sim_null is not None) else None,
+        }}
+
+    # ---- image (CLIP): no direct audio<->CLIP metric available ----
+    # Measuring image-condition influence on AUDIO needs an audio-visual model
+    # in a shared space (e.g. Wav2CLIP / ImageBind). Until one is wired in, the
+    # row is reported as not-available so the panel layout stays complete.
+    if "image" in (global_configs or {}):
+        influence["image"] = {"clip_sim": {
+            "cond": None, "null": None, "delta": None,
+            "note": "needs audio-visual model (e.g. Wav2CLIP)",
+        }}
+
+    # ===== LOG SCALARS (distributional quality only; influence -> panel) =====
     if fd_dac_cond is not None:
         writer.add_scalar("Validation/Metrics/Fd_dac_cond", fd_dac_cond, step)
-    if fad_cond is not None:
-        writer.add_scalar("Validation/Metrics/Fad_cond", fad_cond, step)
+    if kl_cond["kl_real_gen"] is not None:
+        writer.add_scalar("Validation/Metrics/Kl_cond/real_gen",
+                          kl_cond["kl_real_gen"], step)
+        writer.add_scalar("Validation/Metrics/Kl_cond/gen_real",
+                          kl_cond["kl_gen_real"], step)
     if fd_dac_uncond is not None:
         writer.add_scalar("Validation/Metrics/Fd_dac_uncond", fd_dac_uncond, step)
-    if fad_uncond is not None:
-        writer.add_scalar("Validation/Metrics/Fad_uncond", fad_uncond, step)
-    for key, val in fidelity.items():
-        writer.add_scalar(f"Validation/Cond_fidelity/{key}", val, step)
+    if kl_uncond["kl_real_gen"] is not None:
+        writer.add_scalar("Validation/Metrics/Kl_uncond/real_gen",
+                          kl_uncond["kl_real_gen"], step)
+        writer.add_scalar("Validation/Metrics/Kl_uncond/gen_real",
+                          kl_uncond["kl_gen_real"], step)
+
+    # ===== CONDITION-INFLUENCE PANEL (consolidated text table) =====
+    # All per-condition adherence/influence lives HERE now, as a single table,
+    # NOT as separate scalar curves. TensorBoard keeps a per-step history of the
+    # text, so the step slider walks the panel across training.
+    if influence:
+        from condition_metrics import format_influence_panel
+        panel_md = format_influence_panel(
+            influence, step=step, prefix=prefix,
+            guidance=guidance, n_samples=n_samples,
+        )
+        writer.add_text("Validation/Condition_influence", panel_md, step)
 
     # ===== console summary =====
     def _f(x):
         return f"{x:.4f}" if x is not None else "n/a"
-    print(f"  [cond]   FD-DAC: {_f(fd_dac_cond)} | FAD: {_f(fad_cond)}")
+    print(f"  [cond]   FD-DAC: {_f(fd_dac_cond)} | "
+          f"KL(real||gen): {_f(kl_cond['kl_real_gen'])} | "
+          f"KL(gen||real): {_f(kl_cond['kl_gen_real'])}")
     if compute_uncond:
-        print(f"  [uncond] FD-DAC: {_f(fd_dac_uncond)} | FAD: {_f(fad_uncond)}")
-    if fidelity:
-        print("  [fidelity] " + " | ".join(f"{k}={v:.4f}" for k, v in fidelity.items()))
+        print(f"  [uncond] FD-DAC: {_f(fd_dac_uncond)} | "
+              f"KL(real||gen): {_f(kl_uncond['kl_real_gen'])} | "
+              f"KL(gen||real): {_f(kl_uncond['kl_gen_real'])}")
+    if influence:
+        parts = []
+        for cname, metrics in influence.items():
+            for m, vals in metrics.items():
+                d = vals.get("delta")
+                parts.append(f"{cname}/{m} Δ={_f(d)}")
+        if parts:
+            print("  [influence] " + " | ".join(parts))
 
     # ===== RICH COMPARISON LOGGING (real / with-cond / without-cond) =====
     # For the first n_log samples (same indices as the metrics generations),
     # log, all tagged by the generating weights `w` (EMA or Model):
-    #   IMAGES: spectrogram + melody piano-roll, for real / with-cond / without-cond
-    #   AUDIO : the audio + the sonified melody, for real / with-cond / without-cond
+    #   IMAGES: spectrogram, for real / with-cond / without-cond
+    #   AUDIO : the audio,    for real / with-cond / without-cond
     # Everything is logged with global_step=step so TensorBoard's slider walks
-    # across the metric steps. The melody of the generations is RE-EXTRACTED from
-    # the generated audio with the same extractor that produced the targets.
-    from condition_metrics import sonify_melody
-    import numpy as _np
+    # across the metric steps. Melody piano-rolls and sonified-melody audio are
+    # intentionally NOT logged here; per-condition influence is consolidated in
+    # the Validation/Condition_influence text panel (no separate scalar curves).
     w = prefix  # "EMA" or "Model"
-    mel_ext = (fidelity_evaluator.extractors.get("melody")
-               if (fidelity_evaluator is not None and fidelity_evaluator.active)
-               else None)
 
     def _log_audio(wav, tag):
         wav_u = wav.unsqueeze(0) if wav.dim() == 1 else wav
         wn = wav_u / (wav_u.abs().max() + 1e-8)
         writer.add_audio(f"Validation/{tag}", wn, global_step=step,
-                         sample_rate=DAC_SAMPLE_RATE)
-
-    def _log_mel_audio(mel_arr, tag):
-        son = torch.from_numpy(sonify_melody(mel_arr, DAC_SAMPLE_RATE)).unsqueeze(0)
-        writer.add_audio(f"Validation/{tag}", son, global_step=step,
                          sample_rate=DAC_SAMPLE_RATE)
 
     def _log_spec(wav, tag, title):
@@ -721,38 +797,17 @@ def evaluate_and_log_metrics(
                          make_spectrogram(wav_u, DAC_SAMPLE_RATE, title),
                          global_step=step)
 
-    def _log_roll(mel_arr, tag, title):
-        writer.add_image(f"Validation/{tag}",
-                         make_pianoroll(mel_arr, title), global_step=step)
-
-    def _reextract(wav):
-        if mel_ext is None:
-            return None
-        a = wav.numpy() if wav.dim() == 1 else wav.squeeze().numpy()
-        return mel_ext.extract(_np.ascontiguousarray(a, dtype=_np.float32),
-                               DAC_SAMPLE_RATE, n_frames)
-
     for i in range(n_log):
         # ---------- REAL ----------
         real_wav = _decode_one(real_frames[i], dac_model)
         _log_audio(real_wav, f"Audio_real_{i:02d}")
         _log_spec(real_wav, f"Spectrogram_real_{i:02d}", f"real {i} - step {step}")
-        real_mel = cond_targets[i].get("melody") if i < len(cond_targets) else None
-        if real_mel is not None:
-            _log_roll(real_mel, f"Melody_pianoroll_real_{i:02d}",
-                      f"melody real {i} - step {step}")
-            _log_mel_audio(real_mel, f"Melody_audio_real_{i:02d}")
 
         # ---------- GENERATED WITH COND ----------
         cwav = cond_wavs[i]
         _log_audio(cwav, f"Audio_generated_with_cond_{w}_{i:02d}")
         _log_spec(cwav, f"Spectrogram_generated_with_cond_{w}_{i:02d}",
                   f"generated with cond ({w}) {i} - step {step} - guidance={guidance}")
-        cmel = _reextract(cwav)
-        if cmel is not None:
-            _log_roll(cmel, f"Melody_pianoroll_generated_with_cond_{w}_{i:02d}",
-                      f"melody generated with cond ({w}) {i} - step {step}")
-            _log_mel_audio(cmel, f"Melody_audio_generated_with_cond_{w}_{i:02d}")
 
         # ---------- GENERATED WITHOUT COND ----------
         if compute_uncond:
@@ -760,11 +815,6 @@ def evaluate_and_log_metrics(
             _log_audio(uwav, f"Audio_generated_without_cond_{w}_{i:02d}")
             _log_spec(uwav, f"Spectrogram_generated_without_cond_{w}_{i:02d}",
                       f"generated without cond ({w}) {i} - step {step}")
-            umel = _reextract(uwav)
-            if umel is not None:
-                _log_roll(umel, f"Melody_pianoroll_generated_without_cond_{w}_{i:02d}",
-                          f"melody generated without cond ({w}) {i} - step {step}")
-                _log_mel_audio(umel, f"Melody_audio_generated_without_cond_{w}_{i:02d}")
 
         # ---------- save wavs to disk ----------
         sf.write(os.path.join(output_dir, f"metrics_step{step:07d}_real_{i:02d}.wav"),
@@ -781,8 +831,8 @@ def evaluate_and_log_metrics(
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    # Backward-compatible return: the conditioned FD-DAC / FAD.
-    return fd_dac_cond, fad_cond
+    # Backward-compatible return: the conditioned FD-DAC + KL (both directions).
+    return fd_dac_cond, kl_cond["kl_real_gen"], kl_cond["kl_gen_real"]
 
 
 # ======================
@@ -883,7 +933,6 @@ if __name__ == "__main__":
     # Paths derived from the above directories
     normalizer_path   = os.path.join(cache_dir, "normalizer.pt")
     fd_dac_cache_path = os.path.join(cache_dir, "fd_dac_ref_stats.pt")
-    fad_cache_dir     = os.path.join(cache_dir, "fad_cache")
 
     # Config's dump (with CLI override already applied) in the run dir
     config_dump_path = os.path.join(run_dir, "config.yaml")
@@ -915,17 +964,82 @@ if __name__ == "__main__":
     print(f"\nDetected {n_classes} classes: {list(tmp_train.label_to_idx.keys())}")
     del tmp_train
 
-    # Per-run selection of which conditions to activate, driven by the YAML
-    # config. Default null = use all conditions enabled=True in CONDITION_CONFIG.
-    # Empty list [] = use no condition of that type. Explicit list = subset.
+    # ------------------------------------------------------------------
+    # Per-run selection of which FRAME conditions to activate, driven by
+    # conditioning.enabled_frame in the YAML, with these rules:
+    #   * null / absent  -> train with EXACTLY the frame conditions that have
+    #                       actually been EXTRACTED to disk (the .npz contents),
+    #                       intersected with the enabled pool in CONDITION_CONFIG.
+    #   * explicit list  -> train with that subset; every requested condition
+    #                       MUST be present in the extracted .npz, otherwise we
+    #                       RAISE (no silent zero-fill of an un-extracted cond).
+    # Global conditions (text / image) are NOT stored in the .npz, so
+    # enabled_global keeps its previous semantics (null = all enabled in config).
+    # ------------------------------------------------------------------
+    def _detect_extracted_frame_conditions(condition_root,
+                                           splits=("train", "val", "test"),
+                                           max_probe=32):
+        """Set of frame-condition names present in EVERY probed .npz
+        (intersection: a condition counts as available only if all probed
+        samples contain it). Reads only the .npz key list, not the arrays."""
+        root = Path(condition_root) if condition_root else None
+        if root is None or not root.exists():
+            return set()
+        common = None
+        probed = 0
+        for split in splits:
+            sdir = root / split
+            if not sdir.exists():
+                continue
+            for npz in sdir.rglob("*.npz"):
+                try:
+                    with np.load(str(npz)) as d:
+                        keys = set(d.files)
+                except Exception:
+                    continue
+                common = keys if common is None else (common & keys)
+                probed += 1
+                if probed >= max_probe:
+                    break
+            if probed >= max_probe:
+                break
+        return common or set()
+
+    enabled_pool = {name for name, c in CONDITION_CONFIG["frame_level"].items()
+                    if c.get("enabled", False)}
+    extracted = _detect_extracted_frame_conditions(cfg.paths.condition_root)
+    available = extracted & enabled_pool   # extracted AND known/enabled
+
     enabled_f = cfg.conditioning.get("enabled_frame",  None)
     enabled_g = cfg.conditioning.get("enabled_global", None)
     # OmegaConf converts YAML null -> None, YAML list -> ListConfig.
-    # Convert ListConfig to a plain list before passing to the registry.
     if enabled_f is not None:
         enabled_f = list(enabled_f)
     if enabled_g is not None:
         enabled_g = list(enabled_g)
+
+    if enabled_f is None:
+        # Default: train with whatever has actually been extracted on disk.
+        enabled_f = sorted(available)
+        print(f"[conditions] enabled_frame not set -> using the frame conditions "
+              f"extracted on disk: {enabled_f}")
+        if not enabled_f:
+            raise RuntimeError(
+                f"No frame conditions found on disk under "
+                f"{cfg.paths.condition_root}. Extract them first, e.g.:\n"
+                f"  python extract_conditions.py <dataset_root> "
+                f"--conditions melody --device cuda")
+    else:
+        # Explicit subset: every requested condition MUST be extracted.
+        missing = [c for c in enabled_f if c not in extracted]
+        if missing:
+            raise RuntimeError(
+                f"conditioning.enabled_frame requests {missing}, but these are NOT "
+                f"present in the extracted .npz under {cfg.paths.condition_root}.\n"
+                f"  Extracted/available: {sorted(extracted)}\n"
+                f"  Extract the missing ones first:\n"
+                f"    python extract_conditions.py <dataset_root> "
+                f"--conditions {','.join(missing)} --device cuda")
 
     registry = ConditionRegistry(
         enabled_frame  = enabled_f,
@@ -986,35 +1100,44 @@ if __name__ == "__main__":
     print("\nPre-computation of reference statistics for the metrics...")
     metrics_val_ds = MetricsAdapter(val_dataset)
 
-    fd_dac_ref_stats = precompute_fd_dac_reference(
+    # Single real-latent reference (mu + full covariance) shared by BOTH
+    # FD-DAC and the KL divergence, in the normalized latent space -- exactly
+    # as in the unconditional repo. No audio-domain reference is needed anymore
+    # (FAD/Encodec has been removed).
+    fd_dac_ref_stats = precompute_latent_reference(
         metrics_val_ds,
         cache_path=fd_dac_cache_path,
     )
+    print(f"Reference stats ready: FD-DAC + KL on "
+          f"{fd_dac_ref_stats['n_total']} latent frames "
+          f"({len(val_dataset)} val samples)\n")
 
-    fad_calculator = FADCalculator(device="cuda")
-    fad_calculator.precompute_reference_stats(
-        val_dataset=metrics_val_ds,
-        normalizer=normalizer,
-        wav_root=cfg.paths.wav_root,
-        latent_root=cfg.paths.dataset_root,
-        sr=DAC_SAMPLE_RATE,
-        cache_dir=fad_cache_dir,
-    )
-    print(f"Reference stats ready: "
-          f"FD-DAC on {len(val_dataset)} latent samples, "
-          f"FAD on {fad_calculator.ref_n_samples} audio samples\n")
-
-    # Conditioning-fidelity evaluator: re-extracts the enabled frame conditions
-    # from the conditioned generations and compares them, paired, to the input
-    # conditions (melody RPA/RCA, chroma cosine, rhythm correlation). Built once
-    # from the active frame conditions; evaluation-only, never affects training.
+    # Conditioning-influence evaluators (validation only, never affect training):
+    #   - frame conditions: re-extract the enabled frame conditions from the
+    #     generations and compare, paired, to the input ones (melody RPA/RCA,
+    #     chroma cosine, rhythm/energy correlation).
+    #   - text (CLAP): the audio side of the same CLAP checkpoint, to score
+    #     audio<->text adherence; loaded lazily ONLY if 'text' is active.
+    # The per-condition influence (delta vs null) is consolidated in the
+    # Validation/Condition_influence text panel.
     from condition_metrics import ConditionFidelityEvaluator
     fidelity_evaluator = ConditionFidelityEvaluator(
         enabled_frame=list(FRAME_COND_DIMS.keys()),
         device=device,
     )
+    clap_audio_embedder = None
+    if "text" in GLOBAL_CONFIGS:
+        from conditions import ClapAudioEmbedder
+        # match the CLAP checkpoint used by the text condition
+        clap_model_name = CONDITION_CONFIG["global"]["text"]["kwargs"].get(
+            "model_name", "laion/larger_clap_music")
+        clap_audio_embedder = ClapAudioEmbedder(model_name=clap_model_name, device=device)
+        print(f"Text-influence (CLAP audio) enabled: {clap_model_name}")
+
     metrics_uncond = bool(cfg.sampling.get("metrics_uncond", True))
-    print(f"Conditioning fidelity: {list(FRAME_COND_DIMS.keys()) or 'none'} "
+    print(f"Conditioning influence: frame={list(FRAME_COND_DIMS.keys()) or 'none'}"
+          f"{' + text(CLAP)' if clap_audio_embedder is not None else ''}"
+          f"{' + image(n/a)' if 'image' in GLOBAL_CONFIGS else ''} "
           f"| uncond metrics: {'on' if metrics_uncond else 'off'}\n")
 
     # ======================
@@ -1157,7 +1280,7 @@ if __name__ == "__main__":
     print(f"Audio every {cfg.intervals.audio} step | "
           f"Metrics every {cfg.intervals.metrics} step")
     print(f"Metrics: {cfg.sampling.n_metrics_samples} generated vs "
-          f"{fad_calculator.ref_n_samples} reference")
+          f"{fd_dac_ref_stats['n_total']} reference frames")
     print(f"CFG dropout: all={cfg.conditioning.p_drop_all} "
           f"frame={cfg.conditioning.p_drop_frame} "
           f"global={cfg.conditioning.p_drop_global}")
@@ -1343,13 +1466,13 @@ if __name__ == "__main__":
                 model.train()
 
             # ======================
-            # METRICS (FD-DAC + FAD) on conditioned generations
+            # METRICS (FD-DAC + KL) on conditioned generations
             # ======================
             if step > 0 and step % cfg.intervals.metrics == 0:
                 gen_model = (ema.model
                               if cfg.training.use_ema and step >= cfg.training.ema_start
                               else model)
-                fd_dac, fad = evaluate_and_log_metrics(
+                fd_dac_cond, kl_cond_rg, kl_cond_gr = evaluate_and_log_metrics(
                     model=gen_model,
                     normalizer=normalizer,
                     val_dataset=val_dataset,
@@ -1357,7 +1480,6 @@ if __name__ == "__main__":
                     writer=writer,
                     device=device,
                     output_dir=audio_dir,
-                    fad_calculator=fad_calculator,
                     fd_dac_ref_stats=fd_dac_ref_stats,
                     n_samples=cfg.sampling.n_metrics_samples,
                     sampling_cfg=cfg.sampling,
@@ -1366,11 +1488,16 @@ if __name__ == "__main__":
                     frame_dims=FRAME_COND_DIMS,
                     global_configs=GLOBAL_CONFIGS,
                     fidelity_evaluator=fidelity_evaluator,
+                    clap_audio_embedder=clap_audio_embedder,
                     compute_uncond=metrics_uncond,
                     prefix=("EMA"
                             if cfg.training.use_ema and step >= cfg.training.ema_start
                             else "Model"),
                 )
+                if fd_dac_cond is not None:
+                    pbar.write(f"  Metrics [cond]: FD-DAC={fd_dac_cond:.4f} | "
+                               f"KL(real||gen)={kl_cond_rg:.4f} | "
+                               f"KL(gen||real)={kl_cond_gr:.4f}\n")
                 model.train()
 
             # ======================

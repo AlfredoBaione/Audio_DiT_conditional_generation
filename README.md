@@ -1,6 +1,6 @@
 # Conditioned Audio Diffusion Transformer for Controllable Music Generation
 
-Controllable music generation in the latent space of a neural audio codec, trained with the Rectified Flow objective. This is the **conditioned** extension of the unconditional project: the same Diffusion Transformer (DiT) operating on per-frame [Descript Audio Codec](https://github.com/descriptinc/descript-audio-codec) (DAC) latents is now driven by **frame-level** controls (melody, harmony, rhythm) and **global** controls (text, image). Evaluation uses the same two complementary Fréchet distances, FD-DAC (DAC latent space) and FAD (Encodec embedding space).
+Controllable music generation in the latent space of a neural audio codec, trained with the Rectified Flow objective. This is the **conditioned** extension of the unconditional project: the same Diffusion Transformer (DiT) operating on per-frame [Descript Audio Codec](https://github.com/descriptinc/descript-audio-codec) (DAC) latents is now driven by **frame-level** controls (melody, harmony, rhythm) and **global** controls (text, image). Distributional evaluation uses the same two complementary latent-space metrics as the unconditional project: the Fréchet distance (FD-DAC) and the Kullback–Leibler divergence (KL), both under a shared multivariate-Gaussian model of the DAC latent distributions.
 
 This repository was developed at IRCAM (UMR STMS, Sound Analysis-Synthesis team) within the context of a doctoral research project. It shares its backbone, training objective and evaluation with the unconditional repository; this document covers only what conditioning adds.
 
@@ -62,11 +62,13 @@ Unchanged from the unconditional project. Rectified Flow with `t ∼ LogitNormal
 
 Computed every `intervals.metrics` steps on a **fixed** subset of the validation set (deterministic indices, so the curves are comparable across steps), along three independent axes:
 
-- **Unconditional generation** — `Fd_dac_uncond` / `Fad_uncond`. Samples generated with null conditions (no guidance). This is the only metric that is apples-to-apples comparable with the unconditional model: it measures free-generation quality of the conditioned-trained model. Toggle with `sampling.metrics_uncond`.
-- **Conditional generation** — `Fd_dac_cond` / `Fad_cond`. Each sample generated from one specific validation condition (with CFG guidance). Distributional fidelity of the conditioned generations to the real data. Not comparable with the unconditional model, because conditioning restricts the distribution.
+- **Unconditional generation** — `Fd_dac_uncond` / `Kl_uncond/real_gen` / `Kl_uncond/gen_real`. Samples generated with null conditions (no guidance). This is the only metric that is apples-to-apples comparable with the unconditional model: it measures free-generation quality of the conditioned-trained model. Toggle with `sampling.metrics_uncond`.
+- **Conditional generation** — `Fd_dac_cond` / `Kl_cond/real_gen` / `Kl_cond/gen_real`. Each sample generated from one specific validation condition (with CFG guidance). Distributional fidelity of the conditioned generations to the real data. Not comparable with the unconditional model, because conditioning restricts the distribution.
 - **Conditioning fidelity** — `Cond_fidelity/<name>/<metric>`. A *paired* measure (not distributional): the condition is re-extracted from each conditioned generation and compared one-to-one with the input condition. Per condition: melody → Raw Pitch Accuracy + Raw Chroma Accuracy (`mir_eval.melody`); harmony → mean per-frame chroma cosine (MusicGen-Melody style); rhythm → beat/downbeat curve correlation (Music ControlNet-style adherence). Re-extraction uses the same extractor configuration as `extract_conditions.py`, so the two sides are directly comparable.
 
-Both FD-DAC ([Heusel et al.](https://arxiv.org/abs/1706.08500)-style Fréchet distance in the DAC latent space) and **FAD** ([Kilgour et al., 2019](https://arxiv.org/abs/1812.08466)) on [Encodec](https://arxiv.org/abs/2210.13438) embeddings use real validation references, pre-computed once and cached. The set of fidelity metrics computed is driven by `conditioning.enabled_frame`/`enabled_global`.
+Both distributional metrics are computed **entirely in the (normalized) DAC latent space**, modelling the real and generated latent frames as multivariate Gaussians `N(μ, Σ)` with **full** 1024×1024 covariance. **FD-DAC** is the [Heusel et al.](https://arxiv.org/abs/1706.08500)-style Fréchet (Wasserstein-2) distance between the two Gaussians; it is symmetric. **KL divergence** is the closed-form Kullback–Leibler between the same two Gaussians and, being asymmetric, is reported in **both directions** (`real‖gen` and `gen‖real`), computed via a numerically-stable Cholesky factorization with covariance regularization. A single set of real-validation reference statistics (`μ`, `Σ`) is pre-computed once over the entire validation split, cached, and **shared by both metrics** — no audio decoding or external embedding (e.g. Encodec) is involved. The conditioning-fidelity metrics computed are driven by `conditioning.enabled_frame`/`enabled_global`.
+
+> **Note.** A previous version also computed the Fréchet Audio Distance (FAD) on Encodec embeddings of decoded waveforms. FAD has been removed (in both the conditional and unconditional projects): the distributional evaluation is now latent-only, which removes the audio-decoding cost and the Encodec dependency. Audio is still decoded inside the metrics step, but only for the conditioning-fidelity re-extraction and for the TensorBoard audio/spectrogram previews — not for any distributional metric.
 
 
 ## Faithfulness to the literature
@@ -102,7 +104,7 @@ The deviations are intentional and grounded: chroma is a standard, lightweight h
 ├── sanity_check.py              # End-to-end pipeline check (shapes, gradient, single-batch overfit)
 ├── audio_dataset_npy.py         # Dataset, normaliser, DAC loader (shared)
 ├── preprocess_dataset.py        # Audio → DAC latents (shared)
-├── metrics.py                   # FD-DAC and FAD calculators (shared)
+├── metrics.py                   # FD-DAC and KL divergence (latent-space, full covariance, shared)
 ├── condition_metrics.py         # Conditioning-fidelity metrics (melody/chroma/rhythm)
 ├── configs/
 │   └── cond_default.yaml        # Conditioned OmegaConf configuration
@@ -195,7 +197,7 @@ python test_cond.py --ckpt runs/<run>/checkpoints/best_model.pt --n_samples 16 -
 
 ## Dependencies
 
-In addition to the unconditional requirements (`torch >= 2.0`, `torchaudio`, `numpy < 2`, `descript-audio-codec`, `encodec`, `einops`, `soundfile`, `omegaconf`, `matplotlib`, `tensorboard`, `tqdm`, `scipy`):
+In addition to the unconditional requirements (`torch >= 2.0`, `torchaudio`, `numpy < 2`, `descript-audio-codec`, `soundfile`, `omegaconf`, `matplotlib`, `tensorboard`, `tqdm`, `scipy`):
 
 ```
 basic-pitch          # melody (polyphonic note posteriorgram; ONNX on Windows)
@@ -217,8 +219,6 @@ Pillow               # CLIP image conditioning (global, optional)
 - J. Su et al. *RoFormer: Enhanced Transformer with Rotary Position Embedding*. 2021. [arXiv:2104.09864](https://arxiv.org/abs/2104.09864)
 - N. Shazeer. *GLU Variants Improve Transformer*. 2020. [arXiv:2002.05202](https://arxiv.org/abs/2002.05202)
 - R. Kumar et al. *High-Fidelity Audio Compression with Improved RVQGAN* (DAC). NeurIPS 2023. [arXiv:2306.06546](https://arxiv.org/abs/2306.06546)
-- A. Défossez et al. *High Fidelity Neural Audio Compression* (Encodec). TMLR 2023. [arXiv:2210.13438](https://arxiv.org/abs/2210.13438)
-- K. Kilgour et al. *Fréchet Audio Distance*. INTERSPEECH 2019. [arXiv:1812.08466](https://arxiv.org/abs/1812.08466)
 - Y. Wu et al. *Large-scale Contrastive Language-Audio Pretraining* (CLAP). ICASSP 2023. [arXiv:2211.06687](https://arxiv.org/abs/2211.06687)
 - A. Radford et al. *Learning Transferable Visual Models From Natural Language Supervision* (CLIP). ICML 2021. [arXiv:2103.00020](https://arxiv.org/abs/2103.00020)
 

@@ -350,6 +350,150 @@ class RhythmExtractor(FrameConditionExtractor):
 
 
 # ============================================================
+# FRAME-LEVEL: ENERGY / DYNAMICS (frequency-weighted spectral energy in dB)
+# ============================================================
+
+class EnergyExtractor(FrameConditionExtractor):
+    """
+    Music ControlNet-style "dynamics" control: a single per-frame curve that
+    tracks the perceived loudness / dynamics of the music (forte vs piano,
+    crescendo / diminuendo), NOT the per-note onset transients.
+
+    Convergent recipe across the controllable-music-generation literature
+    (Music ControlNet, Wu et al. 2024; MuseControlLite 2025; Audio ControlNet
+    2026; Controllable Video-to-Music 2025):
+
+      1. Frequency-weighted SPECTRAL ENERGY. We take the STFT power spectrogram
+         (hop = DAC_HOP_LENGTH, so frames align with the DAC latents like the
+         chroma) and weight the frequency bins BEFORE summing them, so the curve
+         reflects PERCEIVED intensity rather than raw sample energy:
+           - a high-pass cutoff (`fmin`) zeroes DC and sub-audible rumble
+             (relevant on classical recordings with room/handling noise);
+           - optional A-weighting (`weighting="A"`) applies the standard
+             perceptual loudness contour (librosa.A_weighting).
+         The weighted power is summed over frequency -> per-frame energy.
+
+      2. dB SCALE. The weighted power is averaged over frequency, square-rooted
+         to an amplitude-like RMS, and converted to ABSOLUTE dB (20*log10(rms+eps),
+         dBFS-like) -- NOT relative to the clip maximum. This keeps the dynamics
+         comparable across clips (absolute level is roughly equalised by the
+         loudnorm in preprocessing) and lets silence map to the floor.
+
+      3. SMOOTHING. A Savitzky-Golay filter over a ~`smooth_sec` window removes
+         the fast onset spikes, leaving the slow dynamic envelope.
+
+      4. NORMALISATION [-top_db, 0] dB -> [0, 1]: silence -> 0, full-scale -> 1.
+         This keeps the same non-negative range as the other frame conditions
+         and, crucially, makes the NULL condition (all zeros, used by CFG dropout
+         and make_null_frame_conditions) read as "silence", consistent with the
+         zeros-mean-absence convention of melody / chroma / rhythm.
+
+    Output: (n_frames, 1) float32 in [0, 1].
+
+    Adherence is evaluated (in condition_metrics.py) with Pearson correlation
+    between the input curve and the one re-extracted from the generation, exactly
+    as Music ControlNet evaluates dynamics control.
+    """
+
+    def __init__(self,
+                 n_fft: int = 2048,
+                 weighting: str = "A",      # "A" (perceptual) or "none"
+                 fmin: float = 40.0,        # high-pass cutoff (Hz); 0 disables
+                 top_db: float = 80.0,      # dynamic range below the per-clip max
+                 smooth_sec: float = 1.0,   # Savitzky-Golay window (seconds)
+                 polyorder: int = 3):
+        self.n_fft = int(n_fft)
+        self.weighting = weighting
+        self.fmin = float(fmin)
+        self.top_db = float(top_db)
+        self.smooth_sec = float(smooth_sec)
+        self.polyorder = int(polyorder)
+        self._freq_gain = None      # cached linear power gain per FFT bin
+        self._freq_gain_sr = None
+
+    @property
+    def name(self) -> str:
+        return "energy"
+
+    @property
+    def dim(self) -> int:
+        return 1
+
+    def _frequency_gain(self, sr: int) -> np.ndarray:
+        """Per-FFT-bin multiplicative gain applied to the POWER spectrogram.
+        Cached per (sr, params). High-pass mask * (optional) A-weighting."""
+        if self._freq_gain is not None and self._freq_gain_sr == sr:
+            return self._freq_gain
+        import librosa
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=self.n_fft)  # (n_fft//2+1,)
+        gain = np.ones_like(freqs, dtype=np.float64)
+        if self.weighting == "A":
+            # A_weighting returns dB; convert to a LINEAR POWER gain (10^(dB/10)).
+            # At f=0 it is -inf dB (log10(0)); the high-pass below zeroes that
+            # bin anyway, so the warning is harmless -- silence it.
+            with np.errstate(divide="ignore"):
+                a_db = librosa.A_weighting(freqs)
+            gain = gain * (10.0 ** (a_db / 10.0))
+        if self.fmin > 0:
+            gain[freqs < self.fmin] = 0.0                          # high-pass
+        self._freq_gain = np.nan_to_num(gain, nan=0.0, posinf=0.0,
+                                        neginf=0.0).astype(np.float64)
+        self._freq_gain_sr = sr
+        return self._freq_gain
+
+    def _savgol(self, x: np.ndarray) -> np.ndarray:
+        """Savitzky-Golay smoothing with a window sized in seconds, guarded for
+        short clips (window must be odd, > polyorder, and <= len(x))."""
+        from scipy.signal import savgol_filter
+        win = int(round(self.smooth_sec * DAC_FRAMES_PER_S))
+        if win % 2 == 0:
+            win += 1                          # must be odd
+        win = max(win, self.polyorder + 2)
+        if win % 2 == 0:
+            win += 1
+        if win > len(x):                      # clip too short -> shrink window
+            win = len(x) if len(x) % 2 == 1 else len(x) - 1
+        if win <= self.polyorder:
+            return x                          # not enough frames to smooth
+        return savgol_filter(x, window_length=win, polyorder=self.polyorder)
+
+    def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
+        import librosa
+        # 1. STFT magnitude spectrogram, hop aligned to DAC frames (like chroma).
+        S = np.abs(librosa.stft(y=audio.astype(np.float32),
+                                n_fft=self.n_fft, hop_length=DAC_HOP_LENGTH))  # (freq, T)
+
+        # 2. Frequency weighting on the magnitude. _frequency_gain is a POWER
+        #    gain, so we apply sqrt(gain) to the magnitude => magnitude^2 carries
+        #    the intended power weighting (high-pass + optional A-weighting).
+        gain = self._frequency_gain(sr)                    # power gain, (freq,)
+        S_w = S * np.sqrt(gain)[:, None]
+
+        # 3. Per-frame RMS from the weighted spectrogram. librosa.feature.rms(S=)
+        #    is correctly normalized (time-domain-consistent, window-aware), so
+        #    the dB scale below is properly calibrated -- unlike a raw bin sum.
+        rms = librosa.feature.rms(S=S_w, frame_length=self.n_fft,
+                                  hop_length=DAC_HOP_LENGTH)[0]   # (T,)
+
+        # 4. ABSOLUTE dB (not relative to the clip max): 20*log10(rms + eps).
+        #    Keeps dynamics comparable across clips (level roughly equalised by
+        #    the preprocessing loudnorm); silence maps to the floor.
+        energy_db = 20.0 * np.log10(rms + 1e-7)
+
+        # 5. Smooth the dynamic envelope (remove onset spikes).
+        energy_db = self._savgol(energy_db)
+
+        # 6. Normalise [-top_db, 0] dB -> [0, 1] (silence -> 0, full-scale -> 1).
+        #    The NULL condition (all zeros) therefore reads as silence, matching
+        #    the zeros-mean-absence convention of melody / chroma / rhythm.
+        energy_norm = np.clip((energy_db + self.top_db) / self.top_db, 0.0, 1.0)
+
+        # 7. Align to the DAC-aligned n_frames and shape (n_frames, 1).
+        energy_norm = self._resample_to_frames(energy_norm, n_frames)
+        return energy_norm.reshape(n_frames, 1).astype(np.float32)
+
+
+# ============================================================
 # GLOBAL: TEXT with CLAP (music-aware)
 # ============================================================
 
@@ -430,6 +574,67 @@ class CLAPTextCondition(GlobalConditionExtractor):
 
     def unload(self):
         """Free GPU memory after pre-computing the embeddings."""
+        if self._model is not None:
+            self._model.cpu()
+            del self._model
+            self._model = None
+            if self._device == "cuda":
+                torch.cuda.empty_cache()
+
+
+# ============================================================
+# CLAP AUDIO EMBEDDER (audio side of CLAP, for text-condition INFLUENCE)
+# ============================================================
+
+class ClapAudioEmbedder:
+    """
+    Audio encoder of the SAME CLAP checkpoint used by CLAPTextCondition.
+
+    Used at validation only, to measure how much the text condition influenced
+    the generation: CLAP's audio and text encoders share one space, so the
+    cosine between the audio embedding of a generation and the CLAP-text
+    embedding that conditioned it (already stored in the dataset, L2-normalized)
+    is a direct text-adherence score. The influence is the delta of this score
+    between the with-text and the null-text generations.
+
+    Lazily loaded; only instantiated when 'text' is an active global condition.
+    """
+
+    def __init__(self, model_name: str = "laion/larger_clap_music",
+                 device: Optional[str] = None):
+        self.model_name = model_name
+        self._model = None
+        self._processor = None
+        self._dim = None
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _load(self):
+        if self._model is not None:
+            return
+        from transformers import ClapAudioModelWithProjection, AutoProcessor
+        self._model = ClapAudioModelWithProjection.from_pretrained(self.model_name)
+        self._processor = AutoProcessor.from_pretrained(self.model_name)
+        self._model.eval().to(self._device)
+        self._dim = int(self._model.config.projection_dim)
+        print(f"[ClapAudioEmbedder] '{self.model_name}' audio encoder "
+              f"loaded on {self._device} (dim={self._dim})")
+
+    @torch.no_grad()
+    def embed(self, wav_np: np.ndarray, sr: int) -> np.ndarray:
+        """(T,) waveform -> (dim,) L2-normalized audio embedding in CLAP space.
+        The processor resamples to CLAP's expected rate internally."""
+        self._load()
+        if wav_np.ndim > 1:
+            wav_np = wav_np.squeeze()
+        inputs = self._processor(audios=np.asarray(wav_np, dtype=np.float32),
+                                 sampling_rate=sr, return_tensors="pt")
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        out = self._model(**inputs)
+        feat = out.audio_embeds                      # (1, dim)
+        feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
+        return feat.squeeze(0).cpu().numpy().astype(np.float32)
+
+    def unload(self):
         if self._model is not None:
             self._model.cpu()
             del self._model
@@ -587,6 +792,16 @@ CONDITION_CONFIG = {
             "class": RhythmExtractor,
             "kwargs": {},
             "out_dim": 32,
+            "enabled": True,
+        },
+        "energy": {
+            # Frequency-weighted spectral-energy dynamics curve (1 channel).
+            # raw_dim=1 -> projected to out_dim by the FrameConditionEncoder.
+            # weighting="A" + fmin high-pass = perceptual loudness on the
+            # audible band. out_dim is small: it is a low-bandwidth 1-D signal.
+            "class": EnergyExtractor,
+            "kwargs": {"weighting": "A", "fmin": 40.0},
+            "out_dim": 16,
             "enabled": True,
         },
         # NB: melody used to be extracted with monophonic CREPE (PitchExtractor),

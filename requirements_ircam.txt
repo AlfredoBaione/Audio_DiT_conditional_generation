@@ -6,7 +6,7 @@
 # --system-site-packages and are identical on every IRCAM machine.
 #
 # NOTE: protobuf is intentionally NOT pinned here. descript-audiotools declares
-# protobuf<3.20, which conflicts with the protobuf==4.25.9 that CLAP/FAD need at
+# protobuf<3.20, which conflicts with the protobuf==4.25.9 that CLAP needs at
 # runtime, so pip refuses to resolve them together. The working setup installs
 # this file first, then forces protobuf==4.25.9 afterwards (a non-blocking
 # warning is expected and ignored). This is automated by install_env.sh.
@@ -33,11 +33,9 @@ beat-this==1.1.0
 braceexpand==0.1.7
 descript-audio-codec==1.0.0
 descript-audiotools==0.7.2
-encodec==0.1.1
 ffmpy==1.0.0
 fire==0.7.1
 flatten-dict==0.5.0
-frechet_audio_distance==0.3.4
 ftfy==6.3.1
 julius==0.2.8
 laion_clap==1.1.7

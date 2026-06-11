@@ -38,6 +38,7 @@ from conditions import (
     MelodyExtractor,
     ChromaExtractor,
     RhythmExtractor,
+    EnergyExtractor,
     DAC_FRAMES_PER_S,
 )
 
@@ -125,11 +126,86 @@ def rhythm_fidelity(target: np.ndarray, generated: np.ndarray,
     }
 
 
+# ============================================================
+# ENERGY / DYNAMICS  -- Pearson correlation of the loudness curve
+# ============================================================
+def energy_fidelity(target: np.ndarray, generated: np.ndarray,
+                    fps: float = DAC_FRAMES_PER_S) -> dict:
+    """Pearson correlation between the target dynamics curve and the one
+    re-extracted from the generation. This is exactly how Music ControlNet
+    (Wu et al. 2024, arXiv:2311.07069) evaluates dynamics adherence. The curve
+    is single-channel, shape (n_frames, 1)."""
+    return {
+        "corr": _pearson(target[:, 0], generated[:, 0]),
+    }
+
+
 FIDELITY_FNS = {
     "melody": melody_fidelity,
     "chroma": chroma_fidelity,
     "rhythm": rhythm_fidelity,
+    "energy": energy_fidelity,
 }
+
+
+# ============================================================
+# INFLUENCE PANEL  -- consolidated TensorBoard text table
+# ============================================================
+def format_influence_panel(influence: dict, step: int, prefix: str = "EMA",
+                           guidance: float = 1.0, n_samples: int = 0) -> str:
+    """
+    Render the per-condition influence dict as a single Markdown table for
+    TensorBoard's add_text. The table contains ONLY the conditions active in the
+    current run (it is built from whatever keys `influence` has), so it adapts
+    automatically as conditions are added or removed.
+
+    `influence` layout:
+        { condition_name: { metric_name: {"cond": float|None,
+                                          "null": float|None,
+                                          "delta": float|None,
+                                          "note": str (optional)} } }
+
+    Δ = with-cond - null. All current metrics are higher-is-better, so Δ > 0
+    means the condition pulled the generation toward its target.
+    """
+    def fmt(x):
+        return f"{x:+.4f}" if isinstance(x, (int, float)) else "n/a"
+
+    def fmt_plain(x):
+        return f"{x:.4f}" if isinstance(x, (int, float)) else "n/a"
+
+    lines = []
+    lines.append(f"### Condition influence — step {step}")
+    lines.append(f"_{prefix} weights · guidance={guidance} · {n_samples} samples_")
+    lines.append("")
+    lines.append("| Condition | Metric | with-cond | null | Δ influence |")
+    lines.append("|---|---|---:|---:|---:|")
+    for cname in influence:
+        for metric, vals in influence[cname].items():
+            note = vals.get("note")
+            if note:
+                lines.append(f"| `{cname}` | {metric} | n/a | n/a | _{note}_ |")
+            else:
+                lines.append(
+                    f"| `{cname}` | {metric} | {fmt_plain(vals.get('cond'))} | "
+                    f"{fmt_plain(vals.get('null'))} | {fmt(vals.get('delta'))} |"
+                )
+
+    # --- legend ---
+    lines.append("")
+    lines.append("**How to read this:**")
+    lines.append("- **with-cond** — adherence to the target when the condition "
+                 "*is* given to the model.")
+    lines.append("- **null** — baseline adherence when the model generates "
+                 "*freely* (no condition); the chance level.")
+    lines.append("- **Δ influence** — `with-cond − null`: the *net* effect of "
+                 "the condition. Δ > 0 means it pulls the generation toward its "
+                 "target; near 0 means it is being ignored. Watch Δ rise as "
+                 "training progresses.")
+    lines.append("- Ranges: RPA / RCA / chroma cosine ∈ [0, 1]; rhythm / energy "
+                 "correlation and CLAP cosine ∈ [−1, 1]. Compare each row over "
+                 "time rather than across rows (different scales).")
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -167,6 +243,7 @@ _EXTRACTOR_FNS = {
     "melody": MelodyExtractor,
     "chroma": ChromaExtractor,
     "rhythm": RhythmExtractor,
+    "energy": EnergyExtractor,
 }
 
 
@@ -196,8 +273,9 @@ class ConditionFidelityEvaluator:
         for name in enabled_frame:
             if name not in _EXTRACTOR_FNS:
                 continue
-            # MelodyExtractor / ChromaExtractor take no constructor args here
-            # (defaults match extraction time); RhythmExtractor needs a device.
+            # MelodyExtractor / ChromaExtractor / EnergyExtractor take no
+            # constructor args here (defaults match extraction time, incl. the
+            # energy weighting="A"/fmin=40); RhythmExtractor needs a device.
             if name == "rhythm":
                 self.extractors[name] = _EXTRACTOR_FNS[name](device=device)
             else:

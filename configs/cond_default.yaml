@@ -1,37 +1,41 @@
-# configs/cond_default.yaml  (IRCAM-ported)
+# configs/cond_default.yaml
 #
 # Default configuration for the conditioned Audio DiT training (training_cond.py).
 #
-# IRCAM PORTING NOTES (only the `paths` block changed vs the Windows version):
-#   - All paths are ABSOLUTE and live on the machine-LOCAL disk
-#     (/data/anasynth_nonbp/baione/...), NEVER on the NFS HOME (/u/anasynth/...).
-#   - runs_dir and cache_dir were "runs" / "cache" (relative -> cwd -> HOME on
-#     IRCAM). Made absolute on local disk so a forgotten CLI override cannot
-#     write training data onto NFS (which would saturate the network).
-#   - You still SHOULD pass paths.* explicitly on the command line per dataset
-#     (the launch pattern from the unconditional project); these defaults are
-#     just a safe fallback.
-#   - Adjust the dataset folder name to whatever you actually extracted
-#     (e.g. dataset_ready_full for museart). conditions/ must have been produced
-#     by extract_conditions.py.
+# Mirrors the structure of configs/uncond_default.yaml (model / data / training
+# / intervals / sampling / paths) and adds a `conditioning` section for the
+# multi-modal conditioning specific to this project:
+#   - frame-level conditions (melody, chroma, rhythm) are CONCATENATED on the
+#     feature dimension at the model input, JASCO-style (see network_cond.py);
+#   - global conditions (text-CLAP, image-CLIP) are injected via AdaLN, exactly
+#     as the class label in the official DiT;
+#   - per-sample CFG dropout during training;
+#   - classifier-free guidance during validation (audio + metrics).
 #
-# Launch:
-#   python launch_training_cond.py --run_name "cond_S_melody" \
-#       paths.dataset_root=/data/anasynth_nonbp/baione/dataset_ready_cond/latents \
-#       paths.wav_root=/data/anasynth_nonbp/baione/dataset_ready_cond/wav \
-#       paths.condition_root=/data/anasynth_nonbp/baione/dataset_ready_cond/conditions \
-#       paths.cache_dir=/data/anasynth_nonbp/baione/cache_cond
+# Name of the experiment (organises runs on disk and in TensorBoard):
+#   python training_cond.py --run_name "cond_S_melody"
+#   (default: timestamp YYYY-MM-DD_HH-MM-SS)
 #
-# Resume:
-#   python launch_training_cond.py --run_name "cond_S_melody" \
-#       --resume /data/anasynth_nonbp/baione/runs_cond/<prev>/checkpoints/checkpoint_step50000.pt
+# To resume a training (a new run starts from the given checkpoint):
+#   python training_cond.py --resume runs/<prev_run>/checkpoints/checkpoint_step50000.pt
+#
+# Override on the CLI with dotlist syntax, e.g.:
+#   python training_cond.py --config configs/cond_default.yaml \
+#       --run_name "cond_S_melody" model.kind=S training.num_steps=500000
+#
+# The project-wide pool of available conditions lives in CONDITION_CONFIG in
+# conditions.py. What lives in YAML is the per-run SELECTION of a subset of that
+# pool (see `conditioning.enabled_frame` / `conditioning.enabled_global`). The
+# final set is persisted into each checkpoint via `frame_cond_dims`,
+# `frame_cond_out_dims` and `global_configs`, so sampling and editing can reload
+# it without the YAML.
 
 
 # ============================================================
 # MODEL
 # ============================================================
 model:
-  kind: 'S'              # S | B | G | L  (see network_cond.py)
+  kind: 'S'              # S | B | L  (see network_cond.py)
   duration_s: 5.0        # seconds of audio per chunk
   drop: 0.0              # dropout in the FFN of every DiT block (0 -> inert)
 
@@ -53,6 +57,12 @@ training:
   num_steps: 500000
   lr: 1.0e-4
 
+  # Regularization / numerical guards.
+  # All three are KEPT AS CONFIGURABLE OPTIONS but DISABLED for this training:
+  # the next run is meant to mirror the configuration used by the official DiT
+  # (facebookresearch/DiT), where TF32 + fp32 + AdamW(wd=0) + no clip proved
+  # stable over millions of steps without any NaN event. They can be re-enabled
+  # later from this YAML or via CLI override (e.g. training.use_amp=true).
   weight_decay: 0.0       # 0 disables weight decay in AdamW
   grad_clip:    0.0       # <= 0 disables gradient clipping (norm still logged)
   use_amp:      false     # false runs everything in fp32 (TF32 in matmul)
@@ -62,21 +72,23 @@ training:
   decay_start_frac: 0.8   # cosine decay from step (num_steps * decay_start_frac)
 
   # EMA
-  use_ema:    true
+  use_ema:    true        # if false, no EMA shadow weights (live model only for val/audio/metrics)
   ema_decay:  0.9999
-  ema_start:  5000
+  ema_start:  5000        # step from which EMA begins updating
 
 
 # ============================================================
 # INTERVALS (in training steps)
 # ============================================================
 intervals:
-  val:     1000
-  audio:   25000
-  audio_preview: false
-  metrics: 50000
-  ckpt:    25000          # lowered from 50000 for blackout protection (mirrors uncond advice)
-  keep_last_n_ckpts: 5
+  val:     1000           # validation loss
+  audio:   25000          # frequency of the optional conditioned-only audio preview
+  audio_preview: false    # if true, ALSO log conditioned-only previews every intervals.audio
+                          # (the full real/with-cond/without-cond comparison is always
+                          #  logged at intervals.metrics, so this is just extra/more frequent)
+  metrics: 50000          # computes FD-DAC + KL (both directions)
+  ckpt:    50000          # save periodical checkpoint
+  keep_last_n_ckpts: 5    # keep only the last N periodic checkpoints
 
 
 # ============================================================
@@ -86,8 +98,12 @@ sampling:
   euler_steps: 50
   t_min: 0.001
   t_max: 0.999
-  n_audio_samples: 4
-  n_metrics_samples: 128
+  n_audio_samples: 4      # conditioned audios logged on TB for listening
+  n_metrics_samples: 128  # conditioned samples used to compute FD-DAC + KL
+  # If true, the metrics step ALSO generates n_metrics_samples UNCONDITIONAL
+  # samples (null conditions, no guidance) and logs Fd_dac_uncond / Kl_uncond,
+  # which are the only metrics comparable with the unconditional model. Doubles
+  # the generation cost of the metrics step. Set false to skip it.
   metrics_uncond: true
 
 
@@ -95,31 +111,63 @@ sampling:
 # CONDITIONING
 # ============================================================
 conditioning:
-  p_drop_all:    0.10
-  p_drop_frame:  0.05
-  p_drop_global: 0.05
+  # CFG dropout (per-sample) applied during training.
+  # p_drop_all + p_drop_frame + p_drop_global must be < 1.0; the remaining
+  # probability mass keeps both branches active.
+  p_drop_all:    0.10     # drop ALL conditions       -> pure unconditional
+  p_drop_frame:  0.05     # drop only frame-level (melody / chroma / rhythm)
+  p_drop_global: 0.05     # drop only global (text / image)
+
+  # Classifier-free guidance scale used when generating audio at validation
+  # time (both for listening and for the metrics).
   guidance_scale: 3.0
 
+  # ---------------------------------------------------------------
+  # Per-run SELECTION of which conditions to activate.
+  # Subset of what is enabled=True in CONDITION_CONFIG (conditions.py).
+  #   null  -> use all conditions marked enabled=True in CONDITION_CONFIG
+  #   []    -> use NO condition of that type
+  #   list  -> use only the listed names (each must be enabled=True
+  #            in CONDITION_CONFIG, otherwise the registry raises)
+  #
+  # Examples:
+  #   enabled_frame:  ["melody"]                      # melody only
+  #   enabled_frame:  ["melody", "chroma"]            # melody + harmony
+  #   enabled_frame:  ["melody", "chroma", "rhythm"]  # all three frame conds
+  #   enabled_frame:  []                              # no frame conditioning
+  #   enabled_global: []                              # no text/image AdaLN
+  #
   # FIRST TEST: melody only, no global conditions.
+  # ---------------------------------------------------------------
   enabled_frame:  ["melody"]
   enabled_global: []
 
 
 # ============================================================
-# PATHS  (IRCAM: absolute, machine-LOCAL disk only)
+# PATHS
 # ============================================================
 paths:
   # Output of preprocess_dataset.py + extract_conditions.py
-  dataset_root:   "/data/anasynth_nonbp/baione/dataset_ready_cond/latents"
-  wav_root:       "/data/anasynth_nonbp/baione/dataset_ready_cond/wav"
-  condition_root: "/data/anasynth_nonbp/baione/dataset_ready_cond/conditions"
+  dataset_root:   "./dataset_ready_cond/latents"
+  wav_root:       "./dataset_ready_cond/wav"
+  condition_root: "./dataset_ready_cond/conditions"
 
-  # Class-organised image folders (image_root/<class>/*.jpg). Optional.
-  image_root:     "/data/anasynth_nonbp/baione/image_dataset_cond"
+  # Class-organised image folders (image_root/<class>/*.jpg)
+  image_root:     "./image_dataset_cond"
 
-  # Runs and cache: ABSOLUTE on local disk (NEVER relative -> never on HOME NFS).
-  runs_dir:       "/data/anasynth_nonbp/baione/runs_cond"
-  cache_dir:      "/data/anasynth_nonbp/baione/cache_cond"
+  # Shared among all runs; the specific run is in runs_dir/<run_name>/
+  runs_dir:       "runs"
 
+  # Shared cache among runs over the same dataset (normalizer, FD-DAC + KL reference).
+  # Computed once, reused by all subsequent runs.
+  cache_dir:      "cache"
+
+  # Name of the run (folder under runs_dir/).
+  # Priority: CLI --run_name > YAML run_name > self-generated timestamp.
+  # The adopted value is written here after load, so the dumped config.yaml
+  # always has it.
   run_name:       null
+
+  # Checkpoint path to resume from (override also from --resume CLI).
+  # When resuming, a new run starts; the config registers resume_from.
   resume_from:    null
