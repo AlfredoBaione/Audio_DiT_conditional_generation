@@ -725,7 +725,7 @@ class ImageDatasetManager:
             base = self.image_root / self.split
             if not base.exists():
                 print(f"[ImageDataset/{self.split}] {base} does not exist, "
-                      f"uso layout legacy {self.image_root}")
+                      f"using legacy layout {self.image_root}")
                 base = self.image_root
         else:
             base = self.image_root
@@ -738,7 +738,7 @@ class ImageDatasetManager:
                     self.class_images[d.name] = imgs
         total = sum(len(v) for v in self.class_images.values())
         tag = f"/{self.split}" if self.split else ""
-        print(f"[ImageDataset{tag}] {len(self.class_images)} classi, {total} immagini")
+        print(f"[ImageDataset{tag}] {len(self.class_images)} classes, {total} images")
 
     def has_class(self, class_name: str) -> bool:
         return class_name in self.class_images

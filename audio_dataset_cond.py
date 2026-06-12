@@ -378,10 +378,14 @@ def build_conditioned_datasets(
         chunks = raw.get_chunks_for_normalizer()
         normalizer.fit_from_chunks(chunks, n_frames=raw.n_frames)
 
-    # Image manager: one per split (respects image_root/{train,val}/<class>/)
+    # Image manager: built ONLY if 'image' is an active global condition.
+    # (When image conditioning is OFF, there is no reason to scan image_root or
+    # print image-dataset messages, even if the folder happens to exist.)
     train_image_mgr = None
     val_image_mgr = None
-    if image_root and Path(image_root).exists():
+    image_active = (registry is not None
+                    and "image" in getattr(registry, "global_extractors", {}))
+    if image_active and image_root and Path(image_root).exists():
         train_image_mgr = ImageDatasetManager(image_root, split="train")
         val_image_mgr = ImageDatasetManager(image_root, split="val")
 

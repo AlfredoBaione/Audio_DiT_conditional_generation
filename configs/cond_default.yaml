@@ -100,6 +100,10 @@ sampling:
   t_max: 0.999
   n_audio_samples: 4      # conditioned audios logged on TB for listening
   n_metrics_samples: 128  # conditioned samples used to compute FD-DAC + KL
+  # How many validation generations to DUMP TO DISK per metrics step
+  # (each: input conditions .npz + conditioned .wav + unconditioned .wav), under
+  # runs/<run>/audio/step_<step>/. Default = all generated; lower for big runs.
+  n_val_save: ${sampling.n_metrics_samples}
   # If true, the metrics step ALSO generates n_metrics_samples UNCONDITIONAL
   # samples (null conditions, no guidance) and logs Fd_dac_uncond / Kl_uncond,
   # which are the only metrics comparable with the unconditional model. Doubles

@@ -748,12 +748,19 @@ def evaluate_and_log_metrics(
     # NOT as separate scalar curves. TensorBoard keeps a per-step history of the
     # text, so the step slider walks the panel across training.
     if influence:
-        from condition_metrics import format_influence_panel
+        from condition_metrics import format_influence_panel, format_influence_legend
         panel_md = format_influence_panel(
             influence, step=step, prefix=prefix,
             guidance=guidance, n_samples=n_samples,
         )
         writer.add_text("Validation/Condition_influence", panel_md, step)
+        # Log the explanatory legend ONCE, on its own tag. Pinned to step 0 so it
+        # reads as a one-time preamble, not tied to a metrics step (TensorBoard
+        # text always carries SOME step; 0 is the most neutral).
+        if not getattr(evaluate_and_log_metrics, "_legend_logged", False):
+            writer.add_text("Validation/Condition_influence_legend",
+                            format_influence_legend(), 0)
+            evaluate_and_log_metrics._legend_logged = True
 
     # ===== console summary =====
     def _f(x):
@@ -774,15 +781,52 @@ def evaluate_and_log_metrics(
         if parts:
             print("  [influence] " + " | ".join(parts))
 
-    # ===== RICH COMPARISON LOGGING (real / with-cond / without-cond) =====
-    # For the first n_log samples (same indices as the metrics generations),
-    # log, all tagged by the generating weights `w` (EMA or Model):
-    #   IMAGES: spectrogram, for real / with-cond / without-cond
-    #   AUDIO : the audio,    for real / with-cond / without-cond
-    # Everything is logged with global_step=step so TensorBoard's slider walks
-    # across the metric steps. Melody piano-rolls and sonified-melody audio are
-    # intentionally NOT logged here; per-condition influence is consolidated in
-    # the Validation/Condition_influence text panel (no separate scalar curves).
+    # ===== SAVE VALIDATION ARTIFACTS TO DISK (one dir per step, one sub-dir per generation) =====
+    # output_dir/step_{step}/generation_{i}/ contains, for generation i:
+    #   conditions.npz   - the EXACT input conditions used (melody, energy, ...)
+    #   cond_{name}.wav  - AUDIBLE rendering of each condition (melody as sine
+    #                      tones, energy as amplitude-modulated tone) so one can
+    #                      hear how it maps into the conditioned audio
+    #   cond.wav         - the conditioned generation
+    #   uncond.wav       - the unconditioned (null) generation, same index
+    #   real.wav         - the reference audio (first n_log generations only)
+    # How many generations are dumped is sampling.n_val_save (default: all).
+    def _to_np(wav):
+        return wav.numpy() if wav.dim() == 1 else wav.squeeze().numpy()
+
+    from condition_metrics import sonify_condition
+
+    n_val_save = int(getattr(sampling_cfg, "n_val_save", n_samples) or n_samples)
+    n_save = min(n_val_save, len(cond_wavs))
+    step_dir = os.path.join(output_dir, f"step_{step:07d}")
+
+    def _gen_dir(i):
+        d = os.path.join(step_dir, f"generation_{i:03d}")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    for i in range(n_save):
+        gdir = _gen_dir(i)
+        sf.write(os.path.join(gdir, "cond.wav"),
+                 _to_np(cond_wavs[i]), DAC_SAMPLE_RATE)
+        if i < len(cond_targets):
+            np.savez(os.path.join(gdir, "conditions.npz"), **cond_targets[i])
+            for cname, carr in cond_targets[i].items():
+                son = sonify_condition(cname, carr, DAC_SAMPLE_RATE)
+                if son is not None:
+                    sf.write(os.path.join(gdir, f"cond_{cname}.wav"),
+                             son, DAC_SAMPLE_RATE)
+        if compute_uncond and i < len(unc_wavs):
+            sf.write(os.path.join(gdir, "uncond.wav"),
+                     _to_np(unc_wavs[i]), DAC_SAMPLE_RATE)
+    print(f"    saved {n_save} validation generations "
+          f"(per-generation dirs: cond+uncond+conditions+sonified) to {step_dir}")
+
+    # ===== RICH COMPARISON LOGGING on TensorBoard (real / with-cond / without-cond) =====
+    # For the first n_log samples, log (tagged by the generating weights `w`):
+    #   IMAGES: spectrogram   AUDIO: the full audio,  for real / cond / uncond.
+    # Both conditioned AND unconditioned audio are logged at every metrics step
+    # for direct A/B comparison. Per-condition influence is in the text panel.
     w = prefix  # "EMA" or "Model"
 
     def _log_audio(wav, tag):
@@ -802,6 +846,8 @@ def evaluate_and_log_metrics(
         real_wav = _decode_one(real_frames[i], dac_model)
         _log_audio(real_wav, f"Audio_real_{i:02d}")
         _log_spec(real_wav, f"Spectrogram_real_{i:02d}", f"real {i} - step {step}")
+        sf.write(os.path.join(_gen_dir(i), "real.wav"),
+                 real_wav.numpy(), DAC_SAMPLE_RATE)
 
         # ---------- GENERATED WITH COND ----------
         cwav = cond_wavs[i]
@@ -815,17 +861,6 @@ def evaluate_and_log_metrics(
             _log_audio(uwav, f"Audio_generated_without_cond_{w}_{i:02d}")
             _log_spec(uwav, f"Spectrogram_generated_without_cond_{w}_{i:02d}",
                       f"generated without cond ({w}) {i} - step {step}")
-
-        # ---------- save wavs to disk ----------
-        sf.write(os.path.join(output_dir, f"metrics_step{step:07d}_real_{i:02d}.wav"),
-                 real_wav.numpy(), DAC_SAMPLE_RATE)
-        sf.write(os.path.join(output_dir, f"metrics_step{step:07d}_with_cond_{w}_{i:02d}.wav"),
-                 cwav.numpy() if cwav.dim() == 1 else cwav.squeeze().numpy(),
-                 DAC_SAMPLE_RATE)
-        if compute_uncond:
-            sf.write(os.path.join(output_dir, f"metrics_step{step:07d}_without_cond_{w}_{i:02d}.wav"),
-                     uwav.numpy() if uwav.dim() == 1 else uwav.squeeze().numpy(),
-                     DAC_SAMPLE_RATE)
 
     del dac_model
     if device == "cuda":
@@ -1581,3 +1616,4 @@ if __name__ == "__main__":
         except Exception:
             pass
         print("Training concluded." if saved else "Training ended (see warnings above).")
+

@@ -174,9 +174,11 @@ def format_influence_panel(influence: dict, step: int, prefix: str = "EMA",
     def fmt_plain(x):
         return f"{x:.4f}" if isinstance(x, (int, float)) else "n/a"
 
+    # Markdown (TensorBoard renders markdown but NOT raw HTML). No big '###'
+    # heading -> lighter/smaller; the explanatory legend is a separate tag.
     lines = []
-    lines.append(f"### Condition influence — step {step}")
-    lines.append(f"_{prefix} weights · guidance={guidance} · {n_samples} samples_")
+    lines.append(f"**Condition influence — step {step}** · "
+                 f"_{prefix} · guidance={guidance} · {n_samples} samples_")
     lines.append("")
     lines.append("| Condition | Metric | with-cond | null | Δ influence |")
     lines.append("|---|---|---:|---:|---:|")
@@ -190,22 +192,26 @@ def format_influence_panel(influence: dict, step: int, prefix: str = "EMA",
                     f"| `{cname}` | {metric} | {fmt_plain(vals.get('cond'))} | "
                     f"{fmt_plain(vals.get('null'))} | {fmt(vals.get('delta'))} |"
                 )
-
-    # --- legend ---
-    lines.append("")
-    lines.append("**How to read this:**")
-    lines.append("- **with-cond** — adherence to the target when the condition "
-                 "*is* given to the model.")
-    lines.append("- **null** — baseline adherence when the model generates "
-                 "*freely* (no condition); the chance level.")
-    lines.append("- **Δ influence** — `with-cond − null`: the *net* effect of "
-                 "the condition. Δ > 0 means it pulls the generation toward its "
-                 "target; near 0 means it is being ignored. Watch Δ rise as "
-                 "training progresses.")
-    lines.append("- Ranges: RPA / RCA / chroma cosine ∈ [0, 1]; rhythm / energy "
-                 "correlation and CLAP cosine ∈ [−1, 1]. Compare each row over "
-                 "time rather than across rows (different scales).")
     return "\n".join(lines)
+
+
+def format_influence_legend() -> str:
+    """One-off legend for the Condition_influence panel, logged ONCE to a
+    separate TensorBoard text tag (its own box), not in every per-step table.
+    Markdown only (TensorBoard does not render raw HTML)."""
+    return (
+        "**How to read the Condition influence panel**\n\n"
+        "- **with-cond** — adherence to the target when the condition is given "
+        "to the model.\n"
+        "- **null** — baseline adherence when the model generates freely "
+        "(no condition); the chance level.\n"
+        "- **Δ influence** = with-cond − null — the net effect of the condition. "
+        "Δ > 0 means it pulls the generation toward its target; near 0 means it "
+        "is being ignored. Watch Δ rise as training progresses.\n"
+        "- Ranges: RPA / RCA / chroma cosine ∈ [0, 1]; rhythm / energy "
+        "correlation and CLAP cosine ∈ [−1, 1]. Compare each row over time "
+        "rather than across rows (different scales)."
+    )
 
 
 # ============================================================
@@ -245,6 +251,53 @@ _EXTRACTOR_FNS = {
     "rhythm": RhythmExtractor,
     "energy": EnergyExtractor,
 }
+
+
+# ============================================================
+# CONDITION SONIFICATION  -- render each condition to an audible waveform
+# ============================================================
+def sonify_energy(curve, sr, fps: float = DAC_FRAMES_PER_S,
+                  carrier_hz: float = 220.0, amp: float = 0.3) -> np.ndarray:
+    """
+    Render an energy/dynamics curve (T, 1) in [0, 1] to an audible waveform: a
+    steady carrier tone whose AMPLITUDE follows the curve, so the loudness shape
+    (forte/piano, crescendo/diminuendo) can be *heard* and compared with the
+    conditioned generation. The envelope is linearly interpolated up to the
+    sample rate to avoid zipper artifacts. Returns float32, same length as the
+    audio of the same number of frames.
+    """
+    env = np.asarray(curve, dtype=np.float32).reshape(-1)     # (T,)
+    T = len(env)
+    spf = max(1, int(round(sr / float(fps))))
+    n = T * spf
+    x_old = np.linspace(0.0, 1.0, T, dtype=np.float64)
+    x_new = np.linspace(0.0, 1.0, n, dtype=np.float64)
+    env_up = np.interp(x_new, x_old, env).astype(np.float32)  # smooth envelope
+    t = np.arange(n, dtype=np.float64) / float(sr)
+    carrier = np.sin(2.0 * np.pi * carrier_hz * t).astype(np.float32)
+    return (amp * env_up * carrier).astype(np.float32)
+
+
+# name -> callable(array, sr, fps) -> waveform (float32). Conditions without a
+# sonifier (e.g. chroma) are simply skipped. Easy to extend (e.g. rhythm clicks).
+SONIFY_FNS = {
+    "melody": sonify_melody,
+    "energy": sonify_energy,
+}
+
+
+def sonify_condition(name: str, arr, sr: int,
+                     fps: float = DAC_FRAMES_PER_S):
+    """Dispatch to the right sonifier for a condition; returns a waveform
+    (float32) or None if that condition has no audible rendering."""
+    fn = SONIFY_FNS.get(name)
+    if fn is None:
+        return None
+    try:
+        return fn(arr, sr, fps)
+    except Exception as e:
+        print(f"  [sonify] skipped '{name}': {e}")
+        return None
 
 
 # ============================================================
