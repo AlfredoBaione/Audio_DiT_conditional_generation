@@ -95,7 +95,8 @@ intervals:
 # SAMPLING (Euler / rectified flow)
 # ============================================================
 sampling:
-  euler_steps: 50
+  euler_steps: 100        # match uncond for fair cond-vs-uncond FD-DAC comparison
+                          # (with CFG each step does 2 forward passes)
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4      # conditioned audios logged on TB for listening

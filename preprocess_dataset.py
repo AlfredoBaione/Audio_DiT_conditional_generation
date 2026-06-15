@@ -1,7 +1,28 @@
 """
-preprocess_dataset.py (v6 - Universal, lazy GPU acquisition)
+preprocess_dataset.py (v7 - dynamics-preserving; was v6 - Universal, lazy GPU)
 
 Unified preprocessing for the Audio DiT (conditional + unconditional).
+
+CHANGES 2026-06-12 (agreed revision — classical dynamics preservation):
+  1. Loudness: the loudnorm second pass (linear=true) is replaced by ONE pure
+     constant gain (volume=...dB) computed from the pass-1 measurements and
+     capped by the true-peak headroom. Rationale: loudnorm with linear=true
+     silently reverts to DYNAMIC (compressing) mode whenever measured_LRA >
+     TARGET_LRA or the linear gain would violate TP — with I=-14 this fired on
+     most files and compressed exactly the wide-dynamics classical material.
+     A volume filter can never compress nor clip. TARGET_LUFS: -14 -> -18.
+  2. SILENCE_THRESH_DB (per-chunk mean-volume gate): -40 -> -60 dB. At -40 the
+     gate deleted pianissimo passages, slow-movement openings and reverb tails.
+  3. SILENCE_TRIM_DB (edge trim): -35 -> -55 dB. At -35 quiet beginnings and
+     endings of classical recordings were cut before normalization.
+  4. Stereo: no more mono downmix by averaging (-ac 1 only), which
+     phase-cancels dense stereo mixes. Each channel of a multi-channel file
+     becomes a separate mono example (pan=mono|c0=cN); both channels of the
+     same segment share the SAME split draw to avoid train/val leakage.
+  Everything else (phases, naming, lazy GPU, metadata, DAC encode) unchanged.
+  NOTE: re-preprocess the WHOLE dataset with this version (uniformity across
+  classes), refit the latent normalizer in a FRESH cache dir, and treat all
+  pre-revision FD-DAC/KL numbers as incomparable.
 
 Pipeline:
     Raw audio -> qualitative preprocessing -> chunk -> DAC encode -> latents .npy
@@ -114,6 +135,21 @@ def get_audio_duration(file_path: str) -> float:
         return 0.0
 
 
+def get_audio_channels(file_path: str) -> int:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=channels",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             str(file_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        return int(result.stdout.strip())
+    except Exception:
+        return 1   # defensive: unknown -> old single-output path
+
+
 def get_chunk_rms_db(file_path: str) -> float:
     try:
         result = subprocess.run(
@@ -217,7 +253,7 @@ def analyze_loudness(file_path: str, config: dict) -> dict:
 # ============================================================
 # PREPROCESSING: TRIM + NORMALIZE  (worker: phase 2)
 # ============================================================
-def preprocess_file(args: tuple) -> dict:
+def preprocess_file(args: tuple) -> list:
     file_path, class_name, safe_class_name, file_index, config = args
     file_path = Path(file_path)
 
@@ -230,62 +266,81 @@ def preprocess_file(args: tuple) -> dict:
 
     loudness = analyze_loudness(str(file_path), config)
 
-    filters = []
+    # Loudness: ONE pure constant gain, computed from the pass-1 measurements
+    # and CAPPED by the true-peak headroom:
+    #     gain_dB = min(TARGET_LUFS - measured_I, TARGET_TP - measured_TP)
+    # A volume filter can never compress the dynamics nor clip. (The previous
+    # loudnorm linear=true pass silently reverted to dynamic/compressing mode
+    # whenever measured_LRA > TARGET_LRA or the linear gain would violate TP.)
+    gain_filter = None
     if loudness:
-        # linear=true => one constant gain is applied to reach the target
-        # integrated loudness. With a high TARGET_LRA the dynamic range is NOT
-        # compressed: internal forte/piano relationships are preserved.
-        filters.append(
-            f"loudnorm=I={config['TARGET_LUFS']}:TP={config['TARGET_TP']}:LRA={config['TARGET_LRA']}:"
-            f"measured_I={loudness['measured_I']}:"
-            f"measured_TP={loudness['measured_TP']}:"
-            f"measured_LRA={loudness['measured_LRA']}:"
-            f"measured_thresh={loudness['measured_thresh']}:"
-            f"linear=true"
-        )
-    else:
-        # Measurement failed: without measured_* ffmpeg can only run loudnorm in
-        # dynamic (compressing) mode, which would crush the dynamics. To protect
-        # them, skip loudness normalization for this file (keep original level).
+        try:
+            measured_i  = float(loudness["measured_I"])
+            measured_tp = float(loudness["measured_TP"])
+            if math.isfinite(measured_i) and math.isfinite(measured_tp):
+                gain_db = min(config["TARGET_LUFS"] - measured_i,
+                              config["TARGET_TP"]   - measured_tp)
+                gain_filter = f"volume={gain_db:.2f}dB"
+        except (TypeError, ValueError):
+            gain_filter = None
+    # Measurement failed/unusable: no gain (keep original level) — same
+    # dynamics-protecting fallback as before.
+
+    # Stereo: averaging to mono (-ac 1 alone) phase-cancels dense stereo
+    # mixes. Each channel of a multi-channel file becomes its own mono
+    # example (pan=mono|c0=cN). Mono files keep the old single-output path.
+    n_channels = get_audio_channels(str(file_path))
+    channels = [0, 1] if n_channels >= 2 else [None]
+
+    results = []
+    for ch in channels:
         filters = []
+        if ch is not None:
+            filters.append(f"pan=mono|c0=c{ch}")
+        if gain_filter:
+            filters.append(gain_filter)
 
-    temp_out = Path(config["TEMP_DIR"]) / f"{safe_class_name}_{file_index:05d}.wav"
+        suffix = f"_c{ch}" if ch is not None else ""
+        temp_out = Path(config["TEMP_DIR"]) / f"{safe_class_name}_{file_index:05d}{suffix}.wav"
 
-    command = [
-        "ffmpeg", "-y", "-hide_banner",
-        "-ss", str(trim_start),
-        "-i", str(file_path),
-        "-t", str(trimmed_duration),
-    ]
-    # Only add the -af flag if we actually have filters (the dynamics-preserving
-    # fallback above can leave filters empty: in that case no loudnorm is applied).
-    if filters:
-        command += ["-af", ",".join(filters)]
-    command += [
-        "-ar", str(config["SR"]), "-ac", "1",
-        "-loglevel", "error",
-        str(temp_out),
-    ]
+        command = [
+            "ffmpeg", "-y", "-hide_banner",
+            "-ss", str(trim_start),
+            "-i", str(file_path),
+            "-t", str(trimmed_duration),
+        ]
+        # Only add the -af flag if we actually have filters (no measurement and
+        # mono input -> no filter at all, as before).
+        if filters:
+            command += ["-af", ",".join(filters)]
+        command += [
+            "-ar", str(config["SR"]), "-ac", "1",
+            "-loglevel", "error",
+            str(temp_out),
+        ]
 
-    try:
-        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
-    except subprocess.CalledProcessError as e:
-        stderr_msg = (e.stderr.decode("utf-8", errors="replace").strip()) if e.stderr else ""
-        print(f"[ERROR] Preprocessing failed: {file_path.name}: {stderr_msg}")
-        return None
+        try:
+            subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        except subprocess.CalledProcessError as e:
+            stderr_msg = (e.stderr.decode("utf-8", errors="replace").strip()) if e.stderr else ""
+            print(f"[ERROR] Preprocessing failed: {file_path.name}{suffix}: {stderr_msg}")
+            continue
 
-    actual_duration = get_audio_duration(str(temp_out))
-    if actual_duration < config["MIN_CHUNK_SEC"]:
-        temp_out.unlink(missing_ok=True)
-        return None
+        actual_duration = get_audio_duration(str(temp_out))
+        if actual_duration < config["MIN_CHUNK_SEC"]:
+            temp_out.unlink(missing_ok=True)
+            continue
 
-    return {
-        "temp_path":       str(temp_out),
-        "source_name":     file_path.name,
-        "class_name":      class_name,
-        "safe_class_name": safe_class_name,
-        "duration":        actual_duration,
-    }
+        results.append({
+            "temp_path":       str(temp_out),
+            "source_name":     file_path.name,
+            "class_name":      class_name,
+            "safe_class_name": safe_class_name,
+            "channel":         ch if ch is not None else 0,
+            "duration":        actual_duration,
+        })
+
+    return results if results else None
 
 
 # ============================================================
@@ -316,6 +371,13 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict,
 
     class_counters = Counter()
     all_chunks = []
+    # The two mono examples extracted from the two channels of the SAME stereo
+    # source are near-identical content: they must land in the same split,
+    # otherwise they leak across train/val. The split is therefore drawn once
+    # per (class, source file, segment index) and reused for the other channel.
+    # For mono-only datasets this is behaviourally identical to the old
+    # per-chunk draw (every key is unique).
+    split_cache = {}
 
     for pf in preprocessed_files:
         n_chunks = math.ceil(pf["duration"] / config["CHUNK_LENGTH_SEC"])
@@ -328,13 +390,16 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict,
             if actual_duration < config["MIN_CHUNK_SEC"]:
                 continue
 
-            r = rng.random()
-            if r < thresholds[0]:
-                split = "train"
-            elif r < thresholds[1]:
-                split = "val"
-            else:
-                split = "test"
+            split_key = (safe_class, pf["source_name"], i)
+            if split_key not in split_cache:
+                r = rng.random()
+                if r < thresholds[0]:
+                    split_cache[split_key] = "train"
+                elif r < thresholds[1]:
+                    split_cache[split_key] = "val"
+                else:
+                    split_cache[split_key] = "test"
+            split = split_cache[split_key]
 
             class_counters[safe_class] += 1
             seg_num = class_counters[safe_class]
@@ -351,6 +416,7 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict,
                 "source_name":     pf["source_name"],
                 "class_name":      pf["class_name"],
                 "safe_class_name": safe_class,
+                "channel":         pf.get("channel", 0),
                 "seg_index":       i,
                 "start_sec":       round(start_sec, 3),
                 "duration_sec":    round(actual_duration, 3),
@@ -544,7 +610,7 @@ def encode_chunks_dac(saved_chunks: list, device: str, gpu_mode: str,
 def write_metadata(chunks: list, output_path: str):
     fieldnames = [
         "short_name", "split", "class_name", "safe_class_name",
-        "source_name", "seg_index", "start_sec", "duration_sec", "rms_db",
+        "source_name", "channel", "seg_index", "start_sec", "duration_sec", "rms_db",
     ]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -602,20 +668,24 @@ def main():
         "SR": args.sr,
         "OUTPUT_DIR": args.output_dir,
         "TEMP_DIR": temp_dir,
-        "SILENCE_THRESH_DB": -40.0,
-        "SILENCE_TRIM_DB": -35.0,
-        "TARGET_LUFS": -14.0,
-        "TARGET_TP": -1.0,
-        "TARGET_LRA": 20.0,   # high target LRA => loudnorm (linear) does NOT
-                              # compress the dynamic range; preserves the wide
-                              # forte/piano range typical of classical music.
+        "SILENCE_THRESH_DB": -60.0,  # was -40: the mean-volume gate deleted
+                                     # pianissimo chunks of classical music.
+        "SILENCE_TRIM_DB": -55.0,    # was -35: edge trim cut quiet
+                                     # openings/endings of classical recordings.
+        "TARGET_LUFS": -18.0,        # was -14: gain target for the pure
+                                     # constant-gain normalization; with -14 the
+                                     # true-peak cap fired on nearly every file.
+        "TARGET_TP": -1.0,           # true-peak ceiling used to CAP the gain.
+        "TARGET_LRA": 20.0,          # only used by the pass-1 measurement
+                                     # filter spec (loudnorm print_format=json);
+                                     # no loudnorm is applied in pass 2 anymore.
         "KEEP_TRAIN_WAV": args.keep_train_wav,
     }
 
     n_cores = min(args.max_workers, cpu_count())
 
     print(f"{'='*60}")
-    print(f"PREPROCESSING AUDIO DATASET (v6 - lazy GPU)")
+    print(f"PREPROCESSING AUDIO DATASET (v7 - dynamics-preserving, lazy GPU)")
     print(f"{'='*60}")
     print(f"  Source:         {args.source_dir}")
     print(f"  Output:         {args.output_dir}")
@@ -647,14 +717,17 @@ def main():
             for result in tqdm(pool.imap_unordered(preprocess_file, preprocess_args),
                                total=len(preprocess_args), desc="Preprocessing"):
                 if result is not None:
-                    preprocessed.append(result)
+                    # preprocess_file returns a LIST (1 entry for mono sources,
+                    # 2 entries — one per channel — for stereo sources).
+                    preprocessed.extend(result)
 
         if not preprocessed:
             print("[ERROR] No files preprocessed!")
             return
 
-        # Deterministic order before split assignment (reproducible split/naming).
-        preprocessed.sort(key=lambda x: (x["safe_class_name"], x["source_name"]))
+        # Deterministic order before split assignment (reproducible split/naming;
+        # 'channel' breaks the tie between the two examples of a stereo source).
+        preprocessed.sort(key=lambda x: (x["safe_class_name"], x["source_name"], x["channel"]))
 
         # 3. CHUNK + SPLIT
         print("Phase 3/5 - Chunk preparation + split...")

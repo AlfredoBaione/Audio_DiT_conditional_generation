@@ -12,7 +12,7 @@
 #   1. pip install -r requirements_ircam.txt
 #        Everything on top of the tf2.18 base. protobuf is NOT pinned in that
 #        file: descript-audiotools declares protobuf<3.20, which pip cannot
-#        reconcile with the protobuf==4.25.9 that CLAP/FAD need -> ResolutionImpossible.
+#        reconcile with the protobuf==4.25.9 that CLAP needs -> ResolutionImpossible.
 #   2. pip install protobuf==4.25.9
 #        Forced AFTER the requirements. A non-blocking warning
 #        ("descript-audiotools requires protobuf<3.20 but you have 4.25.9") is
@@ -76,12 +76,12 @@ def check(label, fn):
 import google.protobuf
 print(f"  protobuf {google.protobuf.__version__} (expected 4.25.9)")
 check("numpy + torch",        lambda: __import__("numpy") and __import__("torch"))
-check("dac + encodec",        lambda: __import__("dac") and __import__("encodec"))
+check("dac",                 lambda: __import__("dac"))
 check("basic_pitch",          lambda: __import__("basic_pitch"))
 check("beat_this",            lambda: __import__("beat_this"))
 check("mir_eval",             lambda: __import__("mir_eval"))
 check("laion_clap",           lambda: __import__("laion_clap"))
-check("frechet_audio_distance", lambda: __import__("frechet_audio_distance"))
+check("scipy + librosa",      lambda: __import__("scipy") and __import__("librosa"))
 check("project modules", lambda: [__import__(m) for m in
        ("conditions","network_cond","audio_dataset_cond","metrics","condition_metrics")])
 print()
