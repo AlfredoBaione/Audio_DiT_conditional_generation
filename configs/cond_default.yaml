@@ -54,7 +54,7 @@ data:
 # TRAINING
 # ============================================================
 training:
-  num_steps: 500000
+  num_steps: 1000000
   lr: 1.0e-4
 
   # Regularization / numerical guards.
@@ -152,7 +152,7 @@ conditioning:
   # Examples:
   #   enabled_frame:  ["melody"]                      # melody only
   #   enabled_frame:  ["melody", "chroma"]            # melody + harmony
-  #   enabled_frame:  ["melody", "chroma", "rhythm"]  # all three frame conds
+  #   enabled_frame:  ["melody", "chroma", "rhythm", "energy"]  # all four frame conds
   #   enabled_frame:  []                              # no frame conditioning
   #   enabled_global: []                              # no text/image AdaLN
   #
