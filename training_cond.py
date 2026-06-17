@@ -98,6 +98,28 @@ from metrics import (
 
 
 # ======================
+# DAC LOADER (singleton: load once, reuse for the whole run)
+# ======================
+# Loading the DAC model is slow and allocates a non-trivial amount of memory.
+# The metrics / audio-preview / real-audio paths used to each load and free
+# their own DAC every call; at frequent metrics steps that is wasteful and a
+# source of fragmentation. Mirror the unconditional repo: load it ONCE on CPU
+# and cache it for the whole run.
+_DAC_MODEL = None
+
+
+def get_dac():
+    global _DAC_MODEL
+    if _DAC_MODEL is None:
+        import dac
+        _DAC_MODEL = dac.DAC.load(dac.utils.download(model_type="44khz"))
+        _DAC_MODEL.to("cpu")
+        _DAC_MODEL.eval()
+        print("[DAC] Model loaded once (CPU) and cached for the whole run.")
+    return _DAC_MODEL
+
+
+# ======================
 # CONFIG LOADING
 # ======================
 def load_config():
@@ -432,11 +454,8 @@ def generate_and_log_audio(
         )
         generated_frames.append(gen)
 
-    # Decode with DAC on CPU
-    import dac
-    dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
-    dac_model.to("cpu")
-    dac_model.eval()
+    # Decode with DAC on CPU (shared singleton, loaded once for the whole run)
+    dac_model = get_dac()
 
     for i, gen in enumerate(generated_frames):
         if not torch.isfinite(gen).all():
@@ -465,8 +484,7 @@ def generate_and_log_audio(
             output_dir, f"step{step:07d}_{prefix}_{i:02d}.wav"
         )
         sf.write(wav_path, waveform.squeeze().numpy(), DAC_SAMPLE_RATE)
-
-    del dac_model
+    # dac_model is the shared singleton -> do not delete it.
 
 
 # ======================
@@ -475,10 +493,7 @@ def generate_and_log_audio(
 @torch.no_grad()
 def log_real_audio_samples(val_dataset, normalizer, writer, n_samples):
     """Logs real audio from the val dataset for comparison on TensorBoard."""
-    import dac
-    dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
-    dac_model.to("cpu")
-    dac_model.eval()
+    dac_model = get_dac()
 
     total = len(val_dataset)
     indices = torch.linspace(0, total - 1, n_samples).long().tolist()
@@ -506,7 +521,7 @@ def log_real_audio_samples(val_dataset, normalizer, writer, n_samples):
             spec_img, global_step=0,
         )
 
-    del dac_model
+    # dac_model is the shared singleton -> do not delete it.
     print(f"  {n_samples} real audios logged on TensorBoard")
 
 
@@ -632,14 +647,9 @@ def evaluate_and_log_metrics(
                    if has_ref else None)
     kl_cond = (compute_kl_both(cond_stack, fd_dac_ref_stats, device=device)
                if has_ref else {"kl_real_gen": None, "kl_gen_real": None})
-
-    import dac
-    dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
-    dac_model.to("cpu")
-    dac_model.eval()
-
-    # All conditioned wavs are decoded: fidelity evaluates every generation.
-    cond_wavs = _decode(cond_lat, dac_model)
+    del cond_stack            # free the big stack right after FD/KL (latent-only)
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     # ===== UNCONDITIONAL generation (comparable to the unconditional model) =====
     # The null generations serve two roles: the uncond distributional metrics,
@@ -651,7 +661,7 @@ def evaluate_and_log_metrics(
 
     fd_dac_uncond = None
     kl_uncond = {"kl_real_gen": None, "kl_gen_real": None}
-    unc_wavs = []
+    unc_lat = []
     if compute_uncond:
         unc_lat, _, _, _ = _generate(conditioned=False)
         unc_stack = torch.stack(unc_lat)
@@ -659,35 +669,74 @@ def evaluate_and_log_metrics(
                          if has_ref else None)
         kl_uncond = (compute_kl_both(unc_stack, fd_dac_ref_stats, device=device)
                      if has_ref else {"kl_real_gen": None, "kl_gen_real": None})
-        # For the influence baseline we re-extract conditions from EVERY null
-        # generation, so decode all of them; otherwise only the first n_log are
-        # needed for the audio/spectrogram previews.
-        unc_wavs = _decode(unc_lat if influence_active else unc_lat[:n_log], dac_model)
+        del unc_stack         # free
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    # ===== AUDIO PART: STREAMED, memory-flat (this is the OOM fix) =====
+    # FD-DAC/KL above are latent-only over ALL n_samples (cheap). The AUDIO part
+    # (DAC decode + re-extraction via basic-pitch/librosa + CLAP) is the
+    # RAM-hungry step. Instead of decoding ALL generations into a big list and
+    # re-extracting from all of them at once (which OOM-kills the process at
+    # large n_metrics_samples), we STREAM it: decode ONE generation -> re-extract
+    # its descriptors -> ACCUMULATE the metric -> DISCARD the waveform. Peak RAM
+    # is therefore independent of how many samples we score, so n_influence_samples
+    # can be raised freely -- the only cost of raising it is TIME (basic-pitch
+    # runs once per sample). We still HOLD the first n_keep decoded waveforms,
+    # which are needed for the disk dump (n_val_save) and the TB previews (n_log).
+    n_val_save  = int(getattr(sampling_cfg, "n_val_save", 8) or 8)
+    n_influence = int(getattr(sampling_cfg, "n_influence_samples", 64) or 64)
+    n_keep = max(n_val_save, n_log)
+    n_fid  = min(n_influence, n_samples) if influence_active else 0
+
+    dac_model = get_dac()    # load-once singleton (shared across the whole run)
+
+    def _stream_audio(lat_list):
+        """Decode generations ONE AT A TIME: re-extract frame-condition fidelity
+        and CLAP audio<->text similarity on the first n_fid (accumulated, the
+        waveform then discarded), and RETURN the first n_keep waveforms (held for
+        the disk dump / TB previews). Peak memory is O(n_keep), not O(len)."""
+        n_proc = min(max(n_fid, n_keep), len(lat_list))
+        if frame_active:
+            fidelity_evaluator.reset()
+        clap_sims, kept = [], []
+        for i in range(n_proc):
+            wav = _decode_one(lat_list[i], dac_model)      # decode ONE
+            if i < n_fid:
+                wn = wav.numpy()
+                if frame_active:
+                    fidelity_evaluator.add_sample(
+                        wn, DAC_SAMPLE_RATE, n_frames, cond_targets[i])
+                if text_active:
+                    t = cond_globals[i].get("text") if i < len(cond_globals) else None
+                    if t is not None:
+                        emb = clap_audio_embedder.embed(wn, DAC_SAMPLE_RATE)
+                        clap_sims.append(float(np.dot(emb, t)))
+            if i < n_keep:
+                kept.append(wav)
+            # else: wav is dropped here -> RAM stays flat regardless of n_fid
+        fid  = fidelity_evaluator.results() if frame_active else {}
+        clap = float(np.mean(clap_sims)) if clap_sims else None
+        return fid, clap, kept
+
+    if influence_active:
+        print(f"    measuring condition influence on "
+              f"{min(n_fid, len(cond_lat))} generations (streamed, memory-flat)...")
+    fid_cond, sim_cond, cond_wavs = _stream_audio(cond_lat)
+    fid_null, sim_null, unc_wavs = {}, None, []
+    if compute_uncond and unc_lat:
+        fid_null, sim_null, unc_wavs = _stream_audio(unc_lat)
+
+    del cond_lat, unc_lat    # latents no longer needed
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     # ===== CONDITION INFLUENCE (delta: with-cond vs null, paired) =====
     # influence[cond_name][metric] = {"cond":.., "null":.., "delta":..}.
-    # Higher fidelity = better for all current metrics, so delta>0 means the
-    # condition pulled the generation toward its target. The panel is built only
-    # from the conditions ACTIVE in this run (registry-driven), so it adapts
-    # automatically when conditions are added/removed.
+    # delta>0 means the condition pulled the generation toward its target. Built
+    # only from the conditions ACTIVE in this run (registry-driven).
     influence = {}
-
-    # ---- frame conditions: re-extract from cond and from null, then diff ----
     if frame_active:
-        print(f"    measuring frame-condition influence on {len(cond_wavs)} "
-              f"generations ({list(fidelity_evaluator.extractors)})...")
-        fidelity_evaluator.reset()
-        for wav, tgt in zip(cond_wavs, cond_targets):
-            fidelity_evaluator.add_sample(wav.numpy(), DAC_SAMPLE_RATE, n_frames, tgt)
-        fid_cond = fidelity_evaluator.results()
-
-        fid_null = {}
-        if compute_uncond and unc_wavs:
-            fidelity_evaluator.reset()
-            for wav, tgt in zip(unc_wavs, cond_targets):
-                fidelity_evaluator.add_sample(wav.numpy(), DAC_SAMPLE_RATE, n_frames, tgt)
-            fid_null = fidelity_evaluator.results()
-
         for key, cval in fid_cond.items():
             name, _, metric = key.partition("/")
             nval = fid_null.get(key)
@@ -696,22 +745,7 @@ def evaluate_and_log_metrics(
                 "null": nval,
                 "delta": (cval - nval) if (nval is not None) else None,
             }
-
-    # ---- text (CLAP): cosine(audio, text) for cond vs null ----
     if text_active:
-        print(f"    measuring text (CLAP) influence on {len(cond_wavs)} generations...")
-        def _clap_sim(wavs):
-            sims = []
-            for wav, gt in zip(wavs, cond_globals):
-                t = gt.get("text") if gt else None
-                if t is None:
-                    continue
-                a = wav.numpy() if hasattr(wav, "numpy") else wav
-                emb = clap_audio_embedder.embed(a, DAC_SAMPLE_RATE)   # L2-norm
-                sims.append(float(np.dot(emb, t)))                    # cosine
-            return float(np.mean(sims)) if sims else None
-        sim_cond = _clap_sim(cond_wavs)
-        sim_null = _clap_sim(unc_wavs) if (compute_uncond and unc_wavs) else None
         influence["text"] = {"clap_sim": {
             "cond": sim_cond, "null": sim_null,
             "delta": (sim_cond - sim_null) if (sim_cond is not None and sim_null is not None) else None,
@@ -796,7 +830,8 @@ def evaluate_and_log_metrics(
 
     from condition_metrics import sonify_condition
 
-    n_val_save = int(getattr(sampling_cfg, "n_val_save", n_samples) or n_samples)
+    # n_val_save was already resolved above; the streamed cond_wavs list holds
+    # the first n_keep = max(n_val_save, n_log) decoded waveforms.
     n_save = min(n_val_save, len(cond_wavs))
     step_dir = os.path.join(output_dir, f"step_{step:07d}")
 
@@ -862,7 +897,8 @@ def evaluate_and_log_metrics(
             _log_spec(uwav, f"Spectrogram_generated_without_cond_{w}_{i:02d}",
                       f"generated without cond ({w}) {i} - step {step}")
 
-    del dac_model
+    # dac_model is the shared singleton (get_dac) -> do NOT delete it; just free
+    # any CUDA scratch from the metrics step.
     if device == "cuda":
         torch.cuda.empty_cache()
 
@@ -1616,4 +1652,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         print("Training concluded." if saved else "Training ended (see warnings above).")
-

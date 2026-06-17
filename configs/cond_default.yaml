@@ -100,11 +100,25 @@ sampling:
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4      # conditioned audios logged on TB for listening
-  n_metrics_samples: 128  # conditioned samples used to compute FD-DAC + KL
-  # How many validation generations to DUMP TO DISK per metrics step
-  # (each: input conditions .npz + conditioned .wav + unconditioned .wav), under
-  # runs/<run>/audio/step_<step>/. Default = all generated; lower for big runs.
-  n_val_save: ${sampling.n_metrics_samples}
+  n_metrics_samples: 1024  # conditioned samples used to compute FD-DAC + KL
+  # ---- AUDIO part of the metrics step (DAC decode + re-extraction) ----
+  # FD-DAC/KL above are latent-only and run on ALL n_metrics_samples (cheap).
+  # The audio part (decode + condition re-extraction + disk dump) is RAM-heavy,
+  # so it is BOUNDED to small subsets -- decoding/re-extracting all of a large
+  # n_metrics_samples is what OOM-kills the process. Keep these small.
+  #
+  # How many generations get re-extracted to measure condition influence
+  # (melody RPA/RCA, energy corr, ...). The audio influence is computed in a
+  # STREAMING, memory-flat way (decode one -> re-extract -> discard), so peak RAM
+  # does NOT grow with this number: you can raise it as high as you like and the
+  # only cost is TIME (basic-pitch runs once per sample). 64 is already a stable
+  # mean; raising to e.g. 256/512 buys little statistically but costs proportional
+  # time per metrics step.
+  n_influence_samples: 64
+  # How many validation generations to DUMP TO DISK per metrics step (each:
+  # conditions .npz + sonified conditions + conditioned .wav + unconditioned
+  # .wav + real.wav), under runs/<run>/audio/step_<step>/generation_<i>/.
+  n_val_save: 8
   # If true, the metrics step ALSO generates n_metrics_samples UNCONDITIONAL
   # samples (null conditions, no guidance) and logs Fd_dac_uncond / Kl_uncond,
   # which are the only metrics comparable with the unconditional model. Doubles
@@ -144,7 +158,7 @@ conditioning:
   #
   # FIRST TEST: melody only, no global conditions.
   # ---------------------------------------------------------------
-  enabled_frame:  ["melody"]
+  enabled_frame:  ["melody", "energy"]
   enabled_global: []
 
 
@@ -161,11 +175,11 @@ paths:
   image_root:     "./image_dataset_cond"
 
   # Shared among all runs; the specific run is in runs_dir/<run_name>/
-  runs_dir:       "runs"
+  runs_dir:       "/data/anasynth_nonbp/baione/runs"
 
   # Shared cache among runs over the same dataset (normalizer, FD-DAC + KL reference).
   # Computed once, reused by all subsequent runs.
-  cache_dir:      "cache"
+  cache_dir:      "/data/anasynth_nonbp/baione/cache"
 
   # Name of the run (folder under runs_dir/).
   # Priority: CLI --run_name > YAML run_name > self-generated timestamp.
