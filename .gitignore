@@ -1,37 +1,63 @@
-# ---- Runtime outputs (never commit; they live on local disk anyway) ----
-runs/
-runs_cond/
-cache/
-cache_cond/
-*.pt
-*.pth
-*.ckpt
-
-# ---- Datasets / latents / conditions / audio ----
-dataset_ready*/
-raw_audio/
-image_dataset*/
-*.npy
-*.npz
-*.wav
-*.flac
-*.mp3
-
 # ---- Python ----
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
-.ipynb_checkpoints/
+.eggs/
+build/
+dist/
 .venv/
-env/
 venv/
+env/
+.python-version
 
-# ---- Editors / OS ----
+# ---- generated datasets (preprocess_stream.py output) ----
+# Latents / conditions / wavs / split manifests / dataset metadata.
+dataset_ready_cond/
+dataset_ready*/
+*_ready/
+out_*/
+latents/
+conditions/
+wav/
+global_conditions/
+splits/
+dataset_meta.json
+image_dataset_cond/
+
+# ---- training / eval outputs ----
+runs/                     # TensorBoard logs + checkpoints (paths.runs_dir)
+cache/                    # normalizer / FD-DAC reference / cache_meta.json
+checkpoints*/
+*.pt                      # checkpoints & cached stats (config lives in .yaml)
+test_outputs/
+samples/
+edits/
+
+# ---- model weight caches (DAC / basic-pitch / CLAP / CLIP / VGGish / CREPE) ----
+.cache/
+.huggingface/
+*.onnx
+
+# ---- raw audio / large media (never commit datasets) ----
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.npy
+*.npz
+
+# ---- editors / OS ----
 .vscode/
 .idea/
+*.swp
 .DS_Store
+Thumbs.db
 
-# ---- Logs / TensorBoard ----
-events.out.tfevents.*
-*.log
-wandb/
+# ---- keep configs and (locked) requirements ----
+!requirements.txt
+!requirements.lock.txt
+!configs/*.yaml
+!cond_default.yaml

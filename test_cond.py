@@ -10,12 +10,19 @@
 # trajectory with CFG, decodes it through DAC, and logs both the
 # generation and the real reference on TensorBoard.
 #
+# The test set is the SAME one training persisted: the split parameters are
+# restored from the checkpoint's config, so compute_split reuses the exact
+# splits/test_split_<hash>.json written at train time (no leakage vs training,
+# comparable conditioned generations across checkpoints).
+#
 # Optional overrides:
 #   --prompt   forces a single CLAP text embedding for ALL generations
 #              (replaces the per-sample text embedding from the test set)
 #   --image    forces a single CLIP image embedding for ALL generations
 #              (replaces the per-sample image embedding from the test set)
 #   --guidance overrides cfg.conditioning.guidance_scale
+#   --seed     reproducible generation (seeds python/numpy/torch and the
+#              per-generation noise via a dedicated Generator)
 #
 # Frame-level conditions (pitch, chroma) are always taken from the test
 # sample they belong to (no global override makes physical sense for
@@ -35,17 +42,19 @@
 #     (visible alongside the training logs of the same run)
 
 import os
+os.environ.setdefault("USE_TF", "0")   # transformers -> PyTorch backend (no TF)
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 # Use a machine-local cache for HuggingFace / DAC weights (avoids NFS issues).
 os.environ.setdefault("XDG_CACHE_HOME", "/data/anasynth_nonbp/baione/.cache")
 
 import argparse
-import sys
+import random
 from io import BytesIO
 from pathlib import Path
 
 import torch
+import numpy as np
 import soundfile as sf
-import torchaudio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -57,7 +66,7 @@ from audio_dataset_npy import (
     decode_latents,
     DAC_SAMPLE_RATE,
 )
-from audio_dataset_cond import ConditionedAudioDataset
+from audio_dataset_cond import ConditionedAudioDataset, compute_split
 from network_cond import ConditionedAudioDiT, TOKEN_DIM
 from conditions import (
     ConditionRegistry,
@@ -74,7 +83,19 @@ from conditions import (
 # ============================================================
 def load_config():
     """
-    Loads the same YAML used for training, then applies CLI overrides.
+    Builds the test config the SAME way training_cond.py rebuilds it on --resume:
+    the full training config stored inside the checkpoint is authoritative and is
+    layered ON TOP of the (now optional) external YAML, then CLI overrides win.
+
+    This guarantees the model is tested with the exact dataset_root /
+    condition_root / cache_dir / duration_s / precision / conditioning selection
+    it was trained with, instead of whatever the external YAML happens to hold.
+
+    Precedence (low -> high):
+        external YAML  <  checkpoint config  <  CLI dotlist  <  CLI scalar flags
+
+    The external YAML is only REQUIRED for old checkpoints that stored no full
+    config (only `model_kind`); otherwise it is an optional base.
     Returns (cfg, args).
     """
     parser = argparse.ArgumentParser(
@@ -84,7 +105,11 @@ def load_config():
     )
     parser.add_argument("--config", type=str,
                         default="configs/cond_default.yaml",
-                        help="YAML config file "
+                        help="OPTIONAL base YAML config. The checkpoint's stored "
+                              "training config takes priority and is layered on "
+                              "top of this YAML; if the YAML is missing and the "
+                              "checkpoint has a full config, the checkpoint "
+                              "config is used as the sole base "
                               "(default: configs/cond_default.yaml)")
     parser.add_argument("--ckpt", type=str, required=True,
                         help="Path to checkpoint (.pt) - typically "
@@ -104,6 +129,8 @@ def load_config():
     parser.add_argument("--guidance", type=float, default=None,
                         help="Classifier-free guidance scale "
                               "(default: cfg.conditioning.guidance_scale)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed for reproducible generation (default: free-running)")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Free CLAP text prompt that overrides the "
                               "per-sample text embedding for ALL generations "
@@ -111,19 +138,65 @@ def load_config():
     parser.add_argument("--image", type=str, default=None,
                         help="Image path that overrides the per-sample CLIP "
                               "embedding for ALL generations.")
+    parser.add_argument("--allow_invalid_conditions", action="store_true",
+                        help="DEBUG ONLY: tolerate missing/corrupt conditions on the "
+                             "test set (zero-fill them). Off by default so the "
+                             "evaluation cannot silently score NULL-conditioned "
+                             "generations as if they were conditioned (report #12).")
     args, unknown = parser.parse_known_args()
 
-    if not os.path.exists(args.config):
-        raise FileNotFoundError(f"Config not found: {args.config}")
+    # ---- Base config from the external YAML (now OPTIONAL) ----
+    base_cfg = OmegaConf.load(args.config) if os.path.exists(args.config) else None
 
-    cfg = OmegaConf.load(args.config)
+    # ---- Training config restored from the checkpoint (authoritative) ----
+    # Only the lightweight metadata is read here (map_location='cpu'); the model
+    # weights are (re)loaded later in main(). Mirrors training_cond.load_config().
+    if not os.path.exists(args.ckpt):
+        raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
+    _meta = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    ckpt_config     = _meta.get("config")
+    ckpt_model_kind = _meta.get("model_kind")
+    del _meta
 
+    if ckpt_config is not None:
+        # Normal case: the checkpoint carries the full training config. Layer it
+        # ON TOP of the YAML base (or use it alone if no YAML is present).
+        ckpt_cfg = OmegaConf.create(ckpt_config)
+        cfg = ckpt_cfg if base_cfg is None else OmegaConf.merge(base_cfg, ckpt_cfg)
+        print("[test_cond] Config restored from checkpoint "
+              f"(model.kind={cfg.model.kind}, duration_s={cfg.model.duration_s}, "
+              f"dataset_root={cfg.paths.dataset_root}, "
+              f"enabled_frame={cfg.conditioning.enabled_frame}, "
+              f"enabled_global={cfg.conditioning.enabled_global}).")
+        if base_cfg is None:
+            print(f"[test_cond] (external YAML '{args.config}' not found; using "
+                   f"the checkpoint config as the sole base.)")
+    else:
+        # Old checkpoint without a stored config: the external YAML is mandatory.
+        if base_cfg is None:
+            raise FileNotFoundError(
+                f"Config not found ('{args.config}') AND the checkpoint stores "
+                f"no 'config'. Pass --config with a valid YAML matching the "
+                f"training setup (dataset_root, duration_s, cache_dir, ...)."
+            )
+        cfg = base_cfg
+        if ckpt_model_kind is not None:
+            # model.kind MUST match to load the weights at all.
+            cfg.model.kind = ckpt_model_kind
+            print(f"[test_cond] model.kind restored from checkpoint: "
+                   f"{cfg.model.kind} (old checkpoint without full config; other "
+                   f"params come from the YAML/CLI).")
+        else:
+            print("[test_cond] WARNING: checkpoint has neither 'config' nor "
+                   "'model_kind'; all params come from the YAML/CLI.")
+
+    # ---- CLI overrides win over everything (YAML + checkpoint config) ----
     # CLI dotlist overrides (e.g. sampling.euler_steps=80)
     if unknown:
         cli_cfg = OmegaConf.from_dotlist(unknown)
         cfg = OmegaConf.merge(cfg, cli_cfg)
 
-    # CLI scalars take priority over YAML when explicitly set
+    # CLI scalars take priority when explicitly set
     if args.steps is not None:
         cfg.sampling.euler_steps = args.steps
     if args.duration_s is not None:
@@ -131,7 +204,8 @@ def load_config():
     if args.guidance is not None:
         cfg.conditioning.guidance_scale = args.guidance
 
-    # Infer run_name from --ckpt if not given
+    # ---- run_name (test output location), set AFTER the merge so the checkpoint
+    # config's own paths.run_name never leaks into the test output path ----
     # Expected layout: runs/<run_name>/checkpoints/<file>.pt
     if args.run_name is not None:
         run_name = args.run_name
@@ -164,6 +238,7 @@ def plot_to_image(fig):
 
 def make_spectrogram_image(waveform, sample_rate, title=""):
     """Build a mel-spectrogram image (tensor) for TensorBoard."""
+    import torchaudio   # lazy: only a pure-DSP transform, no torchcodec/FFmpeg
     spec_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=sample_rate, n_mels=128, n_fft=2048, hop_length=512,
     )
@@ -187,15 +262,18 @@ def make_spectrogram_image(waveform, sample_rate, title=""):
 @torch.no_grad()
 def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
                       frame_cond, global_cond, guidance,
-                      frame_dims, global_configs):
+                      frame_dims, global_configs, gen_rng=None):
     """
     Euler integrator with classifier-free guidance.
     Both `frame_cond` and `global_cond` are expected as batch=1 dicts on device.
     If `guidance` <= 1.0 or both conditioning sources are absent, a single
     forward pass per step is used.
+    `gen_rng` (optional torch.Generator) fixes the initial-noise x0 for
+    reproducible generation; None = free-running. Signature kept identical to
+    training_cond.euler_sample_cfg.
     """
     model.eval()
-    x = torch.randn(1, n_frames, TOKEN_DIM, device=device)
+    x = torch.randn(1, n_frames, TOKEN_DIM, device=device, generator=gen_rng)
     dt = (t_max - t_min) / steps
 
     null_fc = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
@@ -229,6 +307,19 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
 def main():
     cfg, args = load_config()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Reproducible generation (A/B): seed the global RNG and build a dedicated
+    # Generator for the per-generation noise (mirrors training_cond metrics seed).
+    gen_rng = None
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        gen_rng = torch.Generator(device=device)
+        gen_rng.manual_seed(int(args.seed))
+        print(f"[test_cond] Seed: {args.seed}")
 
     print(f"[test_cond] Device:     {device}")
     print(f"[test_cond] Config:     {args.config}")
@@ -276,12 +367,19 @@ def main():
         global_cond_configs=global_configs,
     ).to(device)
 
-    if "ema_state_dict" in ckpt:
+    # Prefer the EMA weights, but ONLY if the shadow was being updated when the
+    # checkpoint was written (before training.ema_start it is still the random
+    # init). Old checkpoints have no 'ema_ready' key -> assume ready.
+    if "ema_state_dict" in ckpt and ckpt.get("ema_ready", True):
         model.load_state_dict(ckpt["ema_state_dict"])
         print("[test_cond] Using EMA weights")
     else:
         model.load_state_dict(ckpt["model_state_dict"])
-        print("[test_cond] EMA not available - using main model weights")
+        if "ema_state_dict" in ckpt:
+            print("[test_cond] EMA present but NOT trained yet (checkpoint "
+                  "predates training.ema_start) - using main model weights")
+        else:
+            print("[test_cond] EMA not available - using main model weights")
     model.eval()
 
     # ============================================================
@@ -333,30 +431,69 @@ def main():
     img_root  = (cfg.paths.image_root
                   if Path(cfg.paths.image_root).exists() else None)
 
+    # Reuse the SAME test set training persisted. The split parameters come from
+    # the checkpoint's config (restored in load_config), so the manifest hash
+    # matches and compute_split reuses the exact test_split_<hash>.json written
+    # at train time. save_test_manifest=False: never create one from the test.
+    def _sp(key, default):
+        d = cfg.data.get("split", None) if hasattr(cfg, "data") else None
+        return default if d is None else d.get(key, default)
+
+    split = compute_split(
+        cfg.paths.dataset_root,
+        ratios=tuple(_sp("ratios", [0.8, 0.1, 0.1])),
+        seed=int(_sp("seed", 42)),
+        group_by_source=bool(_sp("group_by_source", True)),
+        stratify_by_class=bool(_sp("stratify_by_class", True)),
+        save_test_manifest=False,
+    )
+    test_files = split["splits"]["test"]
+    if not test_files:
+        raise RuntimeError(
+            f"Empty test split for {cfg.paths.dataset_root}. Expected a persisted "
+            f"test manifest under {Path(cfg.paths.dataset_root).parent/'splits'} "
+            f"(written by training_cond.py). Check the split params match training.")
+
+    # label_to_idx: the checkpoint's mapping is authoritative (it is what the
+    # model's class conditioning was trained with); fall back to the split scan.
+    if label_map:
+        dataset_label_map = dict(label_map)
+    else:
+        dataset_label_map = {c: i for i, c in enumerate(split["classes"])}
+    # keep the naming map consistent with the mapping the dataset actually uses
+    idx_to_label = {v: k for k, v in dataset_label_map.items()}
+
+    # image manager only if image conditioning is active (split-less: split=None)
     image_manager = None
-    if img_root is not None:
+    image_active = "image" in getattr(registry, "global_extractors", {})
+    if image_active and img_root is not None:
         try:
-            image_manager = ImageDatasetManager(img_root, split="test")
+            image_manager = ImageDatasetManager(img_root, split=None)
         except Exception:
-            print(f"[test_cond] No image/test split found - per-sample image "
-                   f"embeddings will be zeros unless --image is provided.")
+            print("[test_cond] image_root present but unreadable -> per-sample "
+                  "image embeddings will be zeros unless --image is provided.")
             image_manager = None
 
     test_dataset = ConditionedAudioDataset(
+        files=test_files,
+        label_to_idx=dataset_label_map,
+        split="test",
         latent_root=cfg.paths.dataset_root,
         condition_root=cond_root,
         image_root=img_root,
-        split="test",
         duration_s=cfg.model.duration_s,
         normalizer=normalizer,
         registry=registry,
         image_manager=image_manager,
         preload_latents=False,
+        strict_conditions=not args.allow_invalid_conditions,   # #12: strict by default
     )
 
     total = len(test_dataset)
     if total == 0:
-        raise RuntimeError(f"Empty test set in {cfg.paths.dataset_root}/test")
+        raise RuntimeError(
+            f"Test split has {len(test_files)} files but 0 usable chunks "
+            f"(duration_s / n_frames mismatch?).")
 
     n_samples = min(args.n_samples, total)
     indices = torch.linspace(0, total - 1, n_samples).long().tolist()
@@ -436,10 +573,11 @@ def main():
                 use_amp=use_amp,
                 frame_cond=fc, global_cond=gc, guidance=guidance,
                 frame_dims=frame_cond_dims, global_configs=global_configs,
+                gen_rng=gen_rng,
             )
 
-        # --- Latent -> audio (denormalize + DAC decode) ---
-        z_gen = frames_gen.T                       # (1024, n_frames)
+        # --- Latent -> audio (denormalize + DAC decode via from_latents) ---
+        z_gen = frames_gen.T                       # (72, n_frames)
         z_gen = normalizer.denormalize(z_gen)
         waveform_gen = decode_latents(z_gen, device=device)
 
@@ -465,7 +603,7 @@ def main():
         )
 
         # --- Real audio reference ---
-        z_real = frames_real.T                     # (1024, n_frames)
+        z_real = frames_real.T                     # (72, n_frames)
         z_real = normalizer.denormalize(z_real)
         waveform_real = decode_latents(z_real, device=device)
         wrn = waveform_real / (waveform_real.abs().max() + 1e-8)

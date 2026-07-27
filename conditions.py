@@ -494,6 +494,181 @@ class EnergyExtractor(FrameConditionExtractor):
 
 
 # ============================================================
+# FRAME-LEVEL: F0 (CREPE, monophonic pitch contour)
+# ============================================================
+
+class CrepeF0Extractor(FrameConditionExtractor):
+    """
+    Monophonic fundamental-frequency (f0) contour from CREPE, via the torch-native
+    `torchcrepe` backend (NOT the TensorFlow `crepe` package -- the project runs
+    with USE_TF=0). This is DISTINCT from `melody`:
+      * melody  -> polyphonic 88-bin piano-roll (basic-pitch + JASCO argmax);
+      * f0      -> a single continuous pitch curve, for monophonic / lead-line
+                   control (bass line, solo voice, melody instrument in front).
+
+    Pipeline (mirrors the other frame extractors' DAC alignment, hardened per the
+    f0 review):
+      1. resample to 16 kHz mono (torchcrepe's operating rate);
+      2. torchcrepe.predict -> per-frame pitch (Hz) + periodicity (voicing conf.);
+      3. voicing decision BEFORE any zeroing: median-filter periodicity, gate out
+         silent frames (local RMS < silence_db), threshold, and drop voiced runs
+         shorter than min_voiced_frames;
+      4. normalize pitch on a LOG scale in [0,1] over ALL frames (no zeros yet, so
+         interpolation never sees an injected 0 -> no phantom pitch ramps);
+      5. resample SEPARATELY to the DAC-aligned n_frames -- pitch linearly, the
+         voiced mask with nearest -- then re-apply the mask;
+      6. map voiced pitch to [voiced_floor, 1], reserving 0 EXCLUSIVELY for
+         "unvoiced/absent" (so 0 is never confused with pitch==fmin).
+
+    Output: (n_frames, dim). dim=2 (default, with_periodicity=True) ->
+    [pitch_norm, periodicity]; dim=1 -> [pitch_norm]. Both channels are 0 on
+    unvoiced frames, matching the zeros-mean-absence convention of the other
+    conditions, so the CFG NULL condition reads as fully unvoiced.
+
+    Requires: pip install torchcrepe
+    """
+
+    def __init__(self,
+                 fmin: float = 50.0,
+                 fmax: float = 1000.0,
+                 model: str = "full",              # "full" or "tiny"
+                 voicing_threshold: float = 0.5,
+                 with_periodicity: bool = True,     # 2 channels [pitch, periodicity]
+                 hop_ms: float = 10.0,
+                 silence_db: float = -60.0,         # frames quieter than this -> unvoiced
+                 median_win: int = 3,               # median filter on periodicity (odd, 0=off)
+                 min_voiced_frames: int = 3,        # drop voiced runs shorter than this
+                 voiced_floor: float = 0.05,        # voiced pitch mapped to [floor, 1]
+                 device: Optional[str] = "cpu"):    # set "cuda" in CONFIG for speed
+        self.fmin = float(fmin)
+        self.fmax = float(fmax)
+        self.model = model
+        self.voicing_threshold = float(voicing_threshold)
+        self.with_periodicity = bool(with_periodicity)
+        self.hop_ms = float(hop_ms)
+        self.silence_db = float(silence_db)
+        self.median_win = int(median_win)
+        self.min_voiced_frames = int(min_voiced_frames)
+        self.voiced_floor = float(voiced_floor)
+        self.device = device
+
+    @property
+    def name(self) -> str:
+        return "f0"
+
+    @property
+    def dim(self) -> int:
+        return 2 if self.with_periodicity else 1
+
+    def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
+        import torch
+        import torchcrepe
+        CR = 16000
+
+        y = np.asarray(audio, dtype=np.float32)
+        if sr != CR:
+            import librosa
+            y = librosa.resample(y, orig_sr=sr, target_sr=CR)
+        wav = torch.from_numpy(y).unsqueeze(0)               # [1, t] @16k
+
+        hop = max(1, int(round(self.hop_ms / 1000.0 * CR)))
+        dev = self.device
+        if dev in (None, "auto"):
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+        pitch, periodicity = torchcrepe.predict(
+            wav, CR, hop_length=hop, fmin=self.fmin, fmax=self.fmax,
+            model=self.model, return_periodicity=True,
+            batch_size=2048, device=dev,
+        )
+        pitch = pitch.squeeze(0).cpu().numpy().astype(np.float64)         # (F,) Hz
+        periodicity = periodicity.squeeze(0).cpu().numpy().astype(np.float64)  # (F,)
+        F = pitch.shape[0]
+        if F < 2:                                            # degenerate -> unvoiced
+            return np.zeros((n_frames, self.dim), dtype=np.float32)
+
+        # --- voicing decision (periodicity + silence + cleanup), BEFORE any zeroing ---
+        per_s = self._median_filter(periodicity, self.median_win)
+        silent = self._silence_mask(y, hop, F, self.silence_db)
+        voiced = (per_s >= self.voicing_threshold) & (~silent)
+        voiced = self._remove_short_runs(voiced, self.min_voiced_frames)
+
+        # --- pitch normalized on a LOG scale over ALL frames (no zeros injected) ---
+        lo, hi = np.log2(self.fmin), np.log2(self.fmax)
+        pf = np.clip(pitch, self.fmin, self.fmax)
+        pnorm_all = ((np.log2(pf) - lo) / (hi - lo + 1e-8)).astype(np.float64)
+
+        # --- SEPARATE resampling to n_frames (report #3 of the f0 review) ---
+        # pitch: linear (smooth contour, interpolated from REAL pitch values, so no
+        #        artificial ramps toward zero at voiced/unvoiced boundaries);
+        # mask : nearest (crisp voiced/unvoiced boundaries);
+        # then RE-APPLY the mask to the pitch. Zero is thus reserved for absence.
+        pnorm_r = self._resample_to_frames(pnorm_all.reshape(-1, 1), n_frames)[:, 0]
+        mask_r  = self._resample_nearest(voiced.astype(np.float64), n_frames) > 0.5
+        per_r   = self._resample_to_frames(per_s.reshape(-1, 1), n_frames)[:, 0]
+
+        # voiced pitch mapped to [voiced_floor, 1] so that 0 means ONLY "unvoiced"
+        pitch_ch = np.where(
+            mask_r, self.voiced_floor + (1.0 - self.voiced_floor) * pnorm_r, 0.0)
+
+        if self.with_periodicity:
+            per_ch = np.where(mask_r, per_r, 0.0)            # 0 at unvoiced too
+            feat = np.stack([pitch_ch, per_ch], axis=-1)     # (n_frames, 2)
+        else:
+            feat = pitch_ch.reshape(-1, 1)                   # (n_frames, 1)
+        return feat.astype(np.float32)
+
+    # ---- f0 post-processing helpers (numpy; no unverifiable torchcrepe APIs) ----
+    @staticmethod
+    def _median_filter(x: np.ndarray, win: int) -> np.ndarray:
+        if win and win >= 3:
+            from scipy.signal import medfilt
+            return medfilt(x, kernel_size=win if win % 2 == 1 else win + 1)
+        return x
+
+    @staticmethod
+    def _silence_mask(y16k: np.ndarray, hop: int, F: int, silence_db: float) -> np.ndarray:
+        """Per-CREPE-frame silence gate: True where the local RMS is below
+        silence_db. Local energy is a box-smoothed y^2 sampled at frame centers."""
+        win = max(hop, 1024)
+        energy = np.convolve((y16k.astype(np.float64) ** 2),
+                             np.ones(win) / win, mode="same")
+        centers = np.clip(np.arange(F) * hop, 0, len(energy) - 1)
+        rms = np.sqrt(energy[centers] + 1e-12)
+        db = 20.0 * np.log10(rms + 1e-9)
+        return db < silence_db
+
+    @staticmethod
+    def _remove_short_runs(mask: np.ndarray, min_len: int) -> np.ndarray:
+        """Set voiced runs shorter than min_len frames back to unvoiced."""
+        if min_len <= 1 or mask.size == 0:
+            return mask
+        out = mask.copy()
+        n = out.size
+        i = 0
+        while i < n:
+            if out[i]:
+                j = i
+                while j < n and out[j]:
+                    j += 1
+                if (j - i) < min_len:
+                    out[i:j] = False
+                i = j
+            else:
+                i += 1
+        return out
+
+    @staticmethod
+    def _resample_nearest(x: np.ndarray, target_len: int) -> np.ndarray:
+        if x.shape[0] == target_len:
+            return x
+        from scipy.interpolate import interp1d
+        f = interp1d(np.linspace(0, 1, x.shape[0]), x, axis=0,
+                     kind="nearest", fill_value="extrapolate")
+        return f(np.linspace(0, 1, target_len))
+
+
+# ============================================================
 # GLOBAL: TEXT with CLAP (music-aware)
 # ============================================================
 
@@ -801,6 +976,22 @@ CONDITION_CONFIG = {
             # audible band. out_dim is small: it is a low-bandwidth 1-D signal.
             "class": EnergyExtractor,
             "kwargs": {"weighting": "A", "fmin": 40.0},
+            "out_dim": 16,
+            "enabled": True,
+        },
+        "f0": {
+            # Monophonic f0 contour from CREPE (torchcrepe backend). Distinct from
+            # `melody` (polyphonic 88-bin basic-pitch): a single continuous pitch
+            # curve for monophonic / lead-line control. raw_dim=2 by default
+            # ([pitch_norm, periodicity]); set with_periodicity=False for raw_dim=1.
+            # Set device="cuda" here for speed on large datasets (only honored
+            # with --num_workers 0). Requires: pip install torchcrepe
+            "class": CrepeF0Extractor,
+            "kwargs": {"fmin": 50.0, "fmax": 1000.0, "model": "full",
+                       "voicing_threshold": 0.5, "with_periodicity": True,
+                       "silence_db": -60.0, "median_win": 3,
+                       "min_voiced_frames": 3, "voiced_floor": 0.05,
+                       "device": "cuda"},
             "out_dim": 16,
             "enabled": True,
         },

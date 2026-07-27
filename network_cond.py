@@ -31,7 +31,8 @@
 #
 # CFG: passing null (zero) conditions yields the unconditional output.
 #
-# No patching: every DAC frame is directly a token (1024-dim).
+# No patching: every DAC frame is directly a token (72-dim, DAC pre-quantizer
+# latents; TOKEN_DIM = DAC_LATENT_DIM, inherited from audio_dataset_npy).
 
 import math
 from typing import Dict, Optional
@@ -47,7 +48,7 @@ from conditions import FrameConditionEncoder, GlobalConditionEncoder
 # ============================================================
 # TOKEN DIM = DAC_LATENT_DIM directly
 # ============================================================
-TOKEN_DIM = DAC_LATENT_DIM   # 1024 - no patching
+TOKEN_DIM = DAC_LATENT_DIM   # 72 (DAC pre-quantizer latents) - no patching
 
 
 # ============================================================
@@ -180,12 +181,20 @@ class SelfAttention(nn.Module):
 # FFN  (SwiGLU) - identical to network.py
 # ============================================================
 class FFN(nn.Module):
-    def __init__(self, hidden_size: int, expansion: int = 4, dropout: float = 0.0):
+    def __init__(self, hidden_size: int, mlp_ratio: float = 4.0,
+                 multiple_of: int = 256, dropout: float = 0.0):
         super().__init__()
-        inner = hidden_size * expansion
-        self.w1 = nn.Linear(hidden_size, inner, bias=False)
-        self.w2 = nn.Linear(inner, hidden_size, bias=False)
-        self.w3 = nn.Linear(hidden_size, inner, bias=False)
+        # SwiGLU has 3 matrices (w1 gate, w3 up, w2 down) vs 2 of a classic FFN.
+        # To match params/FLOPs to a standard FFN at mlp_ratio*hidden, the width
+        # is scaled by 2/3 (Shazeer 2020), then rounded to a multiple for tensor
+        # core efficiency (LLaMA convention). Old behaviour: inner = hidden*4
+        # (3 matrices at 4x) = +50% FFN params vs the matched sizing. Kept 1:1
+        # with network.py so the conditioned backbone matches the unconditional.
+        inner = int(2 * (mlp_ratio * hidden_size) / 3)
+        inner = multiple_of * ((inner + multiple_of - 1) // multiple_of)
+        self.w1 = nn.Linear(hidden_size, inner, bias=False)   # gate
+        self.w3 = nn.Linear(hidden_size, inner, bias=False)   # up
+        self.w2 = nn.Linear(inner, hidden_size, bias=False)   # down
         # Two dropouts with the same p, mirroring timm Mlp (drop1 after the
         # activation/gating on the hidden tensor, drop2 after the output proj).
         self.drop1 = nn.Dropout(dropout)
@@ -226,7 +235,7 @@ class DiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn  = SelfAttention(hidden_size, num_heads, max_seq_len=max_seq_len)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.mlp   = FFN(hidden_size, expansion=int(mlp_ratio), dropout=drop)
+        self.mlp   = FFN(hidden_size, mlp_ratio=mlp_ratio, dropout=drop)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -278,10 +287,11 @@ class ConditionedAudioDiT(nn.Module):
         (official DiT class-label mechanism).
 
     Configurations (same as AudioDiT):
-        'S':  6 layers,  512 hidden,  8 heads  (~36.6M params)
-        'B': 12 layers,  768 hidden, 12 heads  (~159.3M params)
-        'G': 18 layers, 1024 hidden, 16 heads  (~420.9M params)  <- between B and L
-        'L': 24 layers, 1024 hidden, 16 heads  (~559.3M params)
+        'S':  6 layers,  512 hidden,  8 heads   head_dim=64
+        'B': 12 layers,  768 hidden, 12 heads   head_dim=64
+        'G': 18 layers, 1024 hidden, 16 heads   head_dim=64  <- between B and L
+        'L': 24 layers, 1024 hidden, 16 heads   head_dim=64
+        'XL':28 layers, 1152 hidden, 16 heads   head_dim=72  <- official DiT-XL
 
     Args:
         frame_cond_dims:     {name: raw_dim}, e.g.
@@ -301,10 +311,11 @@ class ConditionedAudioDiT(nn.Module):
     """
 
     CONFIGS = {
-        'S': dict(n_layers=6,  hidden_size=512,  n_heads=8),
-        'B': dict(n_layers=12, hidden_size=768,  n_heads=12),
-        'G': dict(n_layers=18, hidden_size=1024, n_heads=16),
-        'L': dict(n_layers=24, hidden_size=1024, n_heads=16),
+        'S':  dict(n_layers=6,  hidden_size=512,  n_heads=8),
+        'B':  dict(n_layers=12, hidden_size=768,  n_heads=12),
+        'G':  dict(n_layers=18, hidden_size=1024, n_heads=16),
+        'L':  dict(n_layers=24, hidden_size=1024, n_heads=16),
+        'XL': dict(n_layers=28, hidden_size=1152, n_heads=16),
     }
 
     def __init__(

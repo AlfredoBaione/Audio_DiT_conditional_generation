@@ -14,6 +14,8 @@
 #       --label "Romanticism_chamber" --strength 0.3 --guidance 3.0
 
 import os
+os.environ.setdefault("USE_TF", "0")   # transformers -> PyTorch backend (no TF)
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 import sys
 import argparse
 from pathlib import Path
@@ -28,7 +30,8 @@ from audio_dataset_npy import (
 )
 from network_cond import ConditionedAudioDiT, TOKEN_DIM
 from conditions import (
-    CLAPTextCondition, ImageCondition, ImageDatasetManager,
+    ConditionRegistry,
+    CLAPTextCondition, ImageCondition,
     make_null_frame_conditions, make_null_global_conditions,
 )
 
@@ -61,7 +64,10 @@ def euler_sampling_cfg(
     null_fc = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
     null_gc = make_null_global_conditions(1, global_configs or {}, device)
 
-    actual_start = max(t_start, T_MIN)
+    # Clamp into [T_MIN, T_MAX]: a t_start above T_MAX would make dt negative and
+    # walk the integration backwards. The edit path already short-circuits
+    # strength=0, so this is a guard for any other caller.
+    actual_start = min(max(t_start, T_MIN), T_MAX)
     dt = (T_MAX - actual_start) / steps
 
     for i in range(steps):
@@ -88,7 +94,7 @@ def euler_sampling_cfg(
 @torch.no_grad()
 def edit_audio(
     model, normalizer, source_path, device,
-    frame_cond=None, global_cond=None,
+    frame_cond_builder=None, global_cond=None,
     edit_strength=0.3, guidance=3.0, steps=50,
     frame_dims=None, global_configs=None,
     use_amp=True,
@@ -96,6 +102,13 @@ def edit_audio(
     """
     Editing: real audio -> partial corruption -> reconstruction.
     edit_strength: 0.0 = no change, 1.0 = full regeneration.
+
+    BUG #4 FIX: the source audio may not last exactly --duration, so its true
+    DAC length is only known AFTER encoding. Frame conditions therefore CANNOT be
+    built ahead of time from a duration-derived n_frames (that produced an x vs
+    frame_cond length mismatch). Instead the caller passes `frame_cond_builder`,
+    a callable n_frames -> frame_cond dict (or None), which is invoked here once
+    the source's actual n_frames is known, guaranteeing x and conditions align.
     """
     import dac
 
@@ -107,43 +120,67 @@ def edit_audio(
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
     if sr != DAC_SAMPLE_RATE:
-        import torchaudio
-        audio = torchaudio.functional.resample(
-            torch.from_numpy(audio).float().unsqueeze(0), sr, DAC_SAMPLE_RATE
-        ).squeeze(0).numpy()
+        import librosa
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=DAC_SAMPLE_RATE)
 
     audio_t = torch.from_numpy(audio).float().unsqueeze(0).unsqueeze(0).to(device)
     x = dac_model.preprocess(audio_t, DAC_SAMPLE_RATE)
-    z, _, _, _, _ = dac_model.encode(x)
-    z = z.squeeze(0).cpu()  # (1024, T)
+    _z, _codes, latents, _, _ = dac_model.encode(x)
+    z = latents.squeeze(0).cpu()  # (72, T) DAC pre-quantizer latents
     del dac_model
     if device == "cuda":
         torch.cuda.empty_cache()
 
     n_frames = z.shape[1]
+
+    # Now that the source's true length is known, build the frame conditions
+    # aligned to THIS n_frames (bug #4). The builder handles npz/wav loading,
+    # per-condition alignment (truncate/zero-pad) and null fallback.
+    frame_cond = frame_cond_builder(n_frames) if frame_cond_builder is not None else None
+    if frame_dims:
+        print(f"  [edit] source n_frames={n_frames} -> "
+              f"frame_cond={'ON' if frame_cond else 'NULL'}")
+
     z_norm = normalizer.normalize(z)
     x1 = z_norm.T.unsqueeze(0)
 
-    # Partial corruption
-    t_start = 1.0 - edit_strength
-    noise = torch.randn_like(x1)
-    x_corrupted = (1 - t_start) * noise + t_start * x1
+    # strength is a fraction of the trajectory: validate it instead of letting a
+    # bad value produce silent nonsense.
+    if not (0.0 <= edit_strength <= 1.0):
+        raise ValueError(f"--strength must be in [0, 1], got {edit_strength}")
 
-    # Re-integration with new conditions
-    frames = euler_sampling_cfg(
-        model, n_frames, device,
-        frame_cond=frame_cond, global_cond=global_cond,
-        guidance=guidance, steps=steps,
-        frame_dims=frame_dims, global_configs=global_configs,
-        x_start=x_corrupted, t_start=t_start,
-        use_amp=use_amp,
-    )
+    # strength=0 means "do not edit". Integrating anyway would set t_start=1.0 >
+    # T_MAX, making dt = (T_MAX - t_start)/steps NEGATIVE: the sampler would walk
+    # BACKWARDS and return something that is not the source at all. Short-circuit
+    # to the identity: decode the untouched latent. (That is the codec
+    # round-trip, i.e. the best this pipeline can reproduce -- not the raw input
+    # bytes, which nothing in latent space can return.)
+    if edit_strength == 0.0:
+        print("  [edit] strength=0 -> identity: returning the source through the "
+              "DAC round-trip, no integration.")
+        frames = x1.squeeze(0)
+    else:
+        # Partial corruption
+        t_start = 1.0 - edit_strength
+        noise = torch.randn_like(x1)
+        x_corrupted = (1 - t_start) * noise + t_start * x1
 
-    # Decode
+        # Re-integration with new conditions
+        frames = euler_sampling_cfg(
+            model, n_frames, device,
+            frame_cond=frame_cond, global_cond=global_cond,
+            guidance=guidance, steps=steps,
+            frame_dims=frame_dims, global_configs=global_configs,
+            x_start=x_corrupted, t_start=t_start,
+            use_amp=use_amp,
+        )
+
+    # Decode (72-dim latents -> quantizer.from_latents -> 1024-dim z -> waveform)
     z_out = normalizer.denormalize(frames.T)
     dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
     dac_model.to("cpu"); dac_model.eval()
-    wav = dac_model.decode(z_out.unsqueeze(0).float()).squeeze()
+    z_q, _, _ = dac_model.quantizer.from_latents(z_out.unsqueeze(0).float())
+    wav = dac_model.decode(z_q).squeeze()
     del dac_model
 
     return wav
@@ -195,6 +232,84 @@ def build_global_cond(
         print(f"  [CLIP-image] {image_path}")
 
     return gc
+
+
+def _align_to_frames(arr: np.ndarray, n_frames: int) -> np.ndarray:
+    """Align a per-frame condition (T, dim) to exactly n_frames on the time axis,
+    exactly as the dataset does in __getitem__: truncate if too long, zero-pad if
+    too short. Keeps one-hot conditions (melody) intact (no interpolation)."""
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    T = arr.shape[0]
+    if T == n_frames:
+        return arr
+    if T > n_frames:
+        return arr[:n_frames]
+    pad = np.zeros((n_frames - T, arr.shape[1]), dtype=np.float32)
+    return np.concatenate([arr, pad], axis=0)
+
+
+def build_frame_cond(args, ckpt, n_frames, device) -> Optional[Dict[str, torch.Tensor]]:
+    """
+    Build the frame_conditions dict {name: (1, n_frames, raw_dim)} on `device`,
+    matching the checkpoint's frame_cond_dims, from one of:
+      --condition_npz : an .npz with keys = condition names (e.g. melody, energy),
+                        each (T, raw_dim); typically produced by extract_conditions.py.
+      --condition_wav : a WAV from which the required frame conditions are
+                        RE-EXTRACTED with the same ConditionRegistry used at
+                        extraction time (identical extractor configuration).
+
+    Alignment to n_frames mirrors the dataset (truncate/zero-pad). Any required
+    condition not found in the source is zero-filled (its null value) with a
+    warning. Returns None if the model has no frame conditioning, or if no source
+    was given (the caller enforces the safety policy in that case).
+    """
+    frame_cond_dims = ckpt.get("frame_cond_dims", {}) or {}
+    if not frame_cond_dims:
+        return None  # model has no frame conditioning at all
+
+    raw: Dict[str, np.ndarray] = {}
+
+    if getattr(args, "condition_npz", None):
+        if not os.path.exists(args.condition_npz):
+            raise FileNotFoundError(f"--condition_npz not found: {args.condition_npz}")
+        data = np.load(args.condition_npz)
+        for name in frame_cond_dims:
+            if name in data:
+                raw[name] = np.asarray(data[name], dtype=np.float32)
+        print(f"  [frame-cond] loaded from npz: {sorted(raw.keys())}")
+
+    elif getattr(args, "condition_wav", None):
+        if not os.path.exists(args.condition_wav):
+            raise FileNotFoundError(f"--condition_wav not found: {args.condition_wav}")
+        audio, sr = sf.read(args.condition_wav, dtype="float32")
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        reg = ConditionRegistry(
+            enabled_frame=list(frame_cond_dims.keys()), enabled_global=[],
+        )
+        raw = reg.extract_frame_conditions(audio, sr, n_frames)  # {name: (n_frames, dim)}
+        print(f"  [frame-cond] re-extracted from wav: {sorted(raw.keys())}")
+
+    else:
+        return None  # no frame source given; caller decides what to do
+
+    fc: Dict[str, torch.Tensor] = {}
+    for name, rdim in frame_cond_dims.items():
+        arr = raw.get(name)
+        if arr is None:
+            print(f"  [frame-cond] WARNING: '{name}' not in source -> null (zeros)")
+            arr = np.zeros((n_frames, rdim), dtype=np.float32)
+        else:
+            arr = _align_to_frames(arr, n_frames)
+            if arr.shape[1] != rdim:
+                raise ValueError(
+                    f"Condition '{name}' has raw_dim {arr.shape[1]} but the "
+                    f"checkpoint expects {rdim}.")
+        t = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+        fc[name] = t.unsqueeze(0).to(device)          # (1, n_frames, rdim)
+    return fc
 
 
 def resolve_normalizer_path(ckpt: dict, ckpt_path: str, cli_path: str = None) -> str:
@@ -263,11 +378,35 @@ def main():
                         help="Edit strength 0-1")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--n_samples", type=int, default=4)
-    parser.add_argument("--duration", type=float, default=5.0)
+    parser.add_argument("--duration", type=float, default=None,
+                        help="Generation length in seconds (generate mode). If "
+                             "omitted, uses the exact n_frames the checkpoint was "
+                             "trained with (recommended). A value here is converted "
+                             "to DAC frames via round(), matching preprocessing.")
     parser.add_argument("--output", type=str, default="./generated_cond")
     parser.add_argument("--normalizer", type=str, default=None,
                         help="Explicit path to normalizer.pt (otherwise resolved "
                              "from the checkpoint config / standard locations).")
+    parser.add_argument("--condition_npz", type=str, default=None,
+                        help="Path to an .npz of frame conditions (keys = condition "
+                             "names, e.g. melody/energy), as produced by "
+                             "extract_conditions.py. Aligned to n_frames "
+                             "(truncate/zero-pad) like the dataset.")
+    parser.add_argument("--condition_wav", type=str, default=None,
+                        help="Path to a WAV from which the frame conditions required "
+                             "by the checkpoint are RE-EXTRACTED with the same "
+                             "ConditionRegistry used at training time.")
+    parser.add_argument("--allow_null_frame_conditions", action="store_true",
+                        help="Permit generation with NULL (zero) frame conditions "
+                             "when the checkpoint requires frame conditioning and no "
+                             "--condition_npz/--condition_wav is given. Off by default "
+                             "so you do not silently generate uncontrolled audio.")
+    parser.add_argument("--allow_null_global_conditions", action="store_true",
+                        help="Permit generation with NULL global conditions when the "
+                             "checkpoint requires text/image conditioning and none is "
+                             "given (no --prompt/--label for text, no --image for "
+                             "image). Off by default so you do not silently generate "
+                             "with uncontrolled global conditioning.")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -296,11 +435,19 @@ def main():
         global_cond_configs=global_configs_ckpt,
     ).to(device)
 
-    if "ema_state_dict" in ckpt:
+    # Prefer the EMA weights, but ONLY if the shadow was actually being updated
+    # when the checkpoint was written. Before training.ema_start the shadow is
+    # still the random initialisation, so loading it would generate noise while
+    # reporting "using EMA". Checkpoints written before this flag existed have no
+    # 'ema_ready' key -> assume ready (previous behaviour).
+    if "ema_state_dict" in ckpt and ckpt.get("ema_ready", True):
         model.load_state_dict(ckpt["ema_state_dict"])
         print("  → Usando EMA model")
     else:
         model.load_state_dict(ckpt["model_state_dict"])
+        if "ema_state_dict" in ckpt:
+            print("  → EMA present but NOT trained yet (checkpoint predates "
+                  "training.ema_start): using the live model weights")
 
     # Normalizer (robust resolution: CLI > checkpoint config > standard paths)
     normalizer = LatentNormalizer()
@@ -317,13 +464,62 @@ def main():
     frame_dims = frame_cond_dims
     global_configs = global_configs_ckpt
 
+    # ---- SAFETY: global conditions (bug #5) ----
+    # Symmetric to the frame-condition policy: if the checkpoint REQUIRES a global
+    # condition (text/image) and the user provided nothing to build it, refuse to
+    # silently generate with a NULL global embedding unless explicitly opted in.
+    # `gc` only contains a key when its input was actually supplied
+    # (text <- --prompt/--label, image <- --image), so a missing key == null.
+    missing_global = [g for g in global_configs if g not in gc]
+    if missing_global:
+        how = {"text": "--prompt or --label", "image": "--image"}
+        need = ", ".join(f"{g} (needs {how.get(g, 'its input')})"
+                         for g in missing_global)
+        if args.allow_null_global_conditions:
+            print(f"[WARN] Checkpoint requires global conditions {missing_global} "
+                  f"but none were given -> generating with NULL global conditions "
+                  f"(--allow_null_global_conditions).")
+        else:
+            print(f"[ERROR] This checkpoint was trained with global conditions "
+                  f"{list(global_configs.keys())}, but these are missing: {need}. "
+                  f"Provide them, or pass --allow_null_global_conditions to "
+                  f"generate with null global conditioning on purpose.")
+            sys.exit(1)
+
+    # ---- SAFETY: frame conditions (bug #5 sibling) ----
+    # Based on whether a frame-condition SOURCE was given, not on n_frames (which
+    # in edit mode is only known after encoding the source). If the checkpoint
+    # requires frame conditioning and no source was given, refuse unless opted in.
+    has_frame_source = bool(getattr(args, "condition_npz", None)
+                            or getattr(args, "condition_wav", None))
+    if frame_dims and not has_frame_source:
+        if args.allow_null_frame_conditions:
+            print(f"[WARN] Checkpoint requires frame conditions {list(frame_dims)} "
+                  f"but none were given -> generating with NULL frame conditions "
+                  f"(--allow_null_frame_conditions).")
+        else:
+            print(f"[ERROR] This checkpoint was trained with frame conditions "
+                  f"{list(frame_dims)}, but no --condition_npz/--condition_wav was "
+                  f"given. Provide one, or pass --allow_null_frame_conditions to "
+                  f"generate with null (zero) frame conditions on purpose.")
+            sys.exit(1)
+
     os.makedirs(args.output, exist_ok=True)
 
     # --- GENERATE ---
     if args.mode == "generate":
-        n_frames = int(args.duration * DAC_FRAMES_PER_S)
+        # Generation length: default to the exact n_frames the model trained on
+        # (stored in the checkpoint), so a 5 s run generates 431 frames, not 430.
+        # A user-provided --duration is converted with round() (codec-consistent).
+        if args.duration is None:
+            n_frames = int(ckpt.get("n_frames", round(5.0 * DAC_FRAMES_PER_S)))
+        else:
+            n_frames = int(round(args.duration * DAC_FRAMES_PER_S))
+        frame_cond = build_frame_cond(args, ckpt, n_frames, device)
+
         print(f"Generazione {args.n_samples} audio | "
-              f"{n_frames} frame | guidance={args.guidance}")
+              f"{n_frames} frame | guidance={args.guidance} | "
+              f"frame_cond={'ON' if frame_cond else 'NULL'}")
 
         import dac
         dac_m = dac.DAC.load(dac.utils.download(model_type="44khz"))
@@ -332,12 +528,14 @@ def main():
         for i in range(args.n_samples):
             gen = euler_sampling_cfg(
                 model, n_frames, device,
+                frame_cond=frame_cond,
                 global_cond=gc if gc else None,
                 guidance=args.guidance, steps=args.steps,
                 frame_dims=frame_dims, global_configs=global_configs,
             )
             z = normalizer.denormalize(gen.T)
-            wav = dac_m.decode(z.unsqueeze(0).float()).squeeze()
+            z_q, _, _ = dac_m.quantizer.from_latents(z.unsqueeze(0).float())
+            wav = dac_m.decode(z_q).squeeze()
             tag = args.label or "uncond"
             p = os.path.join(args.output, f"gen_{tag}_{i:02d}.wav")
             sf.write(p, wav.numpy(), DAC_SAMPLE_RATE)
@@ -349,10 +547,17 @@ def main():
             print("[ERROR] --source richiesto per mode=edit")
             sys.exit(1)
 
+        # Frame conditions are aligned to the SOURCE length (bug #4): pass a
+        # builder that edit_audio calls once the source's n_frames is known.
+        def _frame_cond_builder(nf):
+            return build_frame_cond(args, ckpt, nf, device)
+
         print(f"Editing {args.source} | strength={args.strength} | "
-              f"guidance={args.guidance}")
+              f"guidance={args.guidance} | "
+              f"frame_source={'ON' if has_frame_source else 'NULL'}")
         wav = edit_audio(
             model, normalizer, args.source, device,
+            frame_cond_builder=_frame_cond_builder,
             global_cond=gc if gc else None,
             edit_strength=args.strength, guidance=args.guidance,
             steps=args.steps,

@@ -39,6 +39,8 @@ from conditions import (
     ChromaExtractor,
     RhythmExtractor,
     EnergyExtractor,
+    CrepeF0Extractor,
+    CONDITION_CONFIG,
     DAC_FRAMES_PER_S,
 )
 
@@ -70,8 +72,6 @@ def melody_fidelity(target: np.ndarray, generated: np.ndarray,
     """
     import mir_eval
 
-    T = target.shape[0]
-    times = (np.arange(T) / float(fps)).astype(np.float64)
     ref_freq = _melody_onehot_to_freqs(target)
     est_freq = _melody_onehot_to_freqs(generated)
 
@@ -140,11 +140,36 @@ def energy_fidelity(target: np.ndarray, generated: np.ndarray,
     }
 
 
+# ============================================================
+# F0  -- pitch-contour adherence + voicing agreement
+# ============================================================
+def f0_fidelity(target: np.ndarray, generated: np.ndarray,
+                fps: float = DAC_FRAMES_PER_S) -> dict:
+    """
+    Adherence of the monophonic f0 contour (CrepeF0Extractor output). Channel 0
+    is the normalized (log-)pitch with 0 == unvoiced; a possible channel 1 is
+    the periodicity (ignored here). Two numbers, in the spirit of the melody
+    metrics but for a continuous 1-D contour:
+      - corr:        Pearson correlation of the pitch curve on the frames the
+                     TARGET marks as voiced (where a pitch is actually expected);
+      - voicing_acc: fraction of frames where target and generation agree on
+                     voiced/unvoiced (both > 0 or both == 0).
+    """
+    t = target[:, 0]
+    g = generated[:, 0]
+    tv = t > 0
+    gv = g > 0
+    voiced_corr = _pearson(t[tv], g[tv]) if int(tv.sum()) >= 2 else float("nan")
+    voicing_acc = float((tv == gv).mean()) if tv.size else float("nan")
+    return {"corr": voiced_corr, "voicing_acc": voicing_acc}
+
+
 FIDELITY_FNS = {
     "melody": melody_fidelity,
     "chroma": chroma_fidelity,
     "rhythm": rhythm_fidelity,
     "energy": energy_fidelity,
+    "f0":     f0_fidelity,
 }
 
 
@@ -152,7 +177,8 @@ FIDELITY_FNS = {
 # INFLUENCE PANEL  -- consolidated TensorBoard text table
 # ============================================================
 def format_influence_panel(influence: dict, step: int, prefix: str = "EMA",
-                           guidance: float = 1.0, n_samples: int = 0) -> str:
+                           guidance: float = 1.0, n_samples: int = 0,
+                           coverage: dict = None) -> str:
     """
     Render the per-condition influence dict as a single Markdown table for
     TensorBoard's add_text. The table contains ONLY the conditions active in the
@@ -165,6 +191,14 @@ def format_influence_panel(influence: dict, step: int, prefix: str = "EMA",
                                           "delta": float|None,
                                           "note": str (optional)} } }
 
+    `coverage` (optional), from ConditionFidelityEvaluator.coverage():
+        { "cond/metric": {"valid": int, "attempted": int,
+                          "non_finite": int, "extract_errors": int} }
+    Rendered as a "valid/attempted" column: the mean is only meaningful together
+    with how many samples reached it. Failures (silence, degenerate curves,
+    extraction errors) yield non-finite values that are excluded from the mean,
+    so a score computed on few survivors can look BETTER than one computed on all.
+
     Δ = with-cond - null. All current metrics are higher-is-better, so Δ > 0
     means the condition pulled the generation toward its target.
     """
@@ -174,24 +208,45 @@ def format_influence_panel(influence: dict, step: int, prefix: str = "EMA",
     def fmt_plain(x):
         return f"{x:.4f}" if isinstance(x, (int, float)) else "n/a"
 
+    def fmt_cov(cname, metric):
+        if not coverage:
+            return "—"
+        c = coverage.get(f"{cname}/{metric}")
+        if not c:
+            return "—"
+        s = f"{c['valid']}/{c['attempted']}"
+        bad = c.get("non_finite", 0) + c.get("extract_errors", 0)
+        return s + (f" ⚠️{bad}" if bad else "")
+
     # Markdown (TensorBoard renders markdown but NOT raw HTML). No big '###'
     # heading -> lighter/smaller; the explanatory legend is a separate tag.
     lines = []
     lines.append(f"**Condition influence — step {step}** · "
                  f"_{prefix} · guidance={guidance} · {n_samples} samples_")
     lines.append("")
-    lines.append("| Condition | Metric | with-cond | null | Δ influence |")
-    lines.append("|---|---|---:|---:|---:|")
+    lines.append("| Condition | Metric | with-cond | null | Δ influence | valid/used |")
+    lines.append("|---|---|---:|---:|---:|---:|")
     for cname in influence:
         for metric, vals in influence[cname].items():
             note = vals.get("note")
             if note:
-                lines.append(f"| `{cname}` | {metric} | n/a | n/a | _{note}_ |")
+                lines.append(f"| `{cname}` | {metric} | n/a | n/a | _{note}_ | "
+                             f"{fmt_cov(cname, metric)} |")
             else:
                 lines.append(
                     f"| `{cname}` | {metric} | {fmt_plain(vals.get('cond'))} | "
-                    f"{fmt_plain(vals.get('null'))} | {fmt(vals.get('delta'))} |"
+                    f"{fmt_plain(vals.get('null'))} | {fmt(vals.get('delta'))} | "
+                    f"{fmt_cov(cname, metric)} |"
                 )
+    if coverage:
+        incomplete = {k: c for k, c in coverage.items()
+                      if c["valid"] < c["attempted"]}
+        if incomplete:
+            lines.append("")
+            lines.append("⚠️ _Some samples did not contribute: the mean is over "
+                         "the valid ones only, so it does NOT describe the "
+                         "failures (degenerate/silent generations, extraction "
+                         "errors). Read it together with valid/used._")
     return "\n".join(lines)
 
 
@@ -250,6 +305,7 @@ _EXTRACTOR_FNS = {
     "chroma": ChromaExtractor,
     "rhythm": RhythmExtractor,
     "energy": EnergyExtractor,
+    "f0":     CrepeF0Extractor,
 }
 
 
@@ -280,9 +336,58 @@ def sonify_energy(curve, sr, fps: float = DAC_FRAMES_PER_S,
 
 # name -> callable(array, sr, fps) -> waveform (float32). Conditions without a
 # sonifier (e.g. chroma) are simply skipped. Easy to extend (e.g. rhythm clicks).
+def sonify_f0(arr: np.ndarray, sr: int,
+              fps: float = DAC_FRAMES_PER_S, amp: float = 0.2) -> np.ndarray:
+    """
+    Render the f0 condition to an audible sine contour, so the pitch curve the
+    model is being conditioned on can be *listened to* (the qualitative check
+    that catches octave jumps, phantom pitch in silence, wrong voicing).
+
+    Input is the CrepeF0Extractor output: (T,1) or (T,2) with channel 0 = the
+    normalized pitch and 0 == unvoiced (channel 1, periodicity, is ignored).
+    The mapping is INVERTED using the extractor's ACTUAL parameters read from
+    CONDITION_CONFIG, so it stays in sync if fmin/fmax/voiced_floor are changed:
+        pitch_norm = voiced_floor + (1 - voiced_floor) * (log2(f/fmin) / log2(fmax/fmin))
+    Phase is carried across consecutive voiced frames (and reset on unvoiced) to
+    avoid clicks. Returns float32 in [-amp, amp].
+    """
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    pn = arr[:, 0].astype(np.float64)
+
+    kw = CONDITION_CONFIG.get("frame_level", {}).get("f0", {}).get("kwargs", {})
+    fmin = float(kw.get("fmin", 50.0))
+    fmax = float(kw.get("fmax", 1000.0))
+    floor = float(kw.get("voiced_floor", 0.05))
+
+    voiced = pn > 0.0
+    lo, hi = np.log2(fmin), np.log2(fmax)
+    # undo the [voiced_floor, 1] remap, then the log-scale normalization
+    p = np.clip((pn - floor) / max(1.0 - floor, 1e-8), 0.0, 1.0)
+    freqs = np.where(voiced, np.exp2(p * (hi - lo) + lo), 0.0)
+
+    T = arr.shape[0]
+    spf = max(1, int(round(sr / float(fps))))
+    out = np.zeros(T * spf, dtype=np.float32)
+    t_local = np.arange(spf) / float(sr)
+    phase = 0.0
+    for i in range(T):
+        f = float(freqs[i])
+        seg = slice(i * spf, (i + 1) * spf)
+        if f > 0.0:
+            ph = phase + 2.0 * np.pi * f * t_local
+            out[seg] = (amp * np.sin(ph)).astype(np.float32)
+            phase = float(ph[-1] + 2.0 * np.pi * f / sr)
+        else:
+            phase = 0.0
+    return out
+
+
 SONIFY_FNS = {
     "melody": sonify_melody,
     "energy": sonify_energy,
+    "f0":     sonify_f0,
 }
 
 
@@ -319,17 +424,30 @@ class ConditionFidelityEvaluator:
     """
 
     def __init__(self, enabled_frame, device: str = "cpu",
-                 fps: float = DAC_FRAMES_PER_S):
+                 fps: float = DAC_FRAMES_PER_S, registry=None):
         self.fps = fps
         self.device = device
         self.extractors = {}
+
+        # Report #15: the fidelity metric must re-extract conditions from the
+        # generated audio with the SAME extractor configuration used to build the
+        # targets at preprocessing time. If the run's ConditionRegistry is passed,
+        # reuse its already-instantiated extractors (exact params: f0
+        # with_periodicity / thresholds, energy weighting, etc.). Only fall back
+        # to default-constructed extractors when no registry is available.
+        run_extractors = getattr(registry, "frame_extractors", None) or {}
+
         for name in enabled_frame:
+            if name in run_extractors:
+                self.extractors[name] = run_extractors[name]
+                continue
             if name not in _EXTRACTOR_FNS:
                 continue
-            # MelodyExtractor / ChromaExtractor / EnergyExtractor take no
-            # constructor args here (defaults match extraction time, incl. the
-            # energy weighting="A"/fmin=40); RhythmExtractor needs a device.
-            if name == "rhythm":
+            # Fallback defaults. MelodyExtractor / ChromaExtractor / EnergyExtractor
+            # take no args (defaults match extraction time). RhythmExtractor
+            # (beat_this) and CrepeF0Extractor (torchcrepe) accept a device and
+            # are much faster on GPU; the device does not change their values.
+            if name in ("rhythm", "f0"):
                 self.extractors[name] = _EXTRACTOR_FNS[name](device=device)
             else:
                 self.extractors[name] = _EXTRACTOR_FNS[name]()
@@ -338,6 +456,16 @@ class ConditionFidelityEvaluator:
     def reset(self):
         self._sums = defaultdict(float)
         self._counts = defaultdict(int)
+        # Coverage accounting. Without it the mean silently describes only the
+        # samples that SUCCEEDED: a model that degenerates on the hard cases
+        # (silence, constant curves, extraction failures) produces NaN/Inf there,
+        # those are dropped, and the average IMPROVES because the worst cases
+        # vanished. The mean must always be read together with how many samples
+        # actually contributed.
+        self._attempted = defaultdict(int)     # per metric key
+        self._non_finite = defaultdict(int)    # per metric key
+        self._extract_errors = defaultdict(int)  # per CONDITION name
+        self._cond_attempted = defaultdict(int)  # per CONDITION name
 
     @property
     def active(self) -> bool:
@@ -354,17 +482,54 @@ class ConditionFidelityEvaluator:
         for name, extractor in self.extractors.items():
             if name not in target_cond:
                 continue
+            self._cond_attempted[name] += 1
             target = np.asarray(target_cond[name], dtype=np.float32)
             try:
                 generated = extractor.extract(gen_wav_np, sr, n_frames)
             except Exception as e:
+                # COUNTED, not just printed: a re-extraction that keeps failing
+                # is a property of the generations, and must be visible in the
+                # coverage instead of quietly shrinking the denominator.
+                self._extract_errors[name] += 1
                 print(f"  [fidelity] re-extraction failed for '{name}': {e}")
                 continue
             metrics = FIDELITY_FNS[name](target, generated, self.fps)
             for k, v in metrics.items():
-                if v == v:  # not NaN
-                    self._sums[f"{name}/{k}"] += v
-                    self._counts[f"{name}/{k}"] += 1
+                key = f"{name}/{k}"
+                self._attempted[key] += 1
+                # isfinite, NOT `v == v`: the latter lets +Inf/-Inf through and a
+                # single infinity destroys the mean.
+                if np.isfinite(v):
+                    self._sums[key] += float(v)
+                    self._counts[key] += 1
+                else:
+                    self._non_finite[key] += 1
+
+    def coverage(self) -> dict:
+        """Per metric key: how many samples actually contributed to the mean, and
+        why the others did not. Report it NEXT TO the mean -- a high score on 20%
+        of the samples is not a better model, it is a smaller denominator."""
+        out = {}
+        for key in self._attempted:
+            name = key.split("/")[0]
+            attempted = self._cond_attempted.get(name, 0)
+            out[key] = {
+                "valid": self._counts.get(key, 0),
+                "attempted": attempted,
+                "non_finite": self._non_finite.get(key, 0),
+                "extract_errors": self._extract_errors.get(name, 0),
+            }
+        # conditions whose extraction NEVER succeeded produce no metric key at
+        # all: surface them instead of letting them disappear from the report.
+        for name, n_err in self._extract_errors.items():
+            if not any(k.startswith(name + "/") for k in out):
+                out[f"{name}/<no metric>"] = {
+                    "valid": 0,
+                    "attempted": self._cond_attempted.get(name, 0),
+                    "non_finite": 0,
+                    "extract_errors": n_err,
+                }
+        return out
 
     def results(self) -> dict:
         """Average over the samples that contributed a finite value."""

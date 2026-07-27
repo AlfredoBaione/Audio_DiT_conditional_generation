@@ -90,6 +90,7 @@ def acquire_gpu_locks(num_devices=1):
 
     with ParallelLock():
         devices = mgp.retrieve_my_gpu_locks()
+
         if not devices:
             gpu_ids = mgp.board_ids()
             if gpu_ids is None or len(gpu_ids) == 0:
@@ -113,15 +114,15 @@ def acquire_gpu_locks(num_devices=1):
                     file=sys.stderr,
                 )
 
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if not cuda_visible:
-        raise RuntimeError(
-            "CUDA_VISIBLE_DEVICES not set after locking."
-        )
-    cuda_visible = sorted(cuda_visible.split(","))
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible)
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if not cuda_visible:
+            raise RuntimeError(
+                "CUDA_VISIBLE_DEVICES not set after locking."
+            )
+        cuda_visible = sorted(cuda_visible.split(","))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible)
 
-    return devices
+        return devices
 
 
 # ============================================================

@@ -3,10 +3,10 @@
 # Default configuration for the conditioned Audio DiT training (training_cond.py).
 #
 # Mirrors the structure of configs/uncond_default.yaml (model / data / training
-# / intervals / sampling / paths) and adds a `conditioning` section for the
-# multi-modal conditioning specific to this project:
-#   - frame-level conditions (melody, chroma, rhythm) are CONCATENATED on the
-#     feature dimension at the model input, JASCO-style (see network_cond.py);
+# / intervals / sampling / metrics / paths) and adds a `conditioning` section for
+# the multi-modal conditioning specific to this project:
+#   - frame-level conditions (melody, chroma, rhythm, energy) are CONCATENATED on
+#     the feature dimension at the model input, JASCO-style (see network_cond.py);
 #   - global conditions (text-CLAP, image-CLIP) are injected via AdaLN, exactly
 #     as the class label in the official DiT;
 #   - per-sample CFG dropout during training;
@@ -35,7 +35,7 @@
 # MODEL
 # ============================================================
 model:
-  kind: 'S'              # S | B | L  (see network_cond.py)
+  kind: 'S'              # S | B | G | L | XL  (see network_cond.py)
   duration_s: 5.0        # seconds of audio per chunk
   drop: 0.0              # dropout in the FFN of every DiT block (0 -> inert)
 
@@ -44,10 +44,32 @@ model:
 # DATA
 # ============================================================
 data:
-  train_batch_size: 8
-  val_batch_size: 8
-  grad_accum: 1
-  num_val_batches: 8     # number of validation batches per validation pass
+  train_batch_size: 2
+  val_batch_size: 16
+  grad_accum: 8
+  num_val_batches: 1     # number of validation batches per validation pass
+  num_workers: 4         # DataLoader workers; set 0 on Windows or for simple/debug runs
+
+  # ----------------------------------------------------------------
+  # TRAIN / VAL / TEST split (decided in code; the dataset is split-less on
+  # disk, produced by preprocess_stream.py). The split is:
+  #   * stratified by class (each class contributes to every split by ratio);
+  #   * grouped by SOURCE file (all chunks AND both stereo channels of one
+  #     source go to the same split) -> no chunk-level train/test leakage;
+  #   * deterministic from `seed`;
+  #   * the TEST set is persisted to  <dataset_root>/../splits/test_split_<hash>.json
+  #     so every run on the same dataset+params reuses the SAME test set
+  #     (comparable conditioned generations across checkpoints); train/val are
+  #     re-derived deterministically and need not be saved.
+  # Changing any of these values changes the cached normalizer / FD-DAC
+  # reference fingerprint, so a fresh paths.cache_dir is required.
+  # ----------------------------------------------------------------
+  split:
+    ratios: [0.8, 0.1, 0.1]   # train / val / test (per-class, over source groups)
+    seed: 42
+    group_by_source: true      # leakage-safe (keep true)
+    stratify_by_class: true
+    save_test_manifest: true
 
 
 # ============================================================
@@ -56,6 +78,14 @@ data:
 training:
   num_steps: 1000000
   lr: 1.0e-4
+  seed: 42                # global run seed: x0, t-sampling, CFG dropout, DataLoader
+                          # shuffle. null = off (free-running). Matches uncond.
+
+  # If true (default), the training refuses to start if any requested frame
+  # condition is not present in EVERY train/val .npz (full scan), and the
+  # dataset hard-fails instead of silently zero-filling a missing/corrupt
+  # condition. Set false only for debug runs where NULL conditions are OK.
+  strict_conditions: true
 
   # Regularization / numerical guards.
   # All three are KEPT AS CONFIGURABLE OPTIONS but DISABLED for this training:
@@ -82,10 +112,11 @@ training:
 # ============================================================
 intervals:
   val:     1000           # validation loss
-  audio:   25000          # frequency of the optional conditioned-only audio preview
-  audio_preview: false    # if true, ALSO log conditioned-only previews every intervals.audio
-                          # (the full real/with-cond/without-cond comparison is always
-                          #  logged at intervals.metrics, so this is just extra/more frequent)
+  audio:   25000          # generated-audio preview on TB (Validation/Audio_generated_*)
+                          # sampling.n_audio_samples generations. The real reference
+                          # audio is logged ONCE at step 0. The richer
+                          # real/with-cond/without-cond comparison is logged at
+                          # intervals.metrics. Set very large to effectively disable.
   metrics: 50000          # computes FD-DAC + KL (both directions)
   ckpt:    50000          # save periodical checkpoint
   keep_last_n_ckpts: 5    # keep only the last N periodic checkpoints
@@ -100,7 +131,10 @@ sampling:
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4      # conditioned audios logged on TB for listening
-  n_metrics_samples: 1024  # conditioned samples used to compute FD-DAC + KL
+  n_metrics_samples: 512  # conditioned samples used to compute FD-DAC + KL. 512 is a
+                          # stable estimate for a 72-dim covariance; 1024 doubles the
+                          # metrics-step TIME for a marginal statistical gain -- keep it
+                          # for the final offline evaluation, not for a 1M-step run.
   # ---- AUDIO part of the metrics step (DAC decode + re-extraction) ----
   # FD-DAC/KL above are latent-only and run on ALL n_metrics_samples (cheap).
   # The audio part (decode + condition re-extraction + disk dump) is RAM-heavy,
@@ -124,6 +158,45 @@ sampling:
   # which are the only metrics comparable with the unconditional model. Doubles
   # the generation cost of the metrics step. Set false to skip it.
   metrics_uncond: true
+
+  # How many SAMPLES the metrics step fuses into one forward. Each sample needs 3
+  # rows (conditioned / cfg-null / unconditional: all three are required by the
+  # CFG math, so the 3 is structural, never a knob). This ONLY changes how the
+  # work is packed into forwards: the samples generated -- and therefore the
+  # metric VALUES -- are the same for every value, because the noise is drawn per
+  # sample. What it trades is speed against the activation peak:
+  #   0 -> do NOT fuse: reference serial sampler. LOWEST VRAM, slowest.
+  #        Use this if the metrics step OOMs (same numbers, no code change).
+  #   1 -> 1 sample  -> batch 3   (default: fewer kernel launches than serial)
+  #   2 -> 2 samples -> batch 6   (faster, ~2x the activation peak of batch 3)
+  #   N -> N samples -> batch 3N
+  # Raise it only after checking the peak with nvidia-smi at a metrics step.
+  # Fusing needs a CFG to fuse, so the serial path runs anyway when guidance <= 1,
+  # metrics_uncond=false, or no condition is active.
+  metrics_samples_per_forward: 1
+
+
+# ============================================================
+# METRICS
+# ============================================================
+# Aligned with the unconditional repo. The conditioned metrics are latent-only
+# (FD-DAC + KL, both directions), computed in evaluate_and_log_metrics; the only
+# knob shared with uncond is the generation seed, which fixes the metric noise
+# (x0) so FD/KL are comparable across checkpoints. null = free-running.
+metrics:
+  # Which distributional metrics to compute at each metrics step, mirroring the
+  # unconditional project's registry. Available in this (conditioned) pipeline:
+  #   fd_dac : Frechet distance on the DAC latents  (latent-only, frame-level)
+  #   kl_dac : KL in BOTH directions on DAC latents (latent-only, frame-level)
+  # Each is computed for both axes (conditioned + unconditional -> Fd_dac_cond /
+  # Fd_dac_uncond / Kl_cond / Kl_uncond). Listing a metric is an EXPLICIT request:
+  # an unknown/unsupported name is a hard error at startup, not a silent skip.
+  # An empty list [] turns the distributional metrics off entirely (and skips
+  # building their reference); the condition-influence panel is unaffected.
+  # NOTE: the two share the generated mu/covariance, so asking for both costs
+  # essentially the same as asking for one -- the heavy part is fitted once.
+  enabled: ["fd_dac", "kl_dac"]
+  seed: 0
 
 
 # ============================================================
@@ -156,9 +229,12 @@ conditioning:
   #   enabled_frame:  []                              # no frame conditioning
   #   enabled_global: []                              # no text/image AdaLN
   #
-  # FIRST TEST: melody only, no global conditions.
+  # DEFAULT: f0-only. This matches the current preprocessing line (--conditions f0)
+  # and needs NO optional dependency (f0 uses torchcrepe, already installed;
+  # melody would need basic-pitch, which is optional). Switch to ["melody", ...]
+  # once you have extracted those conditions AND installed basic-pitch.
   # ---------------------------------------------------------------
-  enabled_frame:  ["melody", "energy"]
+  enabled_frame:  ["f0"]
   enabled_global: []
 
 
@@ -166,7 +242,7 @@ conditioning:
 # PATHS
 # ============================================================
 paths:
-  # Output of preprocess_dataset.py + extract_conditions.py
+  # Output of preprocess_stream.py (+ extract_conditions.py to add a condition later)
   dataset_root:   "./dataset_ready_cond/latents"
   wav_root:       "./dataset_ready_cond/wav"
   condition_root: "./dataset_ready_cond/conditions"
@@ -174,12 +250,18 @@ paths:
   # Class-organised image folders (image_root/<class>/*.jpg)
   image_root:     "./image_dataset_cond"
 
+  # Portable defaults (relative to the working dir). On IRCAM, override with the
+  # shared absolute paths, e.g. on the CLI:
+  #   paths.runs_dir=/data/anasynth_nonbp/baione/runs \
+  #   paths.cache_dir=/data/anasynth_nonbp/baione/cache
+  # or keep an IRCAM profile in configs/cond_ircam.yaml.
+  #
   # Shared among all runs; the specific run is in runs_dir/<run_name>/
-  runs_dir:       "/data/anasynth_nonbp/baione/runs"
+  runs_dir:       "./runs"
 
   # Shared cache among runs over the same dataset (normalizer, FD-DAC + KL reference).
   # Computed once, reused by all subsequent runs.
-  cache_dir:      "/data/anasynth_nonbp/baione/cache"
+  cache_dir:      "./cache"
 
   # Name of the run (folder under runs_dir/).
   # Priority: CLI --run_name > YAML run_name > self-generated timestamp.
