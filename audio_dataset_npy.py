@@ -147,62 +147,104 @@ class LatentNormalizer:
         n_frames: int,
         device: Optional[str] = None,
         batch_accum: int = 50,
+        io_workers: int = 16,
     ):
         """
         Compute mean and std per-channel with parallel Welford batched.
 
-        Improvements vs naive version:
           - Single-pass (not two: it uses Welford online)
           - Accelerated GPU (float64 for stability)
-          - Cache to avoid multiple readings of the same file
           - Batch accumulation before updating the stats
+          - PARALLEL READS: the chunks of each batch are loaded by a thread pool.
+            The fit is I/O-bound, not compute-bound -- the Welford update itself
+            is microseconds on 72 channels, while each np.load is a network round
+            trip. Reading them one at a time makes a multi-million-chunk corpus
+            take hours; `io_workers` threads cut that by roughly that factor
+            (np.load releases the GIL during I/O). The arithmetic is UNCHANGED:
+            the pool returns the block in input order, so the accumulated batches
+            are exactly the ones the serial version would have built.
         """
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            
+
         n_chunks = len(chunks)
-        print(f"[Normalizer] Welford batched on {n_chunks} chunk "
-              f"(device={device}, batch_accum={batch_accum})...")
+        print(f"[Normalizer] Welford batched on {n_chunks:,} chunk "
+              f"(device={device}, batch_accum={batch_accum}, "
+              f"io_workers={io_workers})...")
 
         from tqdm import tqdm
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _read(item):
+            """Read ONE chunk slice, or return a reason string if it is unusable.
+
+            Validation happens HERE, before the values reach the statistics: a
+            single latent containing NaN/Inf turns mean and std into NaN, and
+            every subsequent normalize() silently produces NaN for the whole
+            training. The per-sample checks in the dataset run only later, at
+            __getitem__ time, which is far too late to protect the normalizer.
+            """
+            path, start = item
+            try:
+                z = np.load(str(path), mmap_mode="r")[:, start:start + n_frames]
+                z = np.ascontiguousarray(z, dtype=np.float32)
+            except Exception:
+                return "unreadable"
+            if z.ndim != 2 or z.shape[0] != DAC_LATENT_DIM:
+                return "bad_shape"
+            if z.shape[1] != n_frames:
+                return "short"          # short/odd chunk -> skipped, as before
+            if not np.isfinite(z).all():
+                return "non_finite"
+            return z
 
         mean_acc = None   # (dim, 1) float64
         m2_acc   = None   # (dim, 1) float64
-        n_total  = 0
+        n_total  = 0      # frames accumulated
+        n_used   = 0      # chunks that actually contributed
+        rejected = {}     # reason -> count
+        rejected_paths = []   # first few offenders, to make them fixable
 
-        buffer = []
+        with ThreadPoolExecutor(max_workers=max(1, io_workers)) as ex:
+            with tqdm(total=n_chunks, desc="Normalizer fit", unit="chunk") as pbar:
+                for b0 in range(0, n_chunks, batch_accum):
+                    block = chunks[b0:b0 + batch_accum]
+                    arrs = []
+                    for (path, _start), r in zip(block, ex.map(_read, block)):
+                        if isinstance(r, str):
+                            rejected[r] = rejected.get(r, 0) + 1
+                            if len(rejected_paths) < 10:
+                                rejected_paths.append(f"{path}  [{r}]")
+                        else:
+                            arrs.append(r)
+                    pbar.update(len(block))
+                    if not arrs:
+                        continue
+                    n_used += len(arrs)
 
-        for i, (path, start) in enumerate(tqdm(chunks, desc="Normalizer fit")):
-            # Read only the necessary chunk, without caching (avoid OOM)
-            z_arr = np.load(str(path), mmap_mode='r')[:, start:start + n_frames]
-            z = torch.from_numpy(np.ascontiguousarray(z_arr).astype(np.float32))
+                    # Concatenate on time: (dim, sum_of_frames)
+                    batch = torch.from_numpy(np.concatenate(arrs, axis=1)).to(
+                        device=device, dtype=torch.float64)
+                    n_new = batch.shape[1]
 
-            if z.shape[1] != n_frames:
-                continue  # skip short chunks 
+                    if mean_acc is None:
+                        dim = batch.shape[0]
+                        mean_acc = torch.zeros(dim, 1, dtype=torch.float64, device=device)
+                        m2_acc   = torch.zeros(dim, 1, dtype=torch.float64, device=device)
 
-            buffer.append(z)
+                    # Welford parallel (Chan et al., 1979)
+                    n_total_new = n_total + n_new
+                    batch_mean  = batch.mean(dim=1, keepdim=True)
+                    delta       = batch_mean - mean_acc
+                    mean_acc    = mean_acc + delta * (n_new / n_total_new)
+                    batch_m2    = ((batch - batch_mean) ** 2).sum(dim=1, keepdim=True)
+                    m2_acc      = m2_acc + batch_m2 + (delta ** 2) * (n_total * n_new / n_total_new)
+                    n_total     = n_total_new
 
-            # Flush with batch_accum or end of dataset
-            if len(buffer) >= batch_accum or i == n_chunks - 1:
-                # Concatena sul tempo: (dim, batch_accum * n_frames)
-                batch = torch.cat(buffer, dim=1).to(device=device, dtype=torch.float64)
-                buffer = []
-
-                n_new = batch.shape[1]
-
-                if mean_acc is None:
-                    dim = batch.shape[0]
-                    mean_acc = torch.zeros(dim, 1, dtype=torch.float64, device=device)
-                    m2_acc   = torch.zeros(dim, 1, dtype=torch.float64, device=device)
-
-                # Welford parallel (Chan et al., 1979)
-                n_total_new = n_total + n_new
-                batch_mean  = batch.mean(dim=1, keepdim=True)
-                delta       = batch_mean - mean_acc
-                mean_acc    = mean_acc + delta * (n_new / n_total_new)
-                batch_m2    = ((batch - batch_mean) ** 2).sum(dim=1, keepdim=True)
-                m2_acc      = m2_acc + batch_m2 + (delta ** 2) * (n_total * n_new / n_total_new)
-                n_total     = n_total_new
+        if mean_acc is None:
+            raise RuntimeError(
+                f"Normalizer fit read no usable chunk out of {n_chunks:,} "
+                f"(rejected: {rejected or 'none'}).")
 
         var = (m2_acc / n_total).float().cpu()
         self.mean = mean_acc.float().cpu()
@@ -211,6 +253,29 @@ class LatentNormalizer:
         if device == "cuda":
             torch.cuda.empty_cache()
 
+        # A non-finite normalizer would silently turn EVERY normalized batch into
+        # NaN, so refuse it here rather than train on it.
+        if not (torch.isfinite(self.mean).all() and torch.isfinite(self.std).all()):
+            raise RuntimeError(
+                "Normalizer produced non-finite mean/std. The latents feeding it "
+                "are corrupt; inspect the dataset before training.")
+
+        print(f"[Normalizer] fitted on {n_used:,}/{n_chunks:,} chunk "
+              f"({n_total:,} frames)")
+        if rejected:
+            print(f"[Normalizer] rejected chunks: {rejected} "
+                  f"-- these did NOT contribute to mean/std")
+            # Print the paths, not just the counts: the same files are still in
+            # the split, and the dataset will hard-fail on them at __getitem__
+            # during training. Knowing WHICH ones lets you fix or remove them now
+            # instead of discovering it mid-run.
+            for p in rejected_paths:
+                print(f"             {p}")
+            if sum(rejected.values()) > len(rejected_paths):
+                print(f"             ... and "
+                      f"{sum(rejected.values()) - len(rejected_paths)} more")
+            print("             NOTE: these files are still indexed by the "
+                  "datasets; training will stop on them.")
         print(f"[Normalizer] mean range: [{self.mean.min():.3f}, {self.mean.max():.3f}]")
         print(f"[Normalizer] std range:  [{self.std.min():.3f}, {self.std.max():.3f}]")
 
@@ -223,13 +288,46 @@ class LatentNormalizer:
         return z * self.std.to(z.device) + self.mean.to(z.device)
 
     def save(self, path: str):
-        torch.save({"mean": self.mean, "std": self.std}, path)
+        # Publish ATOMICALLY: torch.save writes in place, so an interruption
+        # (SIGTERM, node crash, full disk) leaves a TRUNCATED normalizer.pt on
+        # disk. The next run sees the file exists, tries to load it, and fails --
+        # every time, until someone deletes it by hand. Writing to a temp file in
+        # the same directory and then os.replace() means the destination either
+        # holds the previous content or the complete new one, never a fragment.
+        import os as _os
+        path = str(path)
+        tmp = f"{path}.tmp"
+        torch.save({"mean": self.mean, "std": self.std}, tmp)
+        _os.replace(tmp, path)
         print(f"[Normalizer] saved in {path}")
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        self.mean = ckpt["mean"]
-        self.std  = ckpt["std"]
+        if not isinstance(ckpt, dict) or "mean" not in ckpt or "std" not in ckpt:
+            raise RuntimeError(
+                f"{path} is not a valid normalizer file (missing mean/std). "
+                f"Delete it and let the training recompute it.")
+        mean, std = ckpt["mean"], ckpt["std"]
+        # Validate the CONTENT, not just the fingerprint of the dataset it came
+        # from. A cache written by a version without the NaN check (or by a run
+        # that saw a corrupt latent) can hold NaN mean/std: loading it silently
+        # turns every normalized batch into NaN, and the training would look like
+        # it is running while learning nothing. Refuse it instead.
+        if mean.shape != std.shape:
+            raise RuntimeError(
+                f"{path}: mean{tuple(mean.shape)} and std{tuple(std.shape)} "
+                f"have different shapes.")
+        if not (torch.isfinite(mean).all() and torch.isfinite(std).all()):
+            raise RuntimeError(
+                f"{path} contains non-finite mean/std (it was computed before "
+                f"the latent validation existed, or from corrupt latents). "
+                f"Delete this file so it is recomputed.")
+        if (std <= 0).any():
+            raise RuntimeError(
+                f"{path} contains a non-positive std, which would divide by "
+                f"zero on normalize(). Delete this file so it is recomputed.")
+        self.mean = mean
+        self.std  = std
         print(f"[Normalizer] loaded from {path}")
 
 
@@ -419,8 +517,99 @@ def compute_split(
     }
 
 
-def _chunks_from_files(files: List[Path], n_frames: int) -> List[Tuple[Path, int]]:
-    """Build (path, start) sub-chunks for the normalizer, from a file list."""
+# Cap on how many chunks the normalizer fit reads. None = use EVERY chunk of the
+# train split (the default): the statistics then describe the actual training
+# distribution, with no sampling decision baked into them. Set an integer only if
+# you deliberately want a bounded, faster fit on a very large corpus.
+NORMALIZER_MAX_CHUNKS = None
+
+
+def _meta_latent_frames(latent_root) -> Optional[int]:
+    """`latent_frames_per_chunk` from dataset_meta.json, or None if unavailable.
+
+    preprocess_stream.py writes fixed-length chunks, so this single number
+    describes EVERY .npy in the dataset -- which is what lets _chunks_from_files
+    skip opening them one by one."""
+    p = Path(latent_root).parent / "dataset_meta.json"
+    if not p.exists():
+        return None
+    try:
+        v = json.loads(p.read_text()).get("latent_frames_per_chunk")
+        return int(v) if v else None
+    except Exception:
+        return None
+
+
+def _chunks_from_files(files: List[Path], n_frames: int,
+                       uniform_frames: Optional[int] = None,
+                       max_chunks: Optional[int] = None,
+                       seed: int = 0) -> List[Tuple[Path, int]]:
+    """Build (path, start) sub-chunks for the normalizer, from a file list.
+
+    `uniform_frames` (from dataset_meta.json) is the length EVERY latent has.
+    When it is available the chunk list is computed ARITHMETICALLY instead of
+    opening each .npy to read its shape: that scan is O(n_files) network round
+    trips with the GPU idle -- ~3 hours for a 5.8M-file split on NFS, which is
+    how a job gets killed before the fit even starts. The assumption is verified
+    on a spread sample of files; if any of them disagrees, the exact per-file
+    scan is used instead.
+
+    The sampled check is a fast path, not a proof: a lone odd-length file can
+    slip past it. That is safe because fit_from_chunks re-reads each chunk and
+    SKIPS any slice whose width != n_frames, so a stale (path, start) pair is
+    dropped at read time rather than corrupting the statistics. The probe exists
+    to catch a systematically wrong meta, not every individual outlier.
+
+    `max_chunks` caps how many chunks are returned (deterministically, from
+    `seed`), so the fit stays bounded on huge corpora. Whole files are selected,
+    which also keeps reads sequential per file.
+    """
+    n_files = len(files)
+    if n_files == 0:
+        return []
+
+    per_file = 0
+    if uniform_frames and uniform_frames >= n_frames:
+        # verify the uniform-length assumption on up to 64 spread files
+        probe = sorted({int(round(i)) for i in
+                        np.linspace(0, n_files - 1, min(64, n_files))})
+        ok = True
+        for i in probe:
+            try:
+                if np.load(str(files[i]), mmap_mode="r").shape[1] != uniform_frames:
+                    ok = False
+                    break
+            except Exception:
+                ok = False
+                break
+        if ok:
+            per_file = uniform_frames // n_frames
+        else:
+            print("[normalizer] dataset_meta.json declares "
+                  f"latent_frames_per_chunk={uniform_frames} but the sampled "
+                  "files disagree -> falling back to the exact per-file scan "
+                  "(slower).")
+
+    if per_file > 0:
+        # arithmetic path: no per-file open at all
+        sel = files
+        if max_chunks and n_files * per_file > max_chunks:
+            keep = max(1, max_chunks // per_file)
+            idx = random.Random(seed).sample(range(n_files), min(keep, n_files))
+            sel = [files[i] for i in sorted(idx)]   # sorted -> sequential reads
+            print(f"[normalizer] fitting on {len(sel):,} of {n_files:,} files "
+                  f"({min(len(sel) * per_file, max_chunks):,} chunks, "
+                  f"seed={seed}): a per-channel mean/std does not need the full "
+                  f"corpus.")
+        out = [(f, k * n_frames) for f in sel for k in range(per_file)]
+        # Whole files are kept for read locality, so the count can overshoot when
+        # max_chunks < per_file (a file yields several chunks and at least one
+        # file is always kept). Truncate so the cap is a real cap.
+        if max_chunks and len(out) > max_chunks:
+            out = out[:max_chunks]
+        return out
+
+    # exact path (legacy datasets, or non-uniform lengths): open every file
     chunks = []
     for f in files:
         try:
@@ -429,6 +618,11 @@ def _chunks_from_files(files: List[Path], n_frames: int) -> List[Tuple[Path, int
             continue
         for k in range(file_frames // n_frames):
             chunks.append((f, k * n_frames))
+    if max_chunks and len(chunks) > max_chunks:
+        chunks = random.Random(seed).sample(chunks, max_chunks)
+        chunks.sort()
+        print(f"[normalizer] fitting on {len(chunks):,} sampled chunks "
+              f"(seed={seed}).")
     return chunks
 
 
@@ -643,7 +837,11 @@ def build_datasets(
     else:
         print("[build_datasets] Computing the normalizer on the train split...")
         n_frames = frames_per_chunk(latent_root, duration_s)
-        chunks = _chunks_from_files(splits["train"], n_frames)
+        chunks = _chunks_from_files(
+            splits["train"], n_frames,
+            uniform_frames=_meta_latent_frames(latent_root),
+            max_chunks=NORMALIZER_MAX_CHUNKS,
+        )
         if not chunks:
             raise RuntimeError("No train chunks available to fit the normalizer.")
         normalizer.fit_from_chunks(chunks, n_frames=n_frames)

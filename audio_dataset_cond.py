@@ -47,6 +47,7 @@ from audio_dataset_npy import (
     # split machinery lives in the base module to avoid a circular import;
     # re-exported here so callers can `from audio_dataset_cond import compute_split`.
     compute_split, _class_of_file, _chunks_from_files,
+    _meta_latent_frames, NORMALIZER_MAX_CHUNKS,
 )
 from conditions import (
     ConditionRegistry, ImageDatasetManager,
@@ -157,6 +158,30 @@ class ConditionedAudioDataset(Dataset):
         want_cond = (self.condition_root is not None and len(self._get_frame_names()) > 0)
         present = set()
 
+        # Uniform-length fast path. preprocess_stream.py writes FIXED-length
+        # chunks, so dataset_meta.json's `latent_frames_per_chunk` describes every
+        # latent: opening each one just to read its shape is O(n_files) network
+        # round trips for a number we already know -- hours on a multi-million
+        # file split, repeated once per split. The claim is verified on a spread
+        # sample; if any probed file disagrees, the exact per-file read is used.
+        uniform = _meta_latent_frames(self.latent_root) if self.latent_root else None
+        if uniform:
+            probe = sorted({int(round(i)) for i in
+                            np.linspace(0, len(self.files) - 1,
+                                        min(64, len(self.files)))})
+            for i in probe:
+                try:
+                    if np.load(str(self.files[i]), mmap_mode="r").shape[1] != uniform:
+                        uniform = None
+                        break
+                except Exception:
+                    uniform = None
+                    break
+            if uniform is None:
+                print(f"[CondDataset/{self.split}] dataset_meta.json's "
+                      f"latent_frames_per_chunk does not match the sampled files "
+                      f"-> reading every latent header (slower).")
+
         for f in self.files:
             if f.suffix.lower() not in SUPPORTED_EXTS:
                 continue
@@ -167,13 +192,16 @@ class ConditionedAudioDataset(Dataset):
                 # class not in the global mapping (should not happen): skip safely
                 continue
 
-            try:
-                file_frames = np.load(str(f), mmap_mode="r").shape[1]
-            except Exception as e:
-                n_files_unreadable += 1
-                print(f"[CondDataset/{self.split}] WARNING: unreadable latent "
-                      f"{f.name} ({type(e).__name__}: {e}) -> skipped")
-                continue
+            if uniform is not None:
+                file_frames = uniform          # from the verified dataset meta
+            else:
+                try:
+                    file_frames = np.load(str(f), mmap_mode="r").shape[1]
+                except Exception as e:
+                    n_files_unreadable += 1
+                    print(f"[CondDataset/{self.split}] WARNING: unreadable latent "
+                          f"{f.name} ({type(e).__name__}: {e}) -> skipped")
+                    continue
 
             n_chunks_file = file_frames // self.n_frames
             if n_chunks_file == 0:
@@ -479,10 +507,22 @@ def build_conditioned_datasets(
     else:
         print("[build_conditioned_datasets] Computing normalizer on the train split...")
         n_frames = frames_per_chunk(latent_root, duration_s)
-        chunks = _chunks_from_files(splits["train"], n_frames)
+        # uniform_frames lets this skip opening every .npy just to read its shape
+        # (hours of idle-GPU network I/O on a multi-million-chunk corpus), and
+        # max_chunks bounds how many chunks the fit actually reads.
+        chunks = _chunks_from_files(
+            splits["train"], n_frames,
+            uniform_frames=_meta_latent_frames(latent_root),
+            max_chunks=NORMALIZER_MAX_CHUNKS,
+        )
         if not chunks:
             raise RuntimeError("No train chunks available to fit the normalizer.")
         normalizer.fit_from_chunks(chunks, n_frames=n_frames)
+        # Release the (Path, start) list NOW: it is O(n_chunks) tuples -- roughly
+        # a GB on a multi-million-chunk corpus -- and the three dataset objects
+        # built right below allocate their own per-sample lists. Holding both at
+        # once is a pointless RAM peak at the worst possible moment.
+        del chunks
 
     # 3. image managers only if image conditioning is active
     image_active = (registry is not None

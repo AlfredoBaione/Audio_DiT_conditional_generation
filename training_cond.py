@@ -157,14 +157,21 @@ def _latent_file_list_hash(latent_root):
     unchanged, so a stale normalizer / FD-DAC reference is never reused (#4)."""
     import hashlib
     root = Path(latent_root)
-    entries = []
+    # Hash INCREMENTALLY. Accumulating every entry in a list and then joining it
+    # materialises the file list twice (the list of strings plus one giant blob)
+    # -- roughly 2 GB of transient host RAM for a 5.8M-file corpus, right before
+    # the heaviest startup phase. Feeding the digest entry by entry with the same
+    # "\n" separator yields the SAME hash with flat memory.
+    hasher = hashlib.sha256()
     n = 0
     for p in sorted(root.rglob("*.npy")):
         st = p.stat()
-        entries.append(f"{p.relative_to(root).as_posix()}|{st.st_size}|{st.st_mtime_ns}")
+        entry = f"{p.relative_to(root).as_posix()}|{st.st_size}|{st.st_mtime_ns}"
+        if n:
+            hasher.update(b"\n")        # separator BETWEEN entries, as join does
+        hasher.update(entry.encode("utf-8"))
         n += 1
-    h = hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
-    return h, n
+    return hasher.hexdigest(), n
 
 
 def _cache_fingerprint(cfg, n_frames):
@@ -1761,9 +1768,20 @@ if __name__ == "__main__":
     # The per-condition influence (delta vs null) is consolidated in the
     # Validation/Condition_influence text panel.
     from condition_metrics import ConditionFidelityEvaluator
+    # Device for the re-extraction (CREPE-full / beat_this / CLAP-audio) at the
+    # metrics step: "cuda" (default) or "cpu", from metrics.fidelity_device.
+    # It does not change the extracted values, only speed. "cpu" exists purely as
+    # an escape hatch if the metrics step runs out of VRAM (there the model and
+    # the DAC decoder are both resident, and CREPE-full on top can overflow a
+    # card with little margin).
+    _fid_device = str(cfg.metrics.get("fidelity_device", "cuda"))
+    if _fid_device.startswith("cuda") and not torch.cuda.is_available():
+        print("[metrics] fidelity_device='cuda' but no GPU is available "
+              "-> falling back to CPU for the re-extraction.")
+        _fid_device = "cpu"
     fidelity_evaluator = ConditionFidelityEvaluator(
         enabled_frame=list(FRAME_COND_DIMS.keys()),
-        device=device,
+        device=_fid_device,
         registry=registry,   # #15: re-extract with the run's exact extractor config
     )
     clap_audio_embedder = None
@@ -1772,7 +1790,8 @@ if __name__ == "__main__":
         # match the CLAP checkpoint used by the text condition
         clap_model_name = CONDITION_CONFIG["global"]["text"]["kwargs"].get(
             "model_name", "laion/larger_clap_music")
-        clap_audio_embedder = ClapAudioEmbedder(model_name=clap_model_name, device=device)
+        clap_audio_embedder = ClapAudioEmbedder(model_name=clap_model_name,
+                                                device=_fid_device)
         print(f"Text-influence (CLAP audio) enabled: {clap_model_name}")
 
     metrics_uncond = bool(cfg.sampling.get("metrics_uncond", True))

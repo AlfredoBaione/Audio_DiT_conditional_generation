@@ -41,6 +41,7 @@
 # side). NONE of these use Gaussian mixtures: all are single multivariate
 # Gaussians, exactly like the official FAD/FD/KL.
 
+import os
 import torch
 import numpy as np
 from typing import Optional
@@ -257,7 +258,12 @@ def precompute_latent_reference(
     if cache_path is not None:
         cache_path_obj = Path(cache_path)
         cache_path_obj.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(stats, str(cache_path_obj))
+        # Publish atomically (temp + os.replace): an interruption during a plain
+        # torch.save leaves a TRUNCATED cache file, which the next run finds,
+        # tries to load, and fails on -- every time, until it is deleted by hand.
+        _tmp = str(cache_path_obj) + ".tmp"
+        torch.save(stats, _tmp)
+        os.replace(_tmp, str(cache_path_obj))
         print(f"[Latent Reference] Cache saved in: {cache_path}")
 
     return stats
@@ -564,7 +570,9 @@ def precompute_audio_reference(val_wav_root, embedder, cache_path=None,
     stats = {"mu": mu.cpu(), "sigma": sigma.cpu(), "n_total": count}
     if cache_path is not None:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(stats, str(cache_path))
+        _tmp = str(cache_path) + ".tmp"          # atomic publish, see above
+        torch.save(stats, _tmp)
+        os.replace(_tmp, str(cache_path))
         print(f"[Audio ref] cache saved: {cache_path}")
     return stats
 

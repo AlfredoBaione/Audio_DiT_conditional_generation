@@ -181,7 +181,9 @@ python training_cond.py --config configs/cond_default.yaml \
 - Builds the split, fits/loads the normalizer, and logs the split composition
   (train/val/test file & chunk counts) **inside the `config` panel** on the
   TensorBoard **Text** tab, nested under `data.split.composition`. Parameter counts
-  are nested under `model.n_params_*` and also logged as `Model/n_params_M`.
+  are nested under `model.n_params_*` (and printed at startup). They are
+  deliberately NOT logged as scalars: a constant is a flat point at step 0 that
+  only clutters the Scalars dashboard.
 - **Cache safety:** the normalizer and FD-DAC reference are tied to the dataset via
   `cache_dir/cache_meta.json`. A stale or unverifiable cache **hard-fails**.
 - CLI overrides use dotlist syntax (e.g. `model.kind=B training.lr=5e-5`).
@@ -196,6 +198,14 @@ project's registry:
 metrics:
   enabled: ["fd_dac", "kl_dac"]   # [] turns them off (and skips their reference)
   seed: 0
+  fidelity_device: "cuda"         # "cuda" | "cpu" — device for the re-extraction
+                                  # (CREPE / beat_this / CLAP-audio) that feeds the
+                                  # condition-influence panel. FD-DAC/KL always run
+                                  # on the GPU regardless. The device does not
+                                  # change the values, only speed: "cpu" is an
+                                  # escape hatch if the metrics step runs out of
+                                  # VRAM (there the model AND the DAC decoder are
+                                  # already resident).
 ```
 
 Listing a metric is an explicit request: an unsupported name is a **hard error at

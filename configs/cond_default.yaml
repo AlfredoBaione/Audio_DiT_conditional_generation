@@ -44,10 +44,10 @@ model:
 # DATA
 # ============================================================
 data:
-  train_batch_size: 2
-  val_batch_size: 16
-  grad_accum: 8
-  num_val_batches: 1     # number of validation batches per validation pass
+  train_batch_size: 8
+  val_batch_size: 8
+  grad_accum: 1
+  num_val_batches: 8     # number of validation batches per validation pass
   num_workers: 4         # DataLoader workers; set 0 on Windows or for simple/debug runs
 
   # ----------------------------------------------------------------
@@ -197,6 +197,16 @@ metrics:
   # essentially the same as asking for one -- the heavy part is fitted once.
   enabled: ["fd_dac", "kl_dac"]
   seed: 0
+
+  # Device for the re-extraction at the metrics step (CREPE-full / beat_this /
+  # CLAP-audio), i.e. what feeds the condition-influence panel.
+  #   "cuda" -> GPU (default, fastest)
+  #   "cpu"  -> move ONLY this part to CPU
+  # FD-DAC / KL are unaffected: they always run on the GPU (see metrics.py).
+  # The device does NOT change the values, only speed -- "cpu" is purely an
+  # escape hatch for VRAM: at the metrics step the model and the DAC decoder are
+  # both resident, and CREPE-full on top can overflow a card with little margin.
+  fidelity_device: "cuda"
 
 
 # ============================================================

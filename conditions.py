@@ -991,7 +991,7 @@ CONDITION_CONFIG = {
                        "voicing_threshold": 0.5, "with_periodicity": True,
                        "silence_db": -60.0, "median_win": 3,
                        "min_voiced_frames": 3, "voiced_floor": 0.05,
-                       "device": "cuda"},
+                       "device": "cpu"},
             "out_dim": 16,
             "enabled": True,
         },
