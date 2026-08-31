@@ -30,6 +30,7 @@
 #
 # This module is evaluation-only: it never touches the trained weights.
 
+import copy
 from collections import defaultdict
 
 import numpy as np
@@ -439,7 +440,15 @@ class ConditionFidelityEvaluator:
 
         for name in enabled_frame:
             if name in run_extractors:
-                self.extractors[name] = run_extractors[name]
+                # Keep the exact extractor parameters used to build the stored
+                # targets, but use a shallow copy so the metrics-only runtime
+                # device does not mutate the registry shared with the datasets.
+                extractor = copy.copy(run_extractors[name])
+                if name == "f0":
+                    extractor.device = device
+                elif name == "rhythm":
+                    extractor._device = device
+                self.extractors[name] = extractor
                 continue
             if name not in _EXTRACTOR_FNS:
                 continue

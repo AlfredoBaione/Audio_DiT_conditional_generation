@@ -539,7 +539,8 @@ class CrepeF0Extractor(FrameConditionExtractor):
                  median_win: int = 3,               # median filter on periodicity (odd, 0=off)
                  min_voiced_frames: int = 3,        # drop voiced runs shorter than this
                  voiced_floor: float = 0.05,        # voiced pitch mapped to [floor, 1]
-                 device: Optional[str] = "cpu"):    # set "cuda" in CONFIG for speed
+                 device: Optional[str] = "cpu",     # set "cuda" in CONFIG for speed
+                 batch_size: int = 64):             # CREPE frames per inference batch
         self.fmin = float(fmin)
         self.fmax = float(fmax)
         self.model = model
@@ -551,6 +552,9 @@ class CrepeF0Extractor(FrameConditionExtractor):
         self.min_voiced_frames = int(min_voiced_frames)
         self.voiced_floor = float(voiced_floor)
         self.device = device
+        self.batch_size = int(batch_size)
+        if self.batch_size <= 0:
+            raise ValueError("CrepeF0Extractor batch_size must be > 0")
 
     @property
     def name(self) -> str:
@@ -579,7 +583,7 @@ class CrepeF0Extractor(FrameConditionExtractor):
         pitch, periodicity = torchcrepe.predict(
             wav, CR, hop_length=hop, fmin=self.fmin, fmax=self.fmax,
             model=self.model, return_periodicity=True,
-            batch_size=2048, device=dev,
+            batch_size=self.batch_size, device=dev,
         )
         pitch = pitch.squeeze(0).cpu().numpy().astype(np.float64)         # (F,) Hz
         periodicity = periodicity.squeeze(0).cpu().numpy().astype(np.float64)  # (F,)
@@ -991,7 +995,7 @@ CONDITION_CONFIG = {
                        "voicing_threshold": 0.5, "with_periodicity": True,
                        "silence_db": -60.0, "median_win": 3,
                        "min_voiced_frames": 3, "voiced_floor": 0.05,
-                       "device": "cpu"},
+                       "device": "cpu", "batch_size": 64},
             "out_dim": 16,
             "enabled": True,
         },

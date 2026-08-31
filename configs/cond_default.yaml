@@ -45,9 +45,11 @@ model:
 # ============================================================
 data:
   train_batch_size: 8
-  val_batch_size: 8
+  val_batch_size: 16
   grad_accum: 1
-  num_val_batches: 8     # number of validation batches per validation pass
+  num_val_batches: 11       # max fixed validation batches (11 x 16 covers 165 samples)
+  validation_shuffle: true  # deterministic shuffle before selecting the fixed subset
+  validation_seed: 12345    # fixed subset/noise; live and EMA get the same exam
   num_workers: 4         # DataLoader workers; set 0 on Windows or for simple/debug runs
 
   # ----------------------------------------------------------------
@@ -207,6 +209,7 @@ metrics:
   # escape hatch for VRAM: at the metrics step the model and the DAC decoder are
   # both resident, and CREPE-full on top can overflow a card with little margin.
   fidelity_device: "cuda"
+  
 
 
 # ============================================================

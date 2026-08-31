@@ -493,17 +493,32 @@ def apply_cfg_dropout(frame_cond, global_cond, device, global_configs, B,
 # ======================
 # LOSS
 # ======================
+VALIDATION_PROTOCOL = "fixed_subset_common_noise_sample_weighted_v2"
+
+
 def compute_loss(model, batch, device, use_amp, t_min, t_max,
                  global_configs, p_drop_all, p_drop_frame, p_drop_global,
-                 training=True):
+                 training=True, x0=None, t=None):
     frames, frame_cond, _labels, text_embs, image_embs = batch
     # NB: `labels` is discarded as conditioning (CLAP-text plays that role
     # better now). It is kept in the batch only as metadata for logging.
 
     x1 = frames.to(device).float()
     B = x1.shape[0]
-    x0 = torch.randn_like(x1)
-    t = sample_logit_normal(B, device, t_min, t_max)
+    if x0 is None:
+        x0 = torch.randn_like(x1)
+    else:
+        if tuple(x0.shape) != tuple(x1.shape):
+            raise ValueError(
+                f"fixed x0 has shape {tuple(x0.shape)}, expected {tuple(x1.shape)}")
+        x0 = x0.to(device=device, dtype=x1.dtype, non_blocking=True)
+
+    if t is None:
+        t = sample_logit_normal(B, device, t_min, t_max)
+    else:
+        if t.ndim != 1 or t.shape[0] != B:
+            raise ValueError(f"fixed t has shape {tuple(t.shape)}, expected ({B},)")
+        t = t.to(device=device, dtype=x1.dtype, non_blocking=True)
     t_expand = t.view(B, 1, 1)
     xt = (1 - t_expand) * x0 + t_expand * x1
     target = x1 - x0
@@ -1474,6 +1489,7 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
         "global_configs":       global_configs,
         "n_frames":             n_frames,
         "run_name":             run_name,
+        "validation_protocol":  VALIDATION_PROTOCOL,
         "rng_state":            _capture_rng_state(data_generator),
     }
     if cfg.training.use_ema and ema is not None:
@@ -1548,6 +1564,8 @@ if __name__ == "__main__":
     # never touches the global training RNG. null = free-running. Mirrors uncond.
     metrics_cfg = cfg.get("metrics", None)
     metrics_seed = (metrics_cfg.get("seed", None) if metrics_cfg is not None else None)
+    validation_seed = int(cfg.data.get("validation_seed", 12345))
+    validation_shuffle = bool(cfg.data.get("validation_shuffle", True))
 
     # Which distributional metrics to compute, mirroring the unconditional
     # project's `metrics.enabled` registry. A metric listed here is an EXPLICIT
@@ -1722,14 +1740,49 @@ if __name__ == "__main__":
         generator=data_generator,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=cfg.data.val_batch_size, shuffle=False,
+        val_dataset, batch_size=cfg.data.val_batch_size,
+        shuffle=validation_shuffle,
         num_workers=n_workers, pin_memory=(device == "cuda"),
-        persistent_workers=(n_workers > 0),
+        persistent_workers=False,
         drop_last=False, collate_fn=collate_conditioned,
+        generator=torch.Generator().manual_seed(validation_seed),
     )
 
     train_iter = infinite_loader(train_loader)
-    val_iter   = infinite_loader(val_loader)
+
+    # Fixed validation protocol: cache the same deterministic batches once, then
+    # pair every batch with a dedicated, fixed (x0, t). Both the live model and
+    # EMA receive these exact inputs at every validation step, so their losses and
+    # the curve across checkpoints differ only because the weights changed.
+    requested_val_batches = int(cfg.data.num_val_batches)
+    if requested_val_batches <= 0:
+        raise ValueError(
+            f"data.num_val_batches must be > 0, got {requested_val_batches}.")
+    fixed_val_batches = []
+    for vb in val_loader:
+        fixed_val_batches.append(vb)
+        if len(fixed_val_batches) >= requested_val_batches:
+            break
+    del val_loader
+    if not fixed_val_batches:
+        raise RuntimeError("Validation dataset produced no batches.")
+
+    val_rng = torch.Generator(device="cpu")
+    val_rng.manual_seed(validation_seed)
+    fixed_val_inputs = []
+    for vb in fixed_val_batches:
+        val_frames = vb[0]
+        fixed_x0 = torch.randn(
+            val_frames.shape, dtype=val_frames.dtype, generator=val_rng)
+        u = torch.randn(val_frames.shape[0], generator=val_rng)
+        fixed_t = torch.sigmoid(u).clamp(
+            float(cfg.sampling.t_min), float(cfg.sampling.t_max))
+        fixed_val_inputs.append((fixed_x0, fixed_t))
+    n_fixed_val_samples = sum(int(vb[0].shape[0]) for vb in fixed_val_batches)
+    print(f"[validation] fixed protocol={VALIDATION_PROTOCOL} | "
+          f"shuffle={validation_shuffle} | seed={validation_seed} | "
+          f"batches={len(fixed_val_batches)} | "
+          f"samples={n_fixed_val_samples}")
 
     # ======================
     # PRE-COMPUTATION REFERENCE STATS (one time only, cached in cache_dir)
@@ -1784,6 +1837,12 @@ if __name__ == "__main__":
         device=_fid_device,
         registry=registry,   # #15: re-extract with the run's exact extractor config
     )
+    for _name, _extractor in fidelity_evaluator.extractors.items():
+        _actual_device = getattr(
+            _extractor, "device", getattr(_extractor, "_device", "cpu"))
+        _batch = getattr(_extractor, "batch_size", None)
+        _batch_msg = f" | batch_size={_batch}" if _batch is not None else ""
+        print(f"[metrics] extractor={_name} | device={_actual_device}{_batch_msg}")
     clap_audio_embedder = None
     if "text" in GLOBAL_CONFIGS:
         from conditions import ClapAudioEmbedder
@@ -1940,6 +1999,12 @@ if __name__ == "__main__":
         _restore_rng_state(ckpt.get("rng_state"), data_generator)
         start_step = ckpt["step"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        saved_val_protocol = ckpt.get("validation_protocol", None)
+        if saved_val_protocol != VALIDATION_PROTOCOL:
+            print("[validation] Checkpoint best_val_loss was measured with a "
+                  "different/stochastic protocol; resetting best_val_loss so it "
+                  "is not compared with the new fixed validation curve.")
+            best_val_loss = float("inf")
         print(f"  -> Step {start_step} | best_val_loss: {best_val_loss:.6f}")
         writer.add_text("resumed_from", resume_from, global_step=start_step)
 
@@ -2096,15 +2161,19 @@ if __name__ == "__main__":
             # ======================
             if step % cfg.intervals.val == 0:
                 model.eval()
-                n_val = cfg.data.num_val_batches
 
                 if device == "cuda":
                     torch.cuda.empty_cache()
 
                 with torch.no_grad():
-                    val_losses = []
-                    for _ in range(n_val):
-                        vb = next(val_iter)
+                    val_loss_sum = 0.0
+                    ema_val_loss_sum = 0.0
+                    val_sample_count = 0
+                    ema_active = (cfg.training.use_ema
+                                  and step >= cfg.training.ema_start)
+                    for vb, (fixed_x0, fixed_t) in zip(
+                            fixed_val_batches, fixed_val_inputs):
+                        batch_sample_count = int(vb[0].shape[0])
                         vl = compute_loss(
                             model, vb, device,
                             use_amp=cfg.training.use_amp,
@@ -2115,16 +2184,13 @@ if __name__ == "__main__":
                             p_drop_frame=cfg.conditioning.p_drop_frame,
                             p_drop_global=cfg.conditioning.p_drop_global,
                             training=False,
+                            x0=fixed_x0,
+                            t=fixed_t,
                         ).item()
-                        val_losses.append(vl)
-                        del vb
-                    val_loss = sum(val_losses) / len(val_losses)
+                        val_loss_sum += vl * batch_sample_count
+                        val_sample_count += batch_sample_count
 
-                    ema_val_loss = val_loss
-                    if cfg.training.use_ema and step >= cfg.training.ema_start:
-                        ema_vl = []
-                        for _ in range(n_val):
-                            vb = next(val_iter)
+                        if ema_active:
                             evl = compute_loss(
                                 ema.model, vb, device,
                                 use_amp=cfg.training.use_amp,
@@ -2135,10 +2201,15 @@ if __name__ == "__main__":
                                 p_drop_frame=cfg.conditioning.p_drop_frame,
                                 p_drop_global=cfg.conditioning.p_drop_global,
                                 training=False,
+                                x0=fixed_x0,
+                                t=fixed_t,
                             ).item()
-                            ema_vl.append(evl)
-                            del vb
-                        ema_val_loss = sum(ema_vl) / len(ema_vl)
+                            ema_val_loss_sum += evl * batch_sample_count
+
+                    val_loss = val_loss_sum / val_sample_count
+                    ema_val_loss = val_loss
+                    if ema_active:
+                        ema_val_loss = ema_val_loss_sum / val_sample_count
                         writer.add_scalar("Validation/Loss_ema", ema_val_loss, step)
 
                 writer.add_scalar("Validation/Loss", val_loss, step)

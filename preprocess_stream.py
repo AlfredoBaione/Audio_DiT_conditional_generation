@@ -711,8 +711,15 @@ def extract_and_merge_frame_conditions(
     existing = {}
     if cond_path.exists():
         try:
-            data = np.load(str(cond_path))
-            existing = {k: data[k] for k in data.keys()}
+            # Read INSIDE a context manager: np.load on an .npz returns a lazy
+            # NpzFile that keeps the file OPEN. Leaving it open makes the
+            # os.replace() at the end of this function fail on Windows with
+            # PermissionError/WinError 5 (POSIX allows renaming over an open
+            # file, Windows does not) -- so the whole run dies on the first chunk
+            # that already has conditions. The dict comprehension materialises
+            # every array before the handle closes, so nothing is lost.
+            with np.load(str(cond_path)) as data:
+                existing = {k: data[k] for k in data.keys()}
         except Exception:
             existing = {}
         if not force and required.issubset(existing.keys()):
