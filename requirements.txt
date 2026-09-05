@@ -40,14 +40,6 @@ descript-audio-codec
 
 # ---- conditioning extractors (frame-level) ----
 torchcrepe           # f0     — monophonic pitch contour (CREPE)
-basic-pitch          # melody — 88-bin note posteriorgram
-                     #   NB: pulls TensorFlow. On a conda base that already ships
-                     #   TF (e.g. IRCAM tf2.18) pip may downgrade protobuf and warn
-                     #   about a TF conflict. Harmless for THIS pipeline (the code
-                     #   sets USE_TF=0 and never imports TF), but if TensorFlow
-                     #   itself matters to you on that machine, install this in a
-                     #   separate env. Verify after installing:
-                     #     python -c "from torch.utils.tensorboard import SummaryWriter; print('tb ok')"
                      #     python -c "import dac; print('dac ok')"
 beat_this @ git+https://github.com/CPJKU/beat_this.git   # rhythm — beat/downbeat (not on PyPI)
 
@@ -56,9 +48,12 @@ transformers         # CLAP (text) + CLIP (image) global conditions
 Pillow               # image loading for the CLIP image condition
 
 # ---- evaluation metrics ----
-mir_eval             # melody RPA/RCA fidelity (condition_metrics.py)
-encodec              # Encodec embeddings (audio-FAD path)
-# VGGish is loaded via torch.hub (harritaylor/torchvggish) — no pip package.
+mir_eval             # f0 fidelity: voicing + cents conversion (condition_metrics.py)
+# VGGish is loaded via torch.hub (harritaylor/torchvggish) — no pip package,
+# but its hubconf.py declares dependencies ['torch','numpy','resampy',
+# 'soundfile'] and torch.hub REFUSES to load the repo if one is missing:
+# without resampy, enabling metrics.enabled=[... 'fad_vggish'] dies at startup.
+resampy              # required by torchvggish/vggish_input.py (FAD-VGGish)
 
 # =============================================================================
 # NOT installable via this file (environment-specific):

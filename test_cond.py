@@ -10,10 +10,10 @@
 # trajectory with CFG, decodes it through DAC, and logs both the
 # generation and the real reference on TensorBoard.
 #
-# The test set is the SAME one training persisted: the split parameters are
-# restored from the checkpoint's config, so compute_split reuses the exact
-# splits/test_split_<hash>.json written at train time (no leakage vs training,
-# comparable conditioned generations across checkpoints).
+# The test set is the SAME one the training held out: both read it from the
+# dataset's splits.json (written by preprocess_stream.py). Nothing is
+# recomputed, so the test set cannot drift from the one the checkpoint was
+# trained against (no leakage, comparable generations across checkpoints).
 #
 # Optional overrides:
 #   --prompt   forces a single CLAP text embedding for ALL generations
@@ -49,15 +49,11 @@ os.environ.setdefault("XDG_CACHE_HOME", "/data/anasynth_nonbp/baione/.cache")
 
 import argparse
 import random
-from io import BytesIO
 from pathlib import Path
 
 import torch
 import numpy as np
 import soundfile as sf
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
@@ -66,7 +62,7 @@ from audio_dataset_npy import (
     decode_latents,
     DAC_SAMPLE_RATE,
 )
-from audio_dataset_cond import ConditionedAudioDataset, compute_split
+from audio_dataset_cond import ConditionedAudioDataset, load_source_split
 from network_cond import ConditionedAudioDiT, TOKEN_DIM
 from conditions import (
     ConditionRegistry,
@@ -222,41 +218,6 @@ def load_config():
 
 
 # ============================================================
-# UTILITIES
-# ============================================================
-def plot_to_image(fig):
-    """Convert a matplotlib figure to a torch tensor (3, H, W) for TensorBoard."""
-    import torchvision
-    import PIL.Image as Image
-    buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
-    buf.seek(0)
-    img = torchvision.transforms.ToTensor()(Image.open(buf))
-    buf.close()
-    return img
-
-
-def make_spectrogram_image(waveform, sample_rate, title=""):
-    """Build a mel-spectrogram image (tensor) for TensorBoard."""
-    import torchaudio   # lazy: only a pure-DSP transform, no torchcodec/FFmpeg
-    spec_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sample_rate, n_mels=128, n_fft=2048, hop_length=512,
-    )
-    amp_to_db = torchaudio.transforms.AmplitudeToDB()
-    spec_db = amp_to_db(spec_transform(waveform.cpu().float()))
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.imshow(spec_db[0].numpy(), aspect="auto", origin="lower",
-              cmap="viridis", vmin=-80, vmax=0)
-    ax.set_title(title)
-    ax.set_xlabel("Frame")
-    ax.set_ylabel("Mel Bin")
-    plt.colorbar(ax.images[0], ax=ax, label="dB")
-    img = plot_to_image(fig)
-    plt.close(fig)
-    return img
-
-
-# ============================================================
 # EULER SAMPLING WITH CFG (standalone copy - kept in sync with training_cond.py)
 # ============================================================
 @torch.no_grad()
@@ -279,7 +240,10 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
     null_fc = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
     null_gc = make_null_global_conditions(1, global_configs or {}, device)
 
-    has_cond = (frame_cond is not None) or (global_cond is not None)
+    # NB: test the CONTENT, not `is not None`: with every condition disabled the
+    # caller passes empty dicts ({}), which are "no conditioning" -- treating them
+    # as present would engage CFG and burn two IDENTICAL forwards per step.
+    has_cond = bool(frame_cond) or bool(global_cond)
     use_cfg = (guidance > 1.0) and has_cond
 
     for i in range(steps):
@@ -431,28 +395,22 @@ def main():
     img_root  = (cfg.paths.image_root
                   if Path(cfg.paths.image_root).exists() else None)
 
-    # Reuse the SAME test set training persisted. The split parameters come from
-    # the checkpoint's config (restored in load_config), so the manifest hash
-    # matches and compute_split reuses the exact test_split_<hash>.json written
-    # at train time. save_test_manifest=False: never create one from the test.
-    def _sp(key, default):
-        d = cfg.data.get("split", None) if hasattr(cfg, "data") else None
-        return default if d is None else d.get(key, default)
-
-    split = compute_split(
+    # The test set is READ from the dataset's splits.json -- the same file the
+    # training read. Nothing is recomputed here, so the test set cannot differ
+    # from the one the checkpoint was held out from: that used to depend on the
+    # split parameters restored from the checkpoint config still matching.
+    split = load_source_split(
         cfg.paths.dataset_root,
-        ratios=tuple(_sp("ratios", [0.8, 0.1, 0.1])),
-        seed=int(_sp("seed", 42)),
-        group_by_source=bool(_sp("group_by_source", True)),
-        stratify_by_class=bool(_sp("stratify_by_class", True)),
-        save_test_manifest=False,
+        splits_path=cfg.paths.get("splits_path", None)
+        if hasattr(cfg, "paths") else None,
     )
     test_files = split["splits"]["test"]
     if not test_files:
         raise RuntimeError(
-            f"Empty test split for {cfg.paths.dataset_root}. Expected a persisted "
-            f"test manifest under {Path(cfg.paths.dataset_root).parent/'splits'} "
-            f"(written by training_cond.py). Check the split params match training.")
+            f"Empty test split for {cfg.paths.dataset_root}: "
+            f"{split['manifest_path']} assigns no source to 'test'. The dataset "
+            f"was preprocessed with a test ratio of 0, or every class has too few "
+            f"sources to hold one out.")
 
     # label_to_idx: the checkpoint's mapping is authoritative (it is what the
     # model's class conditioning was trained with); fall back to the split scan.
@@ -593,15 +551,6 @@ def main():
             global_step=i, sample_rate=DAC_SAMPLE_RATE,
         )
 
-        # --- Generated spectrogram ---
-        spec_img_gen = make_spectrogram_image(
-            waveform_gen, DAC_SAMPLE_RATE,
-            f"Generated - {label_name}",
-        )
-        writer.add_image(
-            f"Spectrogram/generated/{label_name}", spec_img_gen, global_step=i,
-        )
-
         # --- Real audio reference ---
         z_real = frames_real.T                     # (72, n_frames)
         z_real = normalizer.denormalize(z_real)
@@ -610,13 +559,6 @@ def main():
         writer.add_audio(
             f"Audio/real/{label_name}", wrn.cpu(),
             global_step=i, sample_rate=DAC_SAMPLE_RATE,
-        )
-        spec_img_real = make_spectrogram_image(
-            waveform_real, DAC_SAMPLE_RATE,
-            f"Real - {label_name}",
-        )
-        writer.add_image(
-            f"Spectrogram/real/{label_name}", spec_img_real, global_step=i,
         )
 
     writer.close()

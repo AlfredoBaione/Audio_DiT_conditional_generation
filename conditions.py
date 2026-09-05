@@ -17,10 +17,6 @@
 #
 #   FRAME-LEVEL (time-aligned, injected by CONCATENATION on the feature
 #   dimension at the model input, JASCO-style -- see network_cond.py):
-#     - melody: basic-pitch multi-pitch posteriorgram reduced to a per-frame
-#               one-hot dominant pitch over 88 piano-key bins (JASCO argmax
-#               reduction; polyphony-robust backbone, replaces the old
-#               monophonic CREPE pitch).
 #     - chroma: chromagram CQT (12 pitch classes) -- harmony.
 #     - rhythm: per-frame beat + downbeat probability curves (2 channels)
 #               from beat_this (Music ControlNet-style rhythm control).
@@ -37,7 +33,7 @@
 # any architecture change.
 #
 # Requirements:
-#   pip install basic-pitch librosa scipy transformers Pillow
+#   pip install librosa scipy transformers Pillow
 #   pip install beat_this            # beat/downbeat tracker (PyTorch, ISMIR 2024)
 
 import torch
@@ -122,137 +118,6 @@ class GlobalConditionExtractor(ABC):
     def dim(self) -> int:
         """Embedding dimensionality."""
         ...
-
-
-# ============================================================
-# FRAME-LEVEL: MELODY (basic-pitch, JASCO-style)
-# ============================================================
-
-class MelodyExtractor(FrameConditionExtractor):
-    """
-    JASCO-faithful melody extraction for polyphonic audio.
-
-    Replicates audiocraft/data/jasco_dataset.py:MelodyData on a modern,
-    pip-installable backbone. Pipeline:
-
-      1. basic-pitch (Spotify, ICASSP 2022; same author -- Rachel Bittner --
-         as the Deep Salience model used by JASCO) returns a per-frame
-         multi-pitch posteriorgram 'note' of shape (T_native, 88), one bin
-         per piano key, at ~86 fps (= AUDIO_SAMPLE_RATE / FFT_HOP
-         = 22050 / 256), which matches the DAC latent frame rate
-         (44100 / 512 ~= 86.13).
-
-      2. The posteriorgram is linearly interpolated on the time axis to
-         n_frames (= the requested DAC-aligned length). JASCO does the same
-         step with F.interpolate(mode='linear').
-
-      3. JASCO 'do_argmax' reduction:
-             binary_mask[argmax(salience, dim=0), t] = 1
-             binary_mask *= (salience != 0)
-         The reference 'salience != 0' check is replaced by
-         'max(posteriorgram) >= frame_threshold' because basic-pitch outputs
-         sigmoid-style posteriors and silent frames are not exactly zero. The
-         default 0.3 matches basic-pitch's DEFAULT_FRAME_THRESHOLD.
-
-    NB on polyphony: even though basic-pitch (like Deep Salience) is
-    polyphony-capable, the argmax reduction keeps the SINGLE dominant pitch
-    per frame, exactly as in JASCO. Harmonic content lives in the chroma /
-    harmony condition, not in this one. This is the design that resolves the
-    mixed polyphonic-vs-melodic dataset case: the melody channel carries the
-    dominant line where one exists (and zero elsewhere via the threshold
-    mask), while harmony is carried by ChromaExtractor.
-
-    Output: (n_frames, 88) float32 one-hot -- or the full posteriorgram if
-    do_argmax=False (deviates from JASCO; multi-pitch in the melody channel).
-    """
-
-    BIN_DIM = 88   # ANNOTATIONS_N_SEMITONES (piano keys) -- basic-pitch native
-
-    _model = None  # process-wide singleton; basic-pitch loads ONNX/TFLite/TF
-                   # automatically depending on the platform (ONNX on Windows,
-                   # TFLite on Linux, CoreML on macOS, TF on Python >= 3.11).
-
-    def __init__(self, frame_threshold: float = 0.3, do_argmax: bool = True):
-        self.frame_threshold = float(frame_threshold)
-        self.do_argmax = bool(do_argmax)
-
-    @property
-    def name(self) -> str:
-        return "melody"
-
-    @property
-    def dim(self) -> int:
-        return self.BIN_DIM
-
-    @classmethod
-    def _get_model(cls):
-        if cls._model is None:
-            try:
-                from basic_pitch import ICASSP_2022_MODEL_PATH
-                from basic_pitch.inference import Model
-            except ImportError as e:
-                raise ImportError(
-                    "basic-pitch is required for MelodyExtractor. "
-                    "Install with: pip install basic-pitch"
-                ) from e
-            cls._model = Model(ICASSP_2022_MODEL_PATH)
-        return cls._model
-
-    def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
-        import os
-        import tempfile
-        import soundfile as sf
-        from basic_pitch.inference import run_inference
-        from basic_pitch.constants import AUDIO_SAMPLE_RATE
-
-        # 1. Resample to basic-pitch native SR (22050) if needed.
-        if sr != AUDIO_SAMPLE_RATE:
-            import librosa
-            audio = librosa.resample(
-                audio.astype(np.float32),
-                orig_sr=sr, target_sr=AUDIO_SAMPLE_RATE,
-            )
-            sr = AUDIO_SAMPLE_RATE
-
-        # 2. basic-pitch's public API takes a file path; write a temp WAV.
-        #    Inference cost (model + windowing) dwarfs the temp-file write.
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-        os.close(tmp_fd)
-        try:
-            sf.write(tmp_path, audio, sr, subtype="FLOAT")
-            model_output = run_inference(tmp_path, self._get_model())
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-        # 3. Take the 'note' posteriorgram: shape (T_native, 88) at ~86 fps.
-        note = np.asarray(model_output["note"], dtype=np.float32)
-        if note.ndim != 2 or note.shape[1] != self.BIN_DIM:
-            raise RuntimeError(
-                f"Unexpected basic-pitch 'note' shape: {note.shape}, "
-                f"expected (T, {self.BIN_DIM})."
-            )
-
-        # 4. Temporal resample to the DAC-aligned n_frames (JASCO step).
-        note_t = self._resample_to_frames(note, n_frames)
-        # Linear interpolation can overshoot tiny amounts; clamp back to [0,1].
-        note_t = np.clip(note_t, 0.0, 1.0).astype(np.float32)
-
-        if not self.do_argmax:
-            # Full multi-pitch posteriorgram (deviation from JASCO).
-            return note_t
-
-        # 5. JASCO 'do_argmax' reduction: one-hot on the argmax bin, masked by
-        #    a per-frame activity threshold (== JASCO's `salience != 0`).
-        T, D = note_t.shape
-        one_hot = np.zeros((T, D), dtype=np.float32)
-        argmax_bins = np.argmax(note_t, axis=1)                  # (T,)
-        max_vals    = note_t[np.arange(T), argmax_bins]          # (T,)
-        active      = max_vals >= self.frame_threshold           # (T,) bool
-        one_hot[np.arange(T)[active], argmax_bins[active]] = 1.0
-        return one_hot
 
 
 # ============================================================
@@ -386,7 +251,7 @@ class EnergyExtractor(FrameConditionExtractor):
          This keeps the same non-negative range as the other frame conditions
          and, crucially, makes the NULL condition (all zeros, used by CFG dropout
          and make_null_frame_conditions) read as "silence", consistent with the
-         zeros-mean-absence convention of melody / chroma / rhythm.
+         zeros-mean-absence convention of chroma / rhythm.
 
     Output: (n_frames, 1) float32 in [0, 1].
 
@@ -485,7 +350,7 @@ class EnergyExtractor(FrameConditionExtractor):
 
         # 6. Normalise [-top_db, 0] dB -> [0, 1] (silence -> 0, full-scale -> 1).
         #    The NULL condition (all zeros) therefore reads as silence, matching
-        #    the zeros-mean-absence convention of melody / chroma / rhythm.
+        #    the zeros-mean-absence convention of chroma / rhythm.
         energy_norm = np.clip((energy_db + self.top_db) / self.top_db, 0.0, 1.0)
 
         # 7. Align to the DAC-aligned n_frames and shape (n_frames, 1).
@@ -501,10 +366,9 @@ class CrepeF0Extractor(FrameConditionExtractor):
     """
     Monophonic fundamental-frequency (f0) contour from CREPE, via the torch-native
     `torchcrepe` backend (NOT the TensorFlow `crepe` package -- the project runs
-    with USE_TF=0). This is DISTINCT from `melody`:
-      * melody  -> polyphonic 88-bin piano-roll (basic-pitch + JASCO argmax);
+    with USE_TF=0). It is the project's ONLY pitch condition:
       * f0      -> a single continuous pitch curve, for monophonic / lead-line
-                   control (bass line, solo voice, melody instrument in front).
+                   control (bass line, solo voice, lead instrument in front).
 
     Pipeline (mirrors the other frame extractors' DAC alignment, hardened per the
     f0 review):
@@ -950,17 +814,10 @@ class ImageDatasetManager:
 CONDITION_CONFIG = {
     "frame_level": {
         # out_dim = per-condition projection width (JASCO bottleneck). The
-        # extractor produces `raw_dim` channels per frame (MelodyExtractor ->
-        # 88 piano-key bins via basic-pitch + JASCO argmax reduction;
-        # ChromaExtractor -> 12 chroma classes via librosa CQT); a single
-        # Linear(raw_dim -> out_dim) projects them before they are
-        # concatenated with the latent on the feature dim.
-        "melody": {
-            "class": MelodyExtractor,
-            "kwargs": {},
-            "out_dim": 64,
-            "enabled": True,
-        },
+        # extractor produces `raw_dim` channels per frame (ChromaExtractor ->
+        # 12 chroma classes via librosa CQT); a single Linear(raw_dim ->
+        # out_dim) projects them before they are concatenated with the latent
+        # on the feature dim.
         "chroma": {
             "class": ChromaExtractor,
             "kwargs": {},
@@ -984,9 +841,9 @@ CONDITION_CONFIG = {
             "enabled": True,
         },
         "f0": {
-            # Monophonic f0 contour from CREPE (torchcrepe backend). Distinct from
-            # `melody` (polyphonic 88-bin basic-pitch): a single continuous pitch
-            # curve for monophonic / lead-line control. raw_dim=2 by default
+            # Monophonic f0 contour from CREPE (torchcrepe backend): a single
+            # continuous pitch curve for monophonic / lead-line control, and the
+            # project's only pitch condition. raw_dim=2 by default
             # ([pitch_norm, periodicity]); set with_periodicity=False for raw_dim=1.
             # Set device="cuda" here for speed on large datasets (only honored
             # with --num_workers 0). Requires: pip install torchcrepe
@@ -995,14 +852,10 @@ CONDITION_CONFIG = {
                        "voicing_threshold": 0.5, "with_periodicity": True,
                        "silence_db": -60.0, "median_win": 3,
                        "min_voiced_frames": 3, "voiced_floor": 0.05,
-                       "device": "cpu", "batch_size": 64},
+                       "device": "cpu", "batch_size": 512},
             "out_dim": 16,
             "enabled": True,
         },
-        # NB: melody used to be extracted with monophonic CREPE (PitchExtractor),
-        # which failed on polyphonic material. It was removed and replaced by
-        # MelodyExtractor above (basic-pitch + JASCO argmax reduction), which
-        # matches JASCO's preprocessing on a polyphony-robust model.
         # Example for adding MFCC in the future:
         # "mfcc": {
         #     "class": MFCCExtractor,

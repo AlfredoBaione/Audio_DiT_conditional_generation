@@ -11,11 +11,14 @@
 #
 # SPLIT-LESS layout (produced by preprocess_stream.py): the dataset mirrors the
 # source class tree and has NO train/val/test directories on disk. The split is
-# decided IN CODE (compute_split below): stratified by class, grouped by source
-# file (leakage-safe), deterministic from a seed, with the test set persisted to
-# <dataset_root>/../splits/test_split_<hash>.json. This module also hosts the
-# split machinery so the conditioned dataset (audio_dataset_cond.py) can reuse it
-# without a circular import.
+# DECIDED AT PREPROCESSING TIME and read back here from <dataset_root>/../
+# splits.json (load_source_split below): assigned over the source files
+# (leakage-safe), stratified by class, seeded, and never reshuffled once written.
+#
+# compute_split() below is the OLD in-code split. It is kept for exactly one
+# purpose: preprocess_stream.py --import_legacy_split calls it to reproduce the
+# assignment a pre-existing dataset was trained against and freeze it into
+# splits.json. Nothing on the training path computes a split any more.
 #
 #   dataset_root/
 #       latents/<class...>/*.npy   ← shape (72, T), dtype float32
@@ -401,6 +404,79 @@ def _split_two(remaining: List[str], r_tr: float, r_val: float) -> Tuple[List[st
         n_val = 1
     n_val = min(n_val, n)
     return remaining[n_val:], remaining[:n_val]
+
+
+SPLITS_NAME = "splits.json"
+
+
+def load_source_split(latent_root, splits_path=None) -> dict:
+    """Read the split DECIDED AT PREPROCESSING TIME (<dataset>/splits.json).
+
+    The split is no longer recomputed here. preprocess_stream.py assigns it over
+    the SOURCE FILES before anything is encoded and writes it down, so it is a
+    property of the dataset rather than of whoever happens to load it: two runs
+    over the same latents cannot disagree about what the test set was, and the
+    file survives the dataset growing (new sources are added to the recorded
+    split, never reshuffled into it).
+
+    Same return shape as compute_split(), so nothing downstream had to change.
+
+    A latent whose source has no recorded assignment is a HARD ERROR: silently
+    dropping it would shrink the training set invisibly, and silently sending it
+    to train would put a held-out source back into training. It means splits.json
+    is older than the latents -- re-run preprocess_stream.py (even --split_only)
+    to assign the new sources.
+    """
+    latent_root = Path(latent_root)
+    p = Path(splits_path) if splits_path else latent_root.parent / SPLITS_NAME
+    if not p.exists():
+        raise FileNotFoundError(
+            f"[split] {p} not found. The train/val/test split is now decided by "
+            f"preprocess_stream.py and recorded in that file.\n"
+            f"  For a dataset built before this change, create it once with:\n"
+            f"    python preprocess_stream.py SRC {latent_root.parent} "
+            f"--import_legacy_split\n"
+            f"  (reproduces the split the training used to compute in-code, so a "
+            f"run already in flight keeps the exact same val/test sets), or\n"
+            f"    python preprocess_stream.py SRC {latent_root.parent} --split_only\n"
+            f"  for a fresh one.")
+    payload = json.loads(p.read_text())
+    groups = payload.get("groups")
+    if not groups:
+        raise RuntimeError(f"[split] {p} has no 'groups' entry.")
+
+    all_files = sorted(latent_root.rglob("*.npy"))
+    if not all_files:
+        raise FileNotFoundError(f"No .npy latents under {latent_root}")
+
+    splits = {"train": [], "val": [], "test": []}
+    unassigned = []
+    for f in all_files:
+        name = groups.get(_source_group_of(f, latent_root))
+        if name in splits:
+            splits[name].append(f)
+        else:
+            unassigned.append(f)
+    if unassigned:
+        raise RuntimeError(
+            f"[split] {len(unassigned)} latent(s) under {latent_root} belong to "
+            f"source(s) with no assignment in {p} (first: {unassigned[0].name}). "
+            f"The split is older than the dataset: re-run preprocess_stream.py "
+            f"(--split_only is enough) to assign the new sources.")
+
+    classes = sorted({_class_of_file(f) for f in all_files})
+    params = dict(payload.get("params", {}))
+    params["source"] = payload.get("source", "assigned")
+    print(f"[split] loaded {p.name} ({payload.get('source', 'assigned')}): "
+          f"{ {k: len(v) for k, v in splits.items()} } chunks over "
+          f"{len(groups)} recorded source(s)")
+    return {
+        "splits": {k: sorted(v) for k, v in splits.items()},
+        "classes": classes,
+        "file_counts": {k: len(v) for k, v in splits.items()},
+        "manifest_path": str(p),
+        "params": params,
+    }
 
 
 def compute_split(
@@ -813,8 +889,12 @@ def build_datasets(
     save_test_manifest: bool = True,
 ):
     """
-    Split-less unconditional dataset builder. Computes the split (stratified,
-    source-grouped, seeded, with a persisted test manifest) and the normalizer.
+    Split-less UNCONDITIONAL dataset builder. Still computes the split in code:
+    it belongs to the unconditional project, which has no preprocess_stream.py
+    splits.json to read. The conditioned path (audio_dataset_cond) reads the
+    recorded split instead -- see load_source_split.
+    Computes the split (stratified, source-grouped, seeded, with a persisted
+    test manifest) and the normalizer.
 
     NOTE: the return shape changed from the old 4-tuple to
         (train, val, test, normalizer, label_to_idx, split_info)

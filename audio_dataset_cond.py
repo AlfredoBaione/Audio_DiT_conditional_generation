@@ -4,7 +4,7 @@
 #
 # Loads for each sample:
 #   - frames:       (n_frames, 72)   normalized DAC pre-quantizer latents
-#   - frame_conds:  {melody, chroma, rhythm, ...} pre-extracted conditions
+#   - frame_conds:  {f0, chroma, rhythm, ...} pre-extracted conditions
 #   - label_idx:    int                 class index
 #   - text_emb:     (text_dim,)         CLAP text embedding (pre-computed)
 #   - image_emb:    (image_dim,)        CLIP embedding (pre-computed)
@@ -15,23 +15,27 @@
 #
 #   dataset_root/
 #       latents/<class...>/*.npy       <- (72, T) float32 pre-quant DAC latents
-#       conditions/<class...>/*.npz    <- melody, chroma, rhythm, energy, f0, ...
+#       conditions/<class...>/*.npz    <- f0, chroma, rhythm, energy, ...
 #       wav/<class...>/*.wav           <- optional (val/test used for FAD)
-#       splits/test_split_<hash>.json  <- persisted test set (written here)
+#       splits.json                    <- source -> train/val/test (READ here)
 #       dataset_meta.json              <- chunk/acoustic params
 #
-# The train/val/test split is now decided IN CODE (compute_split below), not by
-# on-disk directories, because the split is a training-time concern:
+# The train/val/test split is DECIDED BY preprocess_stream.py and read back here
+# (load_source_split). It is not recomputed at training time, because a split
+# that is re-derived on every startup is a split that can silently change --
+# after new files land, after a parameter is edited, after a seed is touched --
+# and a checkpoint would then be evaluated on material it was trained on. The
+# properties are unchanged; only the place they are decided moved:
 #   * STRATIFIED by class (each class contributes to every split by ratio);
 #   * GROUPED by source file (all chunks AND both stereo channels of one source
 #     go to the SAME split) -> no train/test leakage across chunks of a track;
 #   * DETERMINISTIC from a seed;
-#   * the TEST set is persisted to splits/test_split_<hash>.json so every run on
-#     the same dataset+params reuses the same test set (comparable conditioned
-#     generations across checkpoints); train/val are re-derived deterministically.
+#   * WRITTEN DOWN once and never reshuffled: a dataset that grows gets its new
+#     sources assigned into the existing split.
 #
 # Chunk file names are `<stem>[__ch{n}]__c{idx}.npy`; the source group key is the
-# part before the first `__` (sanitize_filename never emits `__` inside a stem).
+# part before the first `__` (sanitize_filename never emits `__` inside a stem),
+# which is exactly the key preprocess_stream.py writes into splits.json.
 
 import random
 from pathlib import Path
@@ -45,8 +49,10 @@ from audio_dataset_npy import (
     LatentNormalizer, DAC_LATENT_DIM, SUPPORTED_EXTS,
     frames_per_chunk,
     # split machinery lives in the base module to avoid a circular import;
-    # re-exported here so callers can `from audio_dataset_cond import compute_split`.
-    compute_split, _class_of_file, _chunks_from_files,
+    # re-exported here so callers can `from audio_dataset_cond import ...`.
+    # load_source_split READS the split preprocess_stream.py wrote; compute_split
+    # is the old in-code one, kept only for --import_legacy_split and test_cond.py.
+    load_source_split, compute_split, _class_of_file, _chunks_from_files,
     _meta_latent_frames, NORMALIZER_MAX_CHUNKS,
 )
 from conditions import (
@@ -65,7 +71,7 @@ class ConditionedAudioDataset(Dataset):
 
     For each sample returns:
         frames:      (n_frames, 72)
-        frame_conds: Dict[str, Tensor] — e.g. {"melody": (n_frames, 88), ...}
+        frame_conds: Dict[str, Tensor] — e.g. {"f0": (n_frames, 2), ...}
         label_idx:   int
         text_emb:    (text_dim,) — embedding of the class name
         image_emb:   (image_dim,) — random image embedding of the class
@@ -472,16 +478,17 @@ def build_conditioned_datasets(
     registry:        Optional[ConditionRegistry] = None,
     preload:         bool = True,
     strict_conditions: bool = True,
-    # ---- split configuration (from cond_default.yaml: data.split) ----
-    split_ratios:    Tuple[float, float, float] = (0.8, 0.1, 0.1),
-    split_seed:      int = 42,
-    group_by_source: bool = True,
-    stratify_by_class: bool = True,
-    save_test_manifest: bool = True,
+    splits_path:     Optional[str] = None,
 ):
     """
     Builds the conditioned train/val/test datasets from the SPLIT-LESS dataset,
-    computing the split (stratified, source-grouped, seeded) and the normalizer.
+    READING the split (written by preprocess_stream.py) and fitting the normalizer.
+
+    The split is no longer computed here: it is decided over the source files at
+    preprocessing time and recorded in <dataset>/splits.json, so it cannot drift
+    between runs, and the normalizer below is fitted on exactly the train split
+    the preprocessing declared. `splits_path` overrides where that file is read
+    from; None = the dataset's own.
 
     Returns:
         (train, val, test, normalizer, label_to_idx, split_info)
@@ -491,11 +498,7 @@ def build_conditioned_datasets(
     }
     """
     # 1. split (shared across train/val/test)
-    split = compute_split(
-        latent_root, ratios=split_ratios, seed=split_seed,
-        group_by_source=group_by_source, stratify_by_class=stratify_by_class,
-        save_test_manifest=save_test_manifest,
-    )
+    split = load_source_split(latent_root, splits_path=splits_path)
     splits = split["splits"]
     classes = split["classes"]
     label_to_idx = {c: i for i, c in enumerate(classes)}

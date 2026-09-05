@@ -14,7 +14,7 @@
 #
 # Conditioning is added ON TOP, without touching the block:
 #
-#   * FRAME-LEVEL conditions (melody, chroma, rhythm) are injected by
+#   * FRAME-LEVEL conditions (f0, chroma, rhythm, energy) are injected by
 #     CONCATENATION ON THE FEATURE DIMENSION at the input, exactly as in
 #     JASCO (audiocraft/models/flow_matching.py, forward):
 #         for each temporal condition c: x = torch.concat((x, c), dim=-1)
@@ -295,7 +295,7 @@ class ConditionedAudioDiT(nn.Module):
 
     Args:
         frame_cond_dims:     {name: raw_dim}, e.g.
-                             {"melody": 88, "chroma": 12, "rhythm": 2}.
+                             {"f0": 2, "chroma": 12, "rhythm": 2}.
                              Raw per-frame dimensionality produced by the
                              extractors (conditions.py). Empty/None -> no frame
                              conditioning (input_proj is token_dim -> hidden,
@@ -471,7 +471,7 @@ class ConditionedAudioDiT(nn.Module):
         """
         x: (B, n_frames, token_dim)   one token per DAC frame
         t: (B,)                        timestep in [0, 1]
-        frame_conditions:  {"melody": (B,T,88), "chroma": (B,T,12), "rhythm": (B,T,2)} or None
+        frame_conditions:  {"f0": (B,T,2), "chroma": (B,T,12), "rhythm": (B,T,2)} or None
         global_conditions: {"text":  (B,d),  "image":  (B,d), ...}    or None
 
         Returns:
@@ -515,31 +515,31 @@ if __name__ == "__main__":
     x = torch.randn(B, N, TOKEN_DIM)
     t = torch.rand(B)
 
-    # --- Melody only ---
-    print("=== Frame: melody only ===")
+    # --- f0 only ---
+    print("=== Frame: f0 only ===")
     model = ConditionedAudioDiT(
         kind='S',
-        frame_cond_dims={"melody": 88},
-        frame_cond_out_dims={"melody": 64},
+        frame_cond_dims={"f0": 2},
+        frame_cond_out_dims={"f0": 16},
         global_cond_configs={},
     )
-    out = model(x, t, frame_conditions={"melody": torch.randn(B, N, 88)})
+    out = model(x, t, frame_conditions={"f0": torch.randn(B, N, 2)})
     print(f"  input {x.shape} -> output {out.shape}")
     assert out.shape == x.shape
     assert out.shape == model(x, t).shape  # frame conds omitted -> zeros
 
     # --- All three frame conditions + global text/image ---
-    print("\n=== Frame: melody+chroma+rhythm | Global: text+image ===")
+    print("\n=== Frame: f0+chroma+rhythm | Global: text+image ===")
     model2 = ConditionedAudioDiT(
         kind='S',
-        frame_cond_dims={"melody": 88, "chroma": 12, "rhythm": 2},
-        frame_cond_out_dims={"melody": 64, "chroma": 64, "rhythm": 32},
+        frame_cond_dims={"f0": 2, "chroma": 12, "rhythm": 2},
+        frame_cond_out_dims={"f0": 16, "chroma": 64, "rhythm": 32},
         global_cond_configs={"text": {"dim": 512}, "image": {"dim": 512}},
     )
     out2 = model2(
         x, t,
         frame_conditions={
-            "melody": torch.randn(B, N, 88),
+            "f0": torch.randn(B, N, 2),
             "chroma": torch.randn(B, N, 12),
             "rhythm": torch.randn(B, N, 2),
         },

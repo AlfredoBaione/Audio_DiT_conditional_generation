@@ -1,0 +1,156 @@
+# ============================================================
+# PREPROCESSING CONFIG  (preprocess_stream.py --config <this file>)
+# ============================================================
+# Every key here is one long CLI flag, without the leading '--'.
+#
+# PRECEDENCE:  built-in defaults  <  this file  <  what you type on the CLI.
+# So the file is the memory of how a dataset is built, and a flag typed on the
+# command line always wins for a one-off. The run prints which keys the file
+# applied and which ones the command line overrode.
+#
+# An UNKNOWN key here is a hard error, not a silent no-op: a typo in the file
+# that records how a dataset was built must never look like a setting that did
+# nothing.
+#
+# What CANNOT be changed on an existing OUT dir: every parameter that decides
+# the audio bytes, which chunks survive, or the latent geometry. Those are
+# recorded in OUT/dataset_meta.json and a re-run that disagrees is refused --
+# use a fresh OUT dir instead. The split has the same protection in
+# OUT/splits.json (see --resplit).
+
+
+# ============================================================
+# PATHS
+# ============================================================
+# Both can also be given positionally: preprocess_stream.py SRC OUT
+source_dir: "./Entire_music_reduced"
+output_dir: "./dataset_ready_cond"
+
+
+# ============================================================
+# CHUNKING  (part of the dataset identity -- fixed once, forever)
+# ============================================================
+sr:              44100    # MUST be 44100: the DAC is the 44khz model
+chunk_duration:  5.0      # seconds per chunk
+chunk_overlap:   0.0      # seconds of overlap between consecutive chunks
+duration:        null     # trim each source to N seconds before chunking
+min_duration:    null     # drop sources shorter than this
+pad_last_chunk:  false    # keep the tail chunk, zero-padded
+keep_num_chunks_per_file: null   # keep only N chunks per source (linspace centers)
+
+
+# ============================================================
+# FILE / CHUNK GATES  (also part of the dataset identity)
+# ============================================================
+# Per-FILE: decide which sources are dropped entirely.
+silence_threshold: null
+max_silence_ratio: null
+peak_threshold:    1.0
+max_peak_ratio:    null
+no_clip:           false
+# Per-CHUNK: decide which chunks survive. Surviving chunks are RENUMBERED, so
+# changing these makes the same file name hold different audio.
+chunk_min_rms:     null
+chunk_min_peak:    null
+
+
+# ============================================================
+# ACOUSTIC TREATMENT  (off by default = supervisor-style loading)
+# ============================================================
+# ON = silence edge-trim + constant-gain loudness normalization + stereo split.
+# Switching it changes the latent statistics: the normalizer and the FD-DAC
+# reference must be refit in a FRESH cache dir.
+acoustic_rules:   false
+target_lufs:      -18.0
+target_tp:        -1.0
+target_lra:       20.0
+silence_trim_db:  -55.0
+silence_thresh_db: -60.0
+no_stereo_split:  false
+min_chunk_sec:    null
+
+
+# ============================================================
+# TRAIN / VAL / TEST SPLIT
+# ============================================================
+# Decided HERE, over the SOURCE FILES, and written to OUT/splits.json. The
+# training reads that file; it no longer computes a split of its own.
+#
+# Ratios apply per class (stratified) and must sum to 1.0. A class with a single
+# source goes entirely to train -- that is what keeps the split leakage-safe.
+split_ratios: "0.8,0.1,0.1"
+split_seed:   42
+no_stratify:  false      # true = one global bucket instead of per-class balance
+
+# A re-run NEVER reassigns a source that already has a split; it only places the
+# new ones. Set resplit: true ONLY to deliberately redecide everything -- it
+# reshuffles train/val/test and invalidates every evaluation of a checkpoint
+# trained against the old assignment.
+resplit: false
+
+# Metadata-only modes (no decoding, no models loaded):
+#   split_only          -> just create/extend splits.json and exit
+#   import_legacy_split -> reproduce the split the TRAINING used to compute
+#                          in-code, for datasets built before the split moved
+#                          here (keeps runs already in flight reproducible)
+split_only:          false
+import_legacy_split: false
+
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+# Which splits get their per-chunk WAV written under wav/<class>/:
+#   "none" (default) | "all" | any subset of train,val,test  e.g. "val"
+#
+# These wavs are the REAL source audio -- they never pass through the DAC. They
+# are what a standard FAD reference is built from (metrics.fad_reference: "wav"
+# on the training side), which is why "val" is usually all you need: it costs
+# roughly a tenth of the disk of "all".
+save_wav: "none"
+
+# Frame conditions to extract into conditions/<class>/<chunk>.npz.
+# null = none. Example: "f0,energy,chroma". Adding one later is incremental:
+# the latents are NOT re-encoded, only the missing condition is extracted.
+conditions: null
+
+# Class-level global conditions to pre-cache: "text", "image", or "text,image".
+# (This is the one key whose name differs from its flag: the CLI spells it
+#  --global, which Python cannot use as an attribute name.)
+global_conds: null
+image_root:   null        # image_root/<class>/*.jpg, for the image condition
+
+# Flatten every source into one class directory.
+single_class: false
+class_name:   null
+
+
+# ============================================================
+# DEVICES / THROUGHPUT
+# ============================================================
+device:      "cuda"       # owns the DAC batch (main process)
+cond_device: null         # GPU-capable conditions (f0, rhythm); null = follow device
+skip_dac:    false        # everything except the DAC encode
+
+num_workers:       4      # CPU workers: load, chunk, CPU conditions, WAV writing
+batch_size:        16     # chunks per DAC forward
+loader_batch_size: 8      # chunks per worker IPC batch
+prefetch_factor:   1      # batches prefetched by EACH worker
+worker_start_method: "spawn"
+
+
+# ============================================================
+# RE-RUN BEHAVIOUR
+# ============================================================
+# A re-run is incremental by default and now also SKIPS ENTIRELY any source
+# whose outputs are all already present -- it is not even decoded. That check
+# reads the source manifest plus file headers, never the audio.
+#
+# force: recompute the chunks this run encounters (same parameters only). It is
+#        NOT a rebuild: outputs this run no longer produces are left in place.
+force: false
+
+# prune_orphans: delete the outputs of sources that no longer exist on disk.
+# Without it they keep feeding the normalizer and the training while
+# corresponding to nothing.
+prune_orphans: false

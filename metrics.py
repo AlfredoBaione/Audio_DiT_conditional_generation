@@ -501,7 +501,8 @@ class VGGishEmbedder:
     def _load(self):
         if self._model is not None:
             return
-        model = torch.hub.load('harritaylor/torchvggish', 'vggish', postprocess=False)
+        model = torch.hub.load('harritaylor/torchvggish', 'vggish',
+                               postprocess=False, trust_repo=True)
         model.eval().to(self.device)
         model.device = self.device
         self._model = model
@@ -544,17 +545,37 @@ def _audio_clips_to_mu_sigma(clip_iter, n_items, embedder, device, desc):
 
 
 @torch.no_grad()
-def precompute_audio_reference(val_wav_root, embedder, cache_path=None,
+def precompute_audio_reference(val_wav_source, embedder, cache_path=None,
                                device: str = "cuda") -> dict:
     """Reference mu/sigma = embeddings of the REAL val wavs (NO DAC). Cached.
-    val_wav_root is searched recursively for *.wav."""
+
+    `val_wav_source` is either
+      * a DIRECTORY, searched recursively for *.wav  (unconditional pipeline:
+        the dataset has a val/ folder, so the directory IS the split), or
+      * an explicit ITERABLE OF FILE PATHS (conditioned pipeline: the dataset is
+        SPLIT-LESS on disk, so wav/ holds train, val and test together and
+        globbing it would build the "real" reference on the test set as well --
+        the exact leakage the in-code split exists to prevent).
+    """
     if cache_path is not None and Path(cache_path).exists():
         print(f"[Audio ref] loading cache: {cache_path}")
         return torch.load(str(cache_path), map_location="cpu", weights_only=False)
     import soundfile as sf
-    wavs = sorted(Path(val_wav_root).rglob("*.wav"))
-    if not wavs:
-        raise FileNotFoundError(f"No .wav under {val_wav_root}")
+    if isinstance(val_wav_source, (str, Path)):
+        wavs = sorted(Path(val_wav_source).rglob("*.wav"))
+        if not wavs:
+            raise FileNotFoundError(f"No .wav under {val_wav_source}")
+    else:
+        wavs = [Path(w) for w in val_wav_source]
+        missing = [w for w in wavs if not w.exists()]
+        if not wavs:
+            raise FileNotFoundError(
+                "precompute_audio_reference received an EMPTY file list.")
+        if missing:
+            raise FileNotFoundError(
+                f"{len(missing)}/{len(wavs)} reference wavs do not exist "
+                f"(first: {missing[0]}). Re-run preprocess_stream.py with "
+                f"--save_wav, or switch metrics.fad_reference to 'decoded'.")
     print(f"[Audio ref] embedding {len(wavs)} real val wavs (NO DAC)...")
 
     def _iter():
@@ -603,6 +624,36 @@ def _decode_embed_mu_sigma(generated_latents, normalizer, embedder, device, desc
 # ============================================================
 
 ALL_METRICS = ("fd_dac", "kl_dac", "fad_encodec", "fad_vggish")
+
+# What the CONDITIONED pipeline (training_cond.py) actually computes. It is a
+# SUBSET of ALL_METRICS on purpose: `fad_encodec` needs the Encodec dependency
+# and is not wired, so listing it must fail loudly rather than be ignored.
+COND_METRICS = ("fd_dac", "kl_dac", "fad_vggish")
+
+
+@torch.no_grad()
+def compute_audio_mu_sigma(clip_iter, n_items, embedder, device: str = "cuda",
+                           desc: str = "Audio stats"):
+    """Public entry point for the streaming audio-embedding statistics.
+
+    `clip_iter` yields (wav (b, c, T), sr); the embeddings are accumulated as
+    running sums, so peak memory does not grow with n_items -- decoding and
+    embedding N clips costs TIME, not RAM. Returns (mu, sigma, n_vectors)."""
+    return _audio_clips_to_mu_sigma(clip_iter, n_items, embedder, device, desc)
+
+
+def compute_fad(mu_gen, sigma_gen, ref_stats: dict, device: str = "cuda") -> float:
+    """Frechet Audio Distance between generated statistics and a reference built
+    by precompute_audio_reference() / compute_audio_mu_sigma(). Same Gaussian
+    formula as FD-DAC, on audio embeddings instead of DAC latents."""
+    mu_ref = ref_stats["mu"].to(device)
+    sigma_ref = ref_stats["sigma"].to(device)
+    fad = compute_frechet_distance(mu_ref, sigma_ref,
+                                   mu_gen.to(device), sigma_gen.to(device))
+    del mu_ref, sigma_ref
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return float(fad.item())
 
 
 def make_embedders(enabled, device: str = "cuda", encodec_sr: int = 24000) -> dict:

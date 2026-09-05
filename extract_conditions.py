@@ -1,7 +1,7 @@
 """
 extract_conditions.py
 
-Standalone tool to add/extract frame-level conditions (melody, chroma, rhythm,
+Standalone tool to add/extract frame-level conditions (f0, chroma, rhythm,
 energy, f0, ...) onto an EXISTING latents dataset produced by preprocess_stream.py.
 
 When to use this vs preprocess_stream.py:
@@ -38,7 +38,7 @@ Expected input:
 Output:
     dataset_ready_cond/
         conditions/<class...>/*.npz
-            -> contains: melody, chroma, rhythm, energy, f0, ... (per
+            -> contains: f0, chroma, rhythm, energy, ... (per
                CONDITION_CONFIG and the --conditions selection)
 
 Usage:
@@ -46,8 +46,8 @@ Usage:
     python extract_conditions.py dataset_ready_cond --device cuda
 
     # only a subset (modular / incremental):
-    python extract_conditions.py dataset_ready_cond --conditions melody --device cuda
-    # later, add f0 WITHOUT recomputing melody (merged into the same .npz):
+    python extract_conditions.py dataset_ready_cond --conditions f0 --device cuda
+    # later, add energy WITHOUT recomputing f0 (merged into the same .npz):
     python extract_conditions.py dataset_ready_cond --conditions f0 --device cuda
 
     python extract_conditions.py dataset_ready_cond --force    # recompute all
@@ -61,7 +61,7 @@ import os
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
-# IRCAM: redirect ALL model caches (DAC, basic-pitch, beat_this, HuggingFace
+# IRCAM: redirect ALL model caches (DAC, CREPE, beat_this, HuggingFace
 # CLAP/CLIP) onto the machine-LOCAL disk instead of the NFS HOME. Downloading
 # model weights into ~ (NFS) is slow and can hit the HOME quota. Mirrors the
 # redirection already done in training_cond.py. Guarded by the local-dir check
@@ -210,13 +210,13 @@ def process_file(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Frame-level condition extraction (melody, chroma, rhythm, ...) "
+        description="Frame-level condition extraction (f0, chroma, rhythm, ...) "
                      "from the preprocessed dataset",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     python extract_conditions.py dataset_ready_cond --device cuda
-    python extract_conditions.py dataset_ready_cond --conditions melody --device cuda
+    python extract_conditions.py dataset_ready_cond --conditions f0 --device cuda
     python extract_conditions.py dataset_ready_cond --conditions rhythm --device cuda
     python extract_conditions.py dataset_ready_cond --force
         """,
@@ -226,7 +226,7 @@ Examples:
                              "(contains latents/ and optionally wav/)")
     parser.add_argument("--conditions", type=str, default=None,
                         help="Comma-separated subset of frame conditions to "
-                             "extract, e.g. 'melody' or 'melody,rhythm'. Each "
+                             "extract, e.g. 'f0' or 'f0,rhythm'. Each "
                              "name must be enabled=True in CONDITION_CONFIG "
                              "(conditions.py). Default (None): extract ALL the "
                              "conditions enabled in CONDITION_CONFIG. Existing "

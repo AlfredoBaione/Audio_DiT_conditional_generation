@@ -237,7 +237,8 @@ def build_global_cond(
 def _align_to_frames(arr: np.ndarray, n_frames: int) -> np.ndarray:
     """Align a per-frame condition (T, dim) to exactly n_frames on the time axis,
     exactly as the dataset does in __getitem__: truncate if too long, zero-pad if
-    too short. Keeps one-hot conditions (melody) intact (no interpolation)."""
+    too short. Never interpolates: a condition is truncated or zero-padded,
+    never resampled."""
     arr = np.asarray(arr, dtype=np.float32)
     if arr.ndim == 1:
         arr = arr[:, None]
@@ -254,7 +255,7 @@ def build_frame_cond(args, ckpt, n_frames, device) -> Optional[Dict[str, torch.T
     """
     Build the frame_conditions dict {name: (1, n_frames, raw_dim)} on `device`,
     matching the checkpoint's frame_cond_dims, from one of:
-      --condition_npz : an .npz with keys = condition names (e.g. melody, energy),
+      --condition_npz : an .npz with keys = condition names (e.g. f0, energy),
                         each (T, raw_dim); typically produced by extract_conditions.py.
       --condition_wav : a WAV from which the required frame conditions are
                         RE-EXTRACTED with the same ConditionRegistry used at
@@ -389,7 +390,7 @@ def main():
                              "from the checkpoint config / standard locations).")
     parser.add_argument("--condition_npz", type=str, default=None,
                         help="Path to an .npz of frame conditions (keys = condition "
-                             "names, e.g. melody/energy), as produced by "
+                             "names, e.g. f0/energy), as produced by "
                              "extract_conditions.py. Aligned to n_frames "
                              "(truncate/zero-pad) like the dataset.")
     parser.add_argument("--condition_wav", type=str, default=None,

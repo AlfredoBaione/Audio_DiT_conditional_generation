@@ -2,7 +2,7 @@
 #
 # Multi-modal conditioning:
 #   - Frame-level (concatenated on the feature dimension at the input,
-#     JASCO-style; see network_cond.py): melody, chroma, rhythm
+#     JASCO-style; see network_cond.py): f0, chroma, rhythm, energy
 #   - Global (AdaLN added to timestep embedding): text (CLAP), image (CLIP)
 #   - CFG dropout per-sample during training (drop-all / drop-frame /
 #     drop-global / keep)
@@ -60,13 +60,26 @@ if os.path.isdir(_IRCAM_LOCAL):
     os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_IRCAM_LOCAL, ".cache"))
 
 import copy
+import sys
 import math
 import json
 import random
 import argparse
 from datetime import datetime
 from pathlib import Path
-from io import BytesIO
+
+# A console that cannot encode a character must not kill a training run. On
+# Windows stdout defaults to the ANSI code page (cp1252), where a single
+# non-ASCII character in a progress line raises UnicodeEncodeError and takes
+# down the run from inside a print -- which is exactly how a metrics step was
+# lost once. backslashreplace keeps the terminal's own encoding (so a UTF-8
+# terminal, e.g. every IRCAM server, still prints the real characters) and only
+# escapes what it cannot represent, instead of raising.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="backslashreplace")
+    except Exception:
+        pass          # not a real console (piped/captured): nothing to harden
 
 import torch
 # Enable TF32 on Ampere+ GPUs (e.g. RTX A4000). Same as facebookresearch/DiT:
@@ -78,9 +91,6 @@ torch.backends.cudnn.allow_tf32 = True
 import torch.nn.functional as F
 import numpy as np
 import soundfile as sf
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -101,7 +111,10 @@ from conditions import (
 from metrics import (
     precompute_latent_reference,
     compute_dac_metrics,
-    DAC_METRICS,
+    precompute_audio_reference,
+    compute_audio_mu_sigma,
+    compute_fad,
+    COND_METRICS,
 )
 
 
@@ -127,17 +140,23 @@ def get_dac():
     return _DAC_MODEL
 
 
+def decode_frames_to_wav(frames, normalizer, dac_model):
+    """(n_frames, 72) NORMALIZED latent -> 1-D waveform on CPU.
+
+    Single implementation, shared by the metrics step and the FAD reference: two
+    copies of "denormalize, quantizer.from_latents, decode" would be two places
+    to keep in sync, and a reference decoded differently from the generations
+    would make the FAD compare the two decoders instead of the two
+    distributions."""
+    z = normalizer.denormalize(frames.T)
+    z = z.unsqueeze(0).float().to(next(dac_model.parameters()).device)
+    z_q, _, _ = dac_model.quantizer.from_latents(z)
+    return dac_model.decode(z_q).squeeze().detach().cpu()
+
+
 # ======================
 # SPLIT / CACHE HELPERS  (new: split-less dataset + cache metadata validation)
 # ======================
-def _split_param(cfg, key, default):
-    """Read data.split.<key> from the YAML, with a default."""
-    d = cfg.data.get("split", None) if hasattr(cfg, "data") else None
-    if d is None:
-        return default
-    return d.get(key, default)
-
-
 def _load_dataset_meta(latent_root):
     """dataset_meta.json is written by preprocess_stream.py at the dataset root
     (the parent of latents/). It records sr / chunk / acoustic params, i.e. HOW
@@ -174,10 +193,42 @@ def _latent_file_list_hash(latent_root):
     return hasher.hexdigest(), n
 
 
+def _splits_fingerprint(cfg):
+    """Identity of the SPLIT the cache was computed against.
+
+    The split now lives in the dataset (splits.json, written by
+    preprocess_stream.py), so the fingerprint records the actual ASSIGNMENT --
+    a digest of every source->split pair -- and not just the parameters that
+    produced it. That is strictly tighter than what it replaced: growing the
+    dataset adds sources to the train split with the parameters unchanged, and
+    the normalizer fitted before that no longer describes the training data.
+
+    A missing file is recorded as None rather than raised on: this runs before
+    the datasets are built, and load_source_split() gives the actionable error.
+    """
+    import hashlib
+    p = Path(cfg.paths.dataset_root).parent / "splits.json"
+    if not p.exists():
+        return None
+    try:
+        payload = json.loads(p.read_text())
+    except Exception:
+        return {"unreadable": True}
+    groups = payload.get("groups", {})
+    digest = hashlib.sha1(
+        json.dumps(groups, sort_keys=True).encode("utf-8")).hexdigest()
+    return {
+        "params": payload.get("params", {}),
+        "source": payload.get("source"),
+        "n_sources": len(groups),
+        "assignment_sha1": digest,
+    }
+
+
 def _cache_fingerprint(cfg, n_frames):
     """Identity of the data the cached normalizer / FD-DAC reference depend on.
     The normalizer is fit on the TRAIN split and the FD reference on the VAL
-    split, so the split parameters are part of the fingerprint too."""
+    split, so the split itself is part of the fingerprint too."""
     flist_hash, flist_count = _latent_file_list_hash(cfg.paths.dataset_root)
     return {
         "latent_root": os.path.abspath(cfg.paths.dataset_root),
@@ -187,12 +238,7 @@ def _cache_fingerprint(cfg, n_frames):
         "latent_dim": int(DAC_LATENT_DIM),
         "latent_file_list_hash": flist_hash,
         "latent_file_count": flist_count,
-        "split": {
-            "ratios": list(_split_param(cfg, "ratios", [0.8, 0.1, 0.1])),
-            "seed": int(_split_param(cfg, "seed", 42)),
-            "group_by_source": bool(_split_param(cfg, "group_by_source", True)),
-            "stratify_by_class": bool(_split_param(cfg, "stratify_by_class", True)),
-        },
+        "split": _splits_fingerprint(cfg),
     }
 
 
@@ -453,13 +499,38 @@ class EMAModel:
 # CFG DROPOUT (per-sample, applied only during training)
 # ======================
 def apply_cfg_dropout(frame_cond, global_cond, device, global_configs, B,
-                      p_drop_all, p_drop_frame, p_drop_global):
+                      p_drop_all, p_drop_frame, p_drop_global,
+                      p_drop_each_frame=0.0):
     """
-    Per-sample CFG dropout. Each element of the batch flips its own coin:
+    Per-sample CFG dropout, in two stages.
+
+    STAGE 1 -- GROUP buckets. Each element of the batch flips one coin:
         p_drop_all     -> drop everything       (pure unconditional)
         p_drop_frame   -> drop only frame-level
         p_drop_global  -> drop only global
         remaining mass -> keep both branches
+
+    These three are what classifier-free guidance extrapolates FROM: the
+    all-null branch has to be a well-trained model in its own right, so its
+    probability mass is reserved and is never diluted by stage 2.
+
+    STAGE 2 -- PER-CONDITION dropout (`p_drop_each_frame`; 0.0 disables it and
+    restores the stage-1-only behaviour exactly). On top of the buckets, EVERY
+    frame condition then flips its OWN independent coin, so the model also sees
+    the partial subsets: f0 alone, f0+energy, chroma alone, ...
+
+    Without stage 2 the model only ever sees the frame conditions ALL present
+    or ALL absent, and asking it for one condition at inference (nulls in the
+    other slots) is out of distribution: the input says "conditioned" in one
+    slot and "unconditional" in the others, a combination it was never trained
+    to resolve. Stage 2 is what makes partial conditioning a capability of the
+    model rather than an accident. It has to be decided BEFORE training -- it
+    changes what the model learns and cannot be bolted on at sampling time.
+
+    With P = p_drop_each_frame over N conditions, a sample in the "keep" bucket
+    still holds all N with probability (1-P)^N, so P is not a small correction:
+    at N=3, P=0.2 leaves all three standing only about half the time. Raising it
+    buys subset coverage and costs joint-conditioning signal.
 
     This gives the model a cond/uncond mixture in EVERY batch, a much more
     stable training signal than per-batch dropout.
@@ -473,10 +544,17 @@ def apply_cfg_dropout(frame_cond, global_cond, device, global_configs, B,
     drop_f = drop_all | drop_frame    # mask: samples with frame conds dropped
     drop_g = drop_all | drop_global   # mask: samples with global conds dropped
 
-    # Frame-level: zero the selected rows (zero is the null for frame conds)
+    # Frame-level: zero the selected rows (zero is the null for frame conds).
+    # STAGE 2 lives here: each condition draws its OWN coin, which is what
+    # produces the partial subsets. A sample already in drop_f stays fully
+    # dropped either way, so the reserved all-null mass is untouched.
     if frame_cond:
         for k in frame_cond:
-            keep_mask = (~drop_f).view(B, 1, 1).to(frame_cond[k].dtype)
+            drop_k = drop_f
+            if p_drop_each_frame > 0.0:
+                drop_k = drop_f | (torch.rand(B, device=device)
+                                   < p_drop_each_frame)
+            keep_mask = (~drop_k).view(B, 1, 1).to(frame_cond[k].dtype)
             frame_cond[k] = frame_cond[k] * keep_mask
 
     # Global: replace with null (zeros) where drop_g
@@ -498,7 +576,7 @@ VALIDATION_PROTOCOL = "fixed_subset_common_noise_sample_weighted_v2"
 
 def compute_loss(model, batch, device, use_amp, t_min, t_max,
                  global_configs, p_drop_all, p_drop_frame, p_drop_global,
-                 training=True, x0=None, t=None):
+                 training=True, x0=None, t=None, p_drop_each_frame=0.0):
     frames, frame_cond, _labels, text_embs, image_embs = batch
     # NB: `labels` is discarded as conditioning (CLAP-text plays that role
     # better now). It is kept in the batch only as metadata for logging.
@@ -538,6 +616,7 @@ def compute_loss(model, batch, device, use_amp, t_min, t_max,
             p_drop_all=p_drop_all,
             p_drop_frame=p_drop_frame,
             p_drop_global=p_drop_global,
+            p_drop_each_frame=p_drop_each_frame,
         )
 
     with torch.amp.autocast('cuda', enabled=use_amp):
@@ -546,41 +625,10 @@ def compute_loss(model, batch, device, use_amp, t_min, t_max,
     return loss
 
 
-# ======================
-# AUDIO/SPECTROGRAM UTILITIES
-# ======================
-def plot_to_image(fig):
-    buf = BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
-    buf.seek(0)
-    import PIL.Image as Image
-    import torchvision
-    img = torchvision.transforms.ToTensor()(Image.open(buf))
-    buf.close()
-    return img
-
-
-def make_spectrogram(waveform, sr, title=""):
-    import torchaudio
-    spec = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr, n_mels=128, n_fft=2048, hop_length=512
-    )(waveform.cpu().float())
-    spec_db = torchaudio.transforms.AmplitudeToDB()(spec)
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.imshow(spec_db[0].numpy(), aspect='auto', origin='lower',
-              cmap='viridis', vmin=-80, vmax=0)
-    ax.set_title(title)
-    ax.set_xlabel("Frame"); ax.set_ylabel("Mel Bin")
-    plt.colorbar(ax.images[0], ax=ax, label="dB")
-    img = plot_to_image(fig)
-    plt.close(fig)
-    return img
-
-
 @torch.no_grad()
 def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
                       frame_cond, global_cond, guidance,
-                      frame_dims, global_configs, gen_rng=None, x0=None):
+                      frame_dims, global_configs, gen_rng=None):
     """
     Euler integrator with classifier-free guidance.
     Both `frame_cond` and `global_cond` are expected as batch=1 dicts on device.
@@ -589,13 +637,9 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
     `gen_rng` (optional torch.Generator) fixes the initial-noise x0 so the metric
     FD/KL are comparable across checkpoints (mirrors the uncond metrics seed);
     None = free-running.
-    `x0` (optional) supplies the initial noise directly, bypassing gen_rng -- used
-    by verify_paired_sampler.py to run this reference path from exactly the noise
-    the fused sampler drew.
     """
     model.eval()
-    x = (torch.randn(1, n_frames, TOKEN_DIM, device=device, generator=gen_rng)
-         if x0 is None else x0.clone())
+    x = torch.randn(1, n_frames, TOKEN_DIM, device=device, generator=gen_rng)
     dt = (t_max - t_min) / steps
 
     null_fc = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
@@ -649,15 +693,15 @@ def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_am
 
     GENERIC / portable: the batch is built by iterating over EVERY active frame
     and global condition and concatenating it with its null, so this works
-    unchanged for f0-only, melody+energy, CLAP-text, CLIP-image, or any future
+    unchanged for f0-only, f0+energy, CLAP-text, CLIP-image, or any future
     combination (driven by the run's condition dicts, nothing is hardcoded).
 
     Returns (cond_latents, uncond_latents): two lists of B tensors on CPU.
     Mathematically equivalent to separate euler_sample_cfg() calls from the same
-    x0 -- but only up to CUDA op ordering, so A/B-verify before trusting it
-    (verify_paired_sampler.py). B does NOT affect which samples come out: the
-    noise is drawn per-sample (see below), so spf is purely about how the work is
-    packed into forwards.
+    x0 -- but only up to CUDA op ordering, so the two paths agree to
+    floating-point tolerance, not bit for bit. B does NOT affect which samples
+    come out: the noise is drawn per-sample (see below), so spf is purely about
+    how the work is packed into forwards.
     """
     model.eval()
     null_fc_1 = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
@@ -716,7 +760,254 @@ def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_am
 
 
 # ======================
-# AUDIO GENERATION (conditioned, from val-set samples)
+# TENSORBOARD AUDIO PANELS: ONE BLOCK PER SAMPLE
+# ======================
+# The two TensorBoard groups that COLLECT one card per sample, outside the
+# per-sample blocks. The dashboard groups on the text before the first '/', so
+# these strings are the group headers exactly as they read on screen.
+UNCOND_AUDIO_GROUP = "uncond generation"
+REAL_AUDIO_GROUP = "ground truth"
+
+
+def norm_wav(x):
+    """
+    A waveform as (1, L) float32 torch, peak-normalized -- what add_audio wants.
+
+    Accepts numpy arrays, 1-D torch tensors and (1, L) torch tensors.
+
+    The normalization is not cosmetic: a sonified condition is synthesized at a
+    fixed low level while a generation is not, so without it the A/B between two
+    cards would be between loudnesses as much as between contents.
+    """
+    a = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+    a = np.asarray(a, dtype=np.float32).reshape(1, -1)
+    return torch.from_numpy(a / (np.abs(a).max() + 1e-8))
+
+
+def audio_panel_tags(family, idx, active_conditions=(), suffix=""):
+    """
+    The TensorBoard AUDIO tags of ONE sample -> {"conditions": {name: tag},
+    "generation": tag, "generation_no_cond": tag, "real": tag}.
+
+    Single source of truth for the audio window's layout, because the four
+    places that log audio (the metrics step, the cheap preview between metrics
+    steps, the step-0 real references, the f0 probe) all write into the same
+    blocks and MUST agree on their names -- otherwise one sample would own two
+    half-filled blocks instead of one.
+
+    THREE layout facts drive every name here, and all three are properties of
+    the dashboard rather than choices:
+
+    1. Cards are grouped by the text BEFORE the first '/', and each group is its
+       own headed, collapsible block. So the SAMPLE is that prefix. With every
+       tag under a single 'Validation/' prefix the dashboard builds ONE grid
+       holding every card of every sample, and a condition ends up separated
+       from its own generation by a row break; one block per sample holds 2-5
+       cards that stay together and are visibly walled off from the next sample.
+
+    2. Inside a block cards are sorted alphabetically and flow into a grid that
+       wraps every 2-3 cards depending on window width. Only the first two
+       positions are therefore side by side at EVERY width -- so slots 1 and 2
+       are the f0 target and the generation conditioned on it, the one A/B these
+       panels exist for.
+
+          1  f0_<family>_XX                     the sonified f0 target
+          2  generation_with_f0_<family>_XX     the generation it conditioned
+          3+ <condition>_<family>_XX            energy, chroma, ... alphabetical
+
+    3. The unconditional generation and the real recording do NOT live in the
+       per-sample block. Each is COLLECTED into a group of its own, holding one
+       card per sample, so that all of them can be heard as a grid of peers
+       instead of one at a time inside separate collapsibles:
+
+          uncond generation/uncond_<family>_XX<suffix>
+          ground truth/real_<family>_XX
+
+       The family and the index in the CARD name are what ties a card back to
+       the block it belongs to: 'uncond generation/uncond_validation_03' is the
+       null twin of 'validation_03/2_generation_with_f0_validation_03', drawn
+       from the same noise, and 'ground truth/real_validation_03' is the
+       recording that block's conditions were extracted from. These groups are
+       flat -- no numeric prefix -- because nothing inside them is an ordered
+       A/B against a neighbouring card.
+
+    The card names repeat the family and index that the block header already
+    shows. That redundancy is deliberate: a card read, filtered or screenshotted
+    on its own still says what it is and which sample it belongs to.
+
+    `family` is "probe" or "validation". `suffix` decorates the BLOCK header
+    (the probe melody's name) and, since the collected groups have no block
+    header to carry it, the uncond CARD name as well; the index stays the
+    cross-reference to the f0 image of the same sample either way. If f0 is not
+    among the active conditions the first one alphabetically leads instead, and
+    the generation card is named after IT -- the panel never claims an f0
+    pairing that was not part of the run.
+
+    With NO condition active at all (pure-unconditional run) the block
+    generation IS the unconditional generation -- nothing was dropped to obtain
+    it -- so it is filed straight into the uncond group and no per-sample block
+    is created. Such a run's audio window is exactly the two collected groups.
+    """
+    active = sorted(active_conditions)
+    lead = "f0" if "f0" in active else (active[0] if active else None)
+    block = f"{family}_{idx:02d}{suffix}"
+    tail = f"{family}_{idx:02d}"
+
+    conditions = {}
+    if lead is not None:
+        conditions[lead] = f"{block}/1_{lead}_{tail}"
+    for j, cname in enumerate(n for n in active if n != lead):
+        conditions[cname] = f"{block}/{3 + j}_{cname}_{tail}"
+
+    uncond = f"{UNCOND_AUDIO_GROUP}/uncond_{tail}{suffix}"
+    real = f"{REAL_AUDIO_GROUP}/real_{tail}"
+
+    return {
+        "conditions": conditions,
+        # No lead -> nothing was conditioned, so the generation IS the uncond
+        # card and the two keys deliberately name the same tag: the callers that
+        # write the null baseline are guarded on a condition being active, so
+        # the tag is still written exactly once.
+        "generation": (f"{block}/2_generation_with_{lead}_{tail}"
+                       if lead is not None else uncond),
+        "generation_no_cond": uncond,
+        "real": real,
+    }
+def subset_generation_tag(family, idx, label, suffix=""):
+    """
+    The audio card of ONE condition-subset generation, inside that sample's
+    block. Slot 2 like the reference generation, so every generation of the
+    sample sits together right after the condition cards and they sort among
+    themselves by subset label.
+    """
+    return f"{family}_{idx:02d}{suffix}/2_gen_{label}_{family}_{idx:02d}"
+
+
+def resolve_influence_subsets(spec, active_names):
+    """
+    -> [(label, (condition names, ...))]: which CONDITION SUBSETS the metrics
+    step generates and scores, in the order they will appear in the panel.
+
+    `spec` is sampling.influence_subsets. Each entry is either an explicit list
+    of condition names, or one of the keywords:
+
+        "all"         -> every active condition (the reference row)
+        "loo"         -> leave-one-out: N subsets, each missing one condition
+        "singletons"  -> N subsets, each holding exactly one condition
+
+    An empty/None spec returns [] and the metrics step behaves exactly as
+    before: one conditioned pass, one null pass, one table.
+
+    Names unknown to the run are a hard error rather than a silent skip -- a
+    typo in a subset list would otherwise quietly measure something else. The
+    empty subset is dropped instead: it is the unconditional pass, which the
+    metrics step already generates and pairs against.
+
+    Every subset is ordered by the run's canonical condition order (not by the
+    order written in the YAML) so a label means the same thing whatever way it
+    was spelled, and two spellings of one subset collapse to one generation.
+    """
+    active = list(active_names or [])
+    if not spec or not active:
+        return []
+    out = []
+
+    def add(label, names):
+        picked = tuple(a for a in active if a in set(names))
+        if not picked:
+            return                       # empty subset == the uncond pass
+        if any(lbl == label for lbl, _ in out):
+            return                       # already asked for, in any spelling
+        out.append((label, picked))
+
+    def label_for(names):
+        if len(names) == len(active):
+            return "all"
+        if len(names) == 1:
+            return f"only_{names[0]}"
+        if len(names) == len(active) - 1:
+            missing = [a for a in active if a not in set(names)]
+            return f"no_{missing[0]}"
+        return "+".join(names)
+
+    for entry in spec:
+        if isinstance(entry, str):
+            key = entry.strip().lower()
+            if key == "all":
+                add("all", active)
+            elif key in ("loo", "leave_one_out"):
+                for n in active:
+                    rest = [a for a in active if a != n]
+                    add(label_for(tuple(rest)), rest)
+            elif key in ("singletons", "each"):
+                for n in active:
+                    add(f"only_{n}", [n])
+            else:
+                raise ValueError(
+                    f"sampling.influence_subsets: unknown keyword '{entry}'. "
+                    f"Use 'all', 'loo', 'singletons', or an explicit list of "
+                    f"condition names from {active}.")
+        else:
+            names = [str(n) for n in entry]
+            unknown = [n for n in names if n not in active]
+            if unknown:
+                raise ValueError(
+                    f"sampling.influence_subsets: condition(s) {unknown} are "
+                    f"not active in this run. Active: {active}.")
+            picked = tuple(a for a in active if a in set(names))
+            add(label_for(picked), picked)
+    return out
+
+
+# ======================
+# WHICH GENERATIONS OWN A TENSORBOARD PANEL
+# ======================
+def metrics_sample_positions(n_samples, n_influence):
+    """
+    -> the positions of the metrics generation list that make up the INFLUENCE
+    SET: the N validation samples that are scored for condition fidelity AND
+    own a TensorBoard panel (a target-vs-generated image and an audio block).
+
+    ONE list, deliberately. The influence table, the Images window and the Audio
+    window are three views of the SAME samples: the number in the table is about
+    the curve you are looking at and the audio you are hearing. Splitting them
+    (score over 64, plot 4) meant the panels illustrated a number computed on
+    samples you never saw.
+
+    Single source of truth also across steps: the metrics step and the cheaper
+    audio preview both write into the validation_XX/ block, so they MUST agree
+    on which validation sample XX is -- otherwise the same block would hold two
+    different recordings depending on which step last wrote to it.
+
+    The spread is uniform over the WHOLE list, not its first N: the generation
+    indices come from linspace(0, len(val)-1, n_samples), so a prefix lands on a
+    tiny head of the validation set (with n_samples=1024 over a 165-sample val,
+    the first 64 generations cover only 11 DISTINCT conditions, each re-drawn
+    with different noise) and the mean would describe that head.
+    """
+    n_samples = int(n_samples or 0)
+    n_fid = min(int(n_influence or 0), n_samples)
+    if n_fid <= 0 or n_samples <= 0:
+        return []
+    return sorted(set(
+        torch.linspace(0, n_samples - 1, n_fid).round().long().tolist()))
+
+
+def influence_set_size(sampling_cfg, default=16) -> int:
+    """sampling.n_influence_samples -- the N of the influence set.
+
+    ONE knob for: how many validation samples and how many probe stimuli are
+    evaluated, plotted and played. It is NOT n_metrics_samples: the
+    distributional metrics (FD-DAC / KL / FAD) run on that much larger pool,
+    because they estimate a covariance and want the samples; the influence set
+    is what a human reads panel by panel, so it is small and fully shown."""
+    if sampling_cfg is None:
+        return int(default)
+    return int(sampling_cfg.get("n_influence_samples", default) or default)
+
+
+# ======================
+# AUDIO PREVIEW (conditioned, into the per-sample panels)
 # ======================
 @torch.no_grad()
 def generate_and_log_audio(
@@ -725,29 +1016,48 @@ def generate_and_log_audio(
     frame_dims, global_configs, prefix="EMA",
 ):
     """
-    Generates `n_samples` CONDITIONED audios by taking conditions from
-    val-set samples, decodes with DAC on CPU, logs on TensorBoard.
-    Mirrors the unconditional repo's `generate_and_log_audio`: tags are
-    Validation/Audio_generated_{prefix}_{i:02d} and
-    Validation/Spectrogram_generated_{prefix}_{i:02d}, where {prefix} is
-    "EMA" or "Model" depending on which weights produced the sample.
+    Cheap audio preview BETWEEN metrics steps, written into the SAME panels the
+    metrics step uses (the validation_XX/ blocks): same validation samples, same
+    tag names, only a finer cadence. The audio window therefore holds ONE family
+    of blocks, and the step slider walks each block through training instead of
+    scattering near-identical tags across the dashboard.
+
+    It refreshes the condition cards and `2_generation_with_f0_validation_XX`;
+    the null generation and the real reference are added by the metrics step,
+    which is the only place they are computed.
+
+    `n_samples` is sampling.n_audio_samples: how many panels to refresh, capped
+    by how many panels exist.
     """
     guidance = float(conditioning_cfg.guidance_scale)
+    from condition_metrics import sonify_condition
 
-    # Pick val-set indices to source the conditions from
     total = len(val_dataset)
-    indices = torch.linspace(0, total - 1, n_samples).long().tolist()
+    n_metrics = int(getattr(sampling_cfg, "n_metrics_samples", 512) or 512)
+    # The influence set, then the PREFIX of it this preview refreshes: index XX
+    # keeps meaning the same validation sample whether the block was last
+    # written by the metrics step or by this cheaper preview.
+    panel_pos = metrics_sample_positions(
+        n_metrics, influence_set_size(sampling_cfg))[:max(0, int(n_samples))]
+    # The metrics step generates from these val-dataset indices; the panel of
+    # position p describes val_dataset[indices[p]].
+    indices = torch.linspace(0, total - 1, n_metrics).long().tolist()
+    if not panel_pos or not frame_dims:
+        # No frame conditioning (or no panels): fall back to a plain spread over
+        # the validation set, still one panel per sample.
+        panel_pos = list(range(min(int(n_samples), total)))
+        indices = torch.linspace(0, total - 1,
+                                 max(1, min(int(n_samples), total))).long().tolist()
+    panel_pos = panel_pos[:max(1, int(n_samples))]
 
-    # Pre-generate latents
-    generated_frames = []
-    sample_class_names = []
-    for idx in indices:
-        _frames_real, frame_cond_real, label_idx, text_emb, image_emb = val_dataset[idx]
-        class_name = val_dataset.idx_to_label.get(label_idx, str(label_idx))
-        sample_class_names.append(class_name)
+    dac_model = get_dac()
 
-        # Build batch=1 conditions on device
-        fc = {k: v.unsqueeze(0).to(device).float() for k, v in frame_cond_real.items()}
+    for k, p in enumerate(panel_pos):
+        idx = indices[p] if p < len(indices) else indices[-1]
+        _frames_real, frame_cond_real, _label_idx, text_emb, image_emb = val_dataset[idx]
+
+        fc = {kk: v.unsqueeze(0).to(device).float()
+              for kk, v in frame_cond_real.items()}
         gc = {}
         if "text" in global_configs:
             gc["text"] = text_emb.unsqueeze(0).to(device)
@@ -763,37 +1073,31 @@ def generate_and_log_audio(
             frame_cond=fc, global_cond=gc, guidance=guidance,
             frame_dims=frame_dims, global_configs=global_configs,
         )
-        generated_frames.append(gen)
-
-    # Decode with DAC on CPU (shared singleton, loaded once for the whole run)
-    dac_model = get_dac()
-
-    for i, gen in enumerate(generated_frames):
         if not torch.isfinite(gen).all():
             continue
-        z = gen.T
-        z = normalizer.denormalize(z)
-        z_in = z.unsqueeze(0).float()
-        z_q, _, _ = dac_model.quantizer.from_latents(z_in)   # (1,72,T) -> (1,1024,T)
-        waveform = dac_model.decode(z_q).squeeze(0)
+
+        tags = audio_panel_tags("validation", k, frame_cond_real.keys())
+
+        # decode_frames_to_wav returns 1-D; unsqueeze back to (1, T), which is
+        # what add_audio expects.
+        waveform = decode_frames_to_wav(gen, normalizer, dac_model).unsqueeze(0)
         wn = waveform / (waveform.abs().max() + 1e-8)
 
-        writer.add_audio(
-            f"Validation/Audio_generated_{prefix}_{i:02d}", wn,
-            global_step=step, sample_rate=DAC_SAMPLE_RATE,
-        )
-        spec_img = make_spectrogram(
-            waveform, DAC_SAMPLE_RATE,
-            f"{prefix} sample {i} ({sample_class_names[i]}) - "
-            f"step {step} - guidance={guidance}",
-        )
-        writer.add_image(
-            f"Validation/Spectrogram_generated_{prefix}_{i:02d}",
-            spec_img, global_step=step,
-        )
+        # Same cards as the metrics step, written to the SAME tags: the f0
+        # target and the generation it produced are the first two cards of the
+        # block, each on its own player.
+        for cname, carr in sorted(frame_cond_real.items()):
+            son = sonify_condition(cname, carr.cpu().numpy(), DAC_SAMPLE_RATE)
+            if son is not None:
+                writer.add_audio(tags["conditions"][cname], norm_wav(son),
+                                 global_step=step,
+                                 sample_rate=DAC_SAMPLE_RATE)
+
+        writer.add_audio(tags["generation"], wn,
+                         global_step=step, sample_rate=DAC_SAMPLE_RATE)
 
         wav_path = os.path.join(
-            output_dir, f"step{step:07d}_{prefix}_{i:02d}.wav"
+            output_dir, f"step{step:07d}_{prefix}_{k:02d}.wav"
         )
         sf.write(wav_path, waveform.squeeze().numpy(), DAC_SAMPLE_RATE)
     # dac_model is the shared singleton -> do not delete it.
@@ -803,39 +1107,319 @@ def generate_and_log_audio(
 # LOG REAL AUDIO SAMPLES (once at startup, step=0)
 # ======================
 @torch.no_grad()
-def log_real_audio_samples(val_dataset, normalizer, writer, n_samples):
-    """Logs real audio from the val dataset for comparison on TensorBoard."""
+def log_real_audio_samples(val_dataset, normalizer, writer, n_samples,
+                           sampling_cfg=None, frame_dims=None):
+    """Logs the real audio of the PANEL samples at step 0, into the same
+    "ground truth" group the metrics step writes, so the reference is audible
+    from the start instead of only appearing at the first metrics step. The
+    card name carries the sample index, which is what ties it back to the
+    validation_XX block and to the f0 image of the same XX."""
     dac_model = get_dac()
 
     total = len(val_dataset)
-    indices = torch.linspace(0, total - 1, n_samples).long().tolist()
+    panel_pos, indices = [], []
+    if sampling_cfg is not None and frame_dims:
+        n_metrics = int(getattr(sampling_cfg, "n_metrics_samples", 512) or 512)
+        panel_pos = metrics_sample_positions(
+            n_metrics, influence_set_size(sampling_cfg))[:max(0, int(n_samples))]
+        indices = torch.linspace(0, total - 1, n_metrics).long().tolist()
+    if not panel_pos:
+        panel_pos = list(range(min(int(n_samples), total)))
+        indices = torch.linspace(0, total - 1,
+                                 max(1, min(int(n_samples), total))).long().tolist()
 
-    for i, idx in enumerate(indices):
-        # ConditionedAudioDataset returns a 5-tuple: take only frames + label
-        frames, _frame_cond, label_idx, _text_emb, _image_emb = val_dataset[idx]
-        class_name = val_dataset.idx_to_label.get(label_idx, str(label_idx))
-        z = frames.T
-        z = normalizer.denormalize(z)
-        z_in = z.unsqueeze(0).float()
-        z_q, _, _ = dac_model.quantizer.from_latents(z_in)   # (1,72,T) -> (1,1024,T)
-        waveform = dac_model.decode(z_q).squeeze(0)
+    for k, p in enumerate(panel_pos):
+        idx = indices[p] if p < len(indices) else indices[-1]
+        # ConditionedAudioDataset returns a 5-tuple: take only the frames
+        frames, _frame_cond, _label_idx, _text_emb, _image_emb = val_dataset[idx]
+        waveform = decode_frames_to_wav(frames, normalizer, dac_model).unsqueeze(0)
         wn = waveform / (waveform.abs().max() + 1e-8)
 
         writer.add_audio(
-            f"Validation/Audio_real_{i:02d}", wn,
+            audio_panel_tags("validation", k)["real"], wn,
             global_step=0, sample_rate=DAC_SAMPLE_RATE,
-        )
-        spec_img = make_spectrogram(
-            waveform, DAC_SAMPLE_RATE,
-            f"Real sample {i} ({class_name})",
-        )
-        writer.add_image(
-            f"Validation/Spectrogram_real_{i:02d}",
-            spec_img, global_step=0,
         )
 
     # dac_model is the shared singleton -> do not delete it.
-    print(f"  {n_samples} real audios logged on TensorBoard")
+    print(f"  {len(panel_pos)} real audios logged on TensorBoard")
+
+
+# ======================
+# OUT-OF-THE-BOX JOINT PROBE (proof of concept)
+# ======================
+@torch.no_grad()
+def run_joint_probe(probe_sets, model, normalizer, n_frames,
+                    step, writer, device,
+                    output_dir, use_amp, sampling_cfg, guidance,
+                    frame_dims, global_configs, fidelity_evaluator,
+                    dac_model, prefix, n_plot, n_audio,
+                    metrics_seed=None):
+    """
+    Generate conditioned on the out-of-the-box probe stimuli of EVERY active
+    condition AT ONCE, and report the result three ways.
+
+    `probe_sets` is {condition name -> ConditionProbeSet}. Panel i drives every
+    active condition with the i-th stimulus of its OWN bank: the f0 of a scale,
+    the chroma of a triad, the energy of a crescendo, the beat grid of a 120 bpm
+    pattern -- combined by index. The pairing is by index and therefore
+    arbitrary, but it is DETERMINISTIC, so panel 03 means the same combination
+    at every checkpoint and the curves stay comparable across steps.
+
+    WHY JOINTLY. A model trained on a fixed condition set with
+    `conditioning.p_drop_each_frame = 0.0` only ever sees TWO situations: all of
+    its conditions present, or all absent. Probing such a model one condition at
+    a time (the others nulled) asks it for a partial subset it was never trained
+    to resolve, so the answer would describe the hole in the training
+    distribution rather than the conditioning. The joint probe presents exactly
+    the shape the model was trained on, which is what makes it readable.
+
+    WHY THE COMBINATION IS NOT "ALIGNED". The stimuli come from DIFFERENT banks
+    and are not mutually consistent (a rising scale under a static triad). That
+    is deliberate. The probe is an out-of-the-box controllability check on
+    unambiguous stimuli: it answers "does this conditioning move the generation
+    at all", which the validation rows cannot answer alone -- on real material a
+    condition is often not cleanly extractable (a smeared chromagram, a beat
+    grid that does not exist, an f0 that fails on 3 samples out of 4) and a
+    middling score there does not separate "the conditioning is weak" from "the
+    target was ambiguous". The validation rows carry the aligned, in-corpus
+    case; the probe carries the clean, artificial one. Both are needed and
+    neither replaces the other.
+
+    What it logs, all at `step` so the TensorBoard slider walks them together:
+      * IMAGES  Validation/<cond>_probe_vs_gen_XX -- target vs re-extracted,
+                one per active condition, titled with the stimulus it used
+      * AUDIO   the probe_XX/ block: one card per condition holding the stimulus
+                that condition was taken from, then the generation they jointly
+                conditioned. The null generation goes to the "uncond generation"
+                group with the others.
+      * TEXT    a <cond>_probe row per condition for the Condition_influence
+                table, returned to the caller as (influence, coverage) to be
+                merged in, plus a Probe_combinations panel saying which stimuli
+                each panel puts together.
+
+    The delta column needs a baseline, so the generation is PAIRED (with-cond
+    and null from the same x0, one fused batch) exactly like the validation
+    metrics -- the null generations cost nothing extra, they are already
+    required by the CFG math.
+
+    `fidelity_evaluator` is reused (reset first) rather than rebuilt: it carries
+    the run's exact extractor configuration, and instantiating a second CREPE
+    would risk the two drifting apart. The caller must therefore have already
+    taken its per_sample()/coverage()/contours() copies for the validation rows.
+    """
+    from condition_metrics import pair_influence
+    # f0 keeps its own dedicated plot (log-Hz axis + voicing ribbon); the other
+    # conditions are drawn by the generic plotter, which picks the form that
+    # suits the shape (curve / two curves / paired heatmaps).
+    from probe_conditions import plot_condition_comparison
+
+    # Only conditions the MODEL actually has: a bank for a condition this run
+    # does not use would be fed into a slot that does not exist.
+    names = [c for c in (frame_dims or {}) if c in (probe_sets or {})]
+    if not names:
+        return {}, {}
+    missing = [c for c in (frame_dims or {}) if c not in (probe_sets or {})]
+    if missing:
+        # Not fatal, but it means those slots go in NULL and the probe is no
+        # longer the in-distribution shape described above -- say so loudly.
+        print(f"    [probe] WARNING: no bank for {missing}; those conditions "
+              f"go in NULL, so this probe is a partial subset")
+
+    # The panels are index-aligned across banks, so the count is the shortest.
+    n_probe = min(len(probe_sets[c]) for c in names)
+    if n_probe == 0:
+        return {}, {}
+    n_plot = max(0, min(int(n_plot), n_probe))
+
+    targets = {c: [np.asarray(t, dtype=np.float32)
+                   for t in probe_sets[c].targets] for c in names}
+
+    def _frame_cond(idxs):
+        # Every configured name must be present (FrameConditionEncoder.forward),
+        # so start from the null dict and fill the ones this probe drives.
+        fc = make_null_frame_conditions(len(idxs), n_frames, frame_dims or {},
+                                        device)
+        for c in names:
+            fc[c] = torch.from_numpy(
+                np.stack([targets[c][i] for i in idxs])).to(device).float()
+        return fc
+
+    # Same seeding contract as the validation metrics: a fixed generator makes
+    # the probe curves comparable ACROSS checkpoints (what moves is the model,
+    # not the noise). None = free-running.
+    def _rng():
+        if metrics_seed is None:
+            return None
+        g = torch.Generator(device=device)
+        g.manual_seed(int(metrics_seed))
+        return g
+
+    spf = max(1, int(sampling_cfg.get("metrics_samples_per_forward", 1) or 1))
+    # The probe's baseline is ITS OWN: n_probe generations without conditions,
+    # from the same x0 as the conditioned ones. It has nothing to do with
+    # sampling.metrics_uncond, which decides whether the DISTRIBUTIONAL metrics
+    # (FD-DAC / KL / FAD) are also computed on the unconditioned branch over
+    # n_metrics_samples. Tying the two, as this line used to, meant switching off
+    # a 512-generation metric silently removed the delta column of the probe --
+    # the very number the probe exists to produce.
+    paired = guidance > 1.0
+
+    cond_lat, null_lat = [], []
+    gen_rng = _rng()
+    if paired:
+        for s in range(0, n_probe, spf):
+            grp = list(range(s, min(s + spf, n_probe)))
+            gc, gu = euler_sample_cfg_paired(
+                model, n_frames, device,
+                steps=sampling_cfg.euler_steps,
+                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
+                use_amp=use_amp,
+                frame_cond=_frame_cond(grp), global_cond={}, guidance=guidance,
+                frame_dims=frame_dims, global_configs=global_configs,
+                gen_rng=gen_rng,
+            )
+            cond_lat.extend(gc)
+            null_lat.extend(gu)
+    else:
+        # No baseline available (guidance <= 1, so there is no CFG to fuse and
+        # no unconditioned branch to compare against). The row is then reported
+        # UNPAIRED: with-cond only, delta as n/a -- never as if a baseline had
+        # been measured.
+        for i in range(n_probe):
+            cond_lat.append(euler_sample_cfg(
+                model, n_frames, device,
+                steps=sampling_cfg.euler_steps,
+                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
+                use_amp=use_amp,
+                frame_cond=_frame_cond([i]), global_cond={}, guidance=guidance,
+                frame_dims=frame_dims, global_configs=global_configs,
+                gen_rng=gen_rng,
+            ))
+
+    # ---- score + collect the curves, one decode per generation ----
+    # add_sample receives EVERY condition of the panel, so one decode scores all
+    # of them and the table gets a row per condition from a single pass.
+    def _score(lat_list, keep):
+        fidelity_evaluator.reset()
+        fidelity_evaluator.keep_contours_for(range(n_plot) if keep else ())
+        wavs = []
+        for i, lat in enumerate(lat_list):
+            wav = decode_frames_to_wav(lat, normalizer, dac_model)
+            fidelity_evaluator.add_sample(
+                wav.numpy(), DAC_SAMPLE_RATE, n_frames,
+                {c: targets[c][i] for c in names}, sample_id=i)
+            wavs.append(wav if i < n_plot else None)
+        return (fidelity_evaluator.per_sample(), fidelity_evaluator.coverage(),
+                {c: fidelity_evaluator.contours(c) for c in names}, wavs)
+
+    ps_cond, cov_cond, cont_cond, wavs_cond = _score(cond_lat, keep=True)
+    # Both defaults matter: with no null pass (metrics_uncond off, or guidance
+    # <= 1) the audio loop below still asks for len(wavs_null).
+    ps_null, wavs_null = {}, []
+    if null_lat:
+        # The null pass contributes only its per-sample values: `attempted` and
+        # the failure counts in the panel describe the CONDITIONED pass, which
+        # is the one the row is about.
+        ps_null, _cn, _ct, wavs_null = _score(null_lat, keep=False)
+
+    # ---- IMAGES + AUDIO for the first n_plot panels ----
+    # One TensorBoard PANEL per probe index: the stimuli it was conditioned on
+    # and the generation sit under the SAME tag prefix, so the audio window
+    # cannot separate a generation from the conditions that produced it.
+    for i in range(n_plot):
+        # The score shown in each plot title is that condition's FIRST metric,
+        # whatever it is called (f0/energy -> corr, chroma -> cosine,
+        # rhythm -> beat_corr): the probe must not hardcode a metric name that
+        # only some conditions have.
+        for c in names:
+            _mkeys = sorted(k for k in ps_cond if k.startswith(f"{c}/"))
+            corr_map = ps_cond.get(_mkeys[0], {}) if _mkeys else {}
+            if i in cont_cond.get(c, {}):
+                tgt, gen = cont_cond[c][i]
+                writer.add_image(
+                    # Same block name as this panel's AUDIO tags, so the Images
+                    # and Audio tabs collapse into the same per-sample sections
+                    # instead of one flat list of every condition x every panel.
+                    f"probe_{i:02d}/{c}_target_vs_gen",
+                    plot_condition_comparison(
+                        c, tgt, gen, kind="probe",
+                        label=f"'{probe_sets[c].names[i]}'", step=step,
+                        prefix=prefix, guidance=guidance,
+                        score=corr_map.get(i)),
+                    global_step=step)
+
+        tags = audio_panel_tags("probe", i, names)
+
+        # The stimuli are re-logged at every probe step even though they never
+        # change -- the audio slider shows the value AT the selected step, so a
+        # card written once would be empty at every later step. They are logged
+        # unconditionally, including when nothing was generated: the card is
+        # what keeps a failed panel visible instead of silently absent. Each is
+        # logged at its OWN bank's rate, which need not be the DAC's.
+        for c in names:
+            writer.add_audio(tags["conditions"][c],
+                             norm_wav(probe_sets[c].wav(i)),
+                             global_step=step, sample_rate=probe_sets[c].sr)
+        if wavs_cond[i] is not None:
+            writer.add_audio(tags["generation"], norm_wav(wavs_cond[i]),
+                             global_step=step, sample_rate=DAC_SAMPLE_RATE)
+            sf.write(os.path.join(_probe_dir(output_dir, step),
+                                  f"probe_{i:02d}.wav"),
+                     wavs_cond[i].numpy(), DAC_SAMPLE_RATE)
+        # The null generation of the SAME panel, on its own card: it is the
+        # baseline the influence row is computed against, and what it has to be
+        # told apart from is the card beside it.
+        if i < len(wavs_null) and wavs_null[i] is not None:
+            # Card bounded by n_audio_samples, like its validation twin: the
+            # "uncond generation" group is listening material, so it gets n per
+            # family rather than one per panel. The .wav is written for every
+            # panel regardless -- on disk the baseline of panel 07 has to exist
+            # even when only the first few are worth a card.
+            if i < n_audio:
+                writer.add_audio(tags["generation_no_cond"], norm_wav(wavs_null[i]),
+                                 global_step=step, sample_rate=DAC_SAMPLE_RATE)
+            sf.write(os.path.join(_probe_dir(output_dir, step),
+                                  f"probe_{i:02d}_uncond.wav"),
+                     wavs_null[i].numpy(), DAC_SAMPLE_RATE)
+
+    # ---- which stimuli each panel combines ----
+    # The tags carry only the index, so the mapping has to be written somewhere
+    # readable; without it "probe_03" is unidentifiable in the audio window.
+    combo = ["| Panel | " + " | ".join(f"`{c}`" for c in names) + " |",
+             "|---" * (len(names) + 1) + "|"]
+    for i in range(n_probe):
+        combo.append(f"| **{i:02d}** | "
+                     + " | ".join(probe_sets[c].names[i] for c in names) + " |")
+    writer.add_text("Validation/Probe_combinations",
+                    "**Out-of-the-box probe panels** - each row is one joint "
+                    "stimulus set, combined BY INDEX across the per-condition "
+                    "banks and deliberately not mutually aligned.\n\n"
+                    + "\n".join(combo), global_step=step)
+
+    # ---- the influence rows, renamed so they read as their own axis ----
+    # pair_influence keys off the condition name; renaming to "<cond>_probe" is
+    # what keeps a probe row from being mistaken for the validation row of the
+    # same condition in the same table.
+    inf, cov = pair_influence(ps_cond, ps_null, coverage_cond=cov_cond,
+                              have_null=bool(null_lat))
+    rows = {f"{c}_probe": inf[c] for c in names if inf.get(c)}
+    if not rows:
+        # Every re-extraction failed. Say so on the console rather than adding an
+        # empty block that renders as no row at all -- "the probe is missing from
+        # the table" and "the probe scored nothing" must not look the same.
+        print("    [probe] no measurable generation -- no probe row this step")
+        return {}, {}
+    coverage = {}
+    for c in names:
+        coverage.update({k.replace(f"{c}/", f"{c}_probe/", 1): v
+                         for k, v in cov.items() if k.startswith(f"{c}/")})
+    return rows, coverage
+
+
+def _probe_dir(output_dir, step):
+    d = os.path.join(output_dir, f"step_{step:07d}", "probe")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 # ======================
@@ -848,7 +1432,9 @@ def evaluate_and_log_metrics(
     sampling_cfg, conditioning_cfg, use_amp,
     frame_dims, global_configs,
     fidelity_evaluator=None, clap_audio_embedder=None, compute_uncond=True,
-    prefix="EMA", metrics_seed=None, metrics_enabled=DAC_METRICS,
+    prefix="EMA", metrics_seed=None, metrics_enabled=COND_METRICS,
+    fad_embedder=None, fad_ref_stats=None, n_fad=0, fad_device="cuda",
+    probe_sets=None,
 ):
     """
     Computes the full validation metric suite on a FIXED subset of the val set
@@ -868,7 +1454,7 @@ def evaluate_and_log_metrics(
 
       3. CONDITION INFLUENCE       -> Validation/Condition_influence (text panel)
          Paired delta: re-extract each condition from the conditioned AND the
-         null generations, score adherence on both (melody RPA/RCA, chroma
+         null generations, score adherence on both (f0 corr, chroma
          cosine, rhythm/energy correlation, text CLAP audio-text cosine), and
          report Δ = with-cond - null. Answers "how much does the condition pull
          the generation toward its target?". Consolidated into a single Markdown
@@ -879,7 +1465,7 @@ def evaluate_and_log_metrics(
     FD-DAC and KL (both directions, real||gen and gen||real) share the SAME real
     validation latent reference (fd_dac_ref_stats) in both the cond and uncond
     cases; the distributional metrics are latent-only (audio is decoded only for
-    the influence re-extraction and the audio/spectrogram previews). `prefix`
+    the influence re-extraction and the audio previews). `prefix`
     ("EMA" / "Model") tags the previews by the generating weights. Returns
     (fd_dac_cond, kl_cond_real_gen, kl_cond_gen_real) for the caller.
     """
@@ -887,7 +1473,41 @@ def evaluate_and_log_metrics(
     n_frames = val_dataset.n_frames
     total = len(val_dataset)
     indices = torch.linspace(0, total - 1, n_samples).long().tolist()
-    n_log = min(2, n_samples)   # how many samples to log richly (audio/specs/rolls)
+    # ---- WHICH samples get the rich treatment (comparison plot + audio panel) ----
+    # Resolved BEFORE the generation pass, because the REAL latent of those
+    # samples has to be captured while it runs.
+    frame_active = (fidelity_evaluator is not None and fidelity_evaluator.active)
+    text_active  = ("text" in (global_configs or {})) and (clap_audio_embedder is not None)
+    influence_active = frame_active or text_active
+
+    n_val_save  = int(getattr(sampling_cfg, "n_val_save", 8) or 8)
+    n_influence = influence_set_size(sampling_cfg)
+    # The two COLLECTED audio groups -- "ground truth" (the recordings) and
+    # "uncond generation" (the same model with no conditions) -- are listening
+    # material, not diagnostics, so they have their own size: n_audio_samples.
+    # They are a PREFIX of the influence set, so real_validation_03 is still the
+    # recording that block validation_03 was conditioned from.
+    n_audio = int(getattr(sampling_cfg, "n_audio_samples", 4) or 0)
+    n_fid = min(n_influence, n_samples) if influence_active else 0
+    # THE influence set: the same N validation samples are scored, plotted and
+    # played. plot_ids IS fid_pos -- every scored sample owns a panel, so the
+    # table, the Images window and the Audio window all describe one set.
+    fid_pos = metrics_sample_positions(
+        n_samples, n_influence if influence_active else 0)
+    plot_ids = list(fid_pos) if frame_active else []
+    n_log = min(2, n_samples)   # how many samples to log richly (audio/real)
+    log_ids = sorted(set(range(n_log)) | set(plot_ids))
+    log_id_set = set(log_ids)
+    n_keep = max(n_val_save, n_log)
+
+    # ---- CONDITION SUBSETS (condition-combination influence) ----
+    # Each subset is a full extra generation pass over n_samples, so the cost of
+    # the metrics step is linear in how many are asked for. They are all scored
+    # against the SAME null pass, which is what makes their deltas comparable.
+    subset_specs = []
+    if influence_active and frame_active:
+        subset_specs = resolve_influence_subsets(
+            sampling_cfg.get("influence_subsets", None), list(frame_dims or {}))
 
     ref_frames = (fd_dac_ref_stats["n_total"]
                   if fd_dac_ref_stats is not None else "n/a")
@@ -899,10 +1519,15 @@ def evaluate_and_log_metrics(
     # ---- generate n_samples latents, conditioned or unconditional ----
     # For the conditioned pass we also keep, for the first n_log samples, the
     # real latent (to decode the real audio) and the target condition.
-    def _generate(conditioned):
+    def _generate(conditioned, subset=None):
+        """`subset`: when given, only these frame conditions are handed to the
+        model; the others are left out and the network zero-fills them, which is
+        the same null the CFG dropout used at training time. The TARGETS kept
+        for scoring stay the FULL set either way -- measuring a condition that
+        was not given is exactly how its side effects show up."""
         lat_list = []
         targets = []        # paired frame conditions (cpu numpy); cond only
-        real_frames = []    # real latents of the first n_log samples; cond only
+        real_frames = {}    # real latents of log_ids, keyed by generation index
         global_targets = [] # paired global conds (text/image emb); cond only
         # Dedicated, isolated RNG for the metric noise so FD/KL are comparable
         # across checkpoints (mirrors the uncond metrics seed). Re-seeded at the
@@ -916,7 +1541,8 @@ def evaluate_and_log_metrics(
             frames_real, frame_cond_real, _lab, text_emb, image_emb = val_dataset[idx]
             if conditioned:
                 fc = {k: v.unsqueeze(0).to(device).float()
-                      for k, v in frame_cond_real.items()}
+                      for k, v in frame_cond_real.items()
+                      if subset is None or k in subset}
                 gc = {}
                 if "text" in global_configs:
                     gc["text"] = text_emb.unsqueeze(0).to(device)
@@ -929,8 +1555,8 @@ def evaluate_and_log_metrics(
                     "text":  text_emb.cpu().numpy()  if "text"  in global_configs else None,
                     "image": image_emb.cpu().numpy() if "image" in global_configs else None,
                 })
-                if j < n_log:
-                    real_frames.append(frames_real)
+                if j in log_id_set:
+                    real_frames[j] = frames_real
             else:
                 fc, gc, g = None, None, 1.0
             gen = euler_sample_cfg(
@@ -953,7 +1579,7 @@ def evaluate_and_log_metrics(
         the same cond-side extras (targets / real_frames / global_targets) as the
         conditioned _generate."""
         cond_list, unc_list = [], []
-        targets, real_frames, global_targets = [], [], []
+        targets, real_frames, global_targets = [], {}, []
         gen_rng = None
         if metrics_seed is not None:
             gen_rng = torch.Generator(device=device)
@@ -970,8 +1596,8 @@ def evaluate_and_log_metrics(
                     "text":  text_emb.cpu().numpy()  if "text"  in global_configs else None,
                     "image": image_emb.cpu().numpy() if "image" in global_configs else None,
                 })
-                if j < n_log:
-                    real_frames.append(frames_real)
+                if j in log_id_set:
+                    real_frames[j] = frames_real
             # stack the group's conditions -> batch `len(group)`
             fc = {k: torch.stack([d[k] for d in fcs]).to(device).float()
                   for k in (fcs[0].keys() if fcs else [])}
@@ -995,10 +1621,7 @@ def evaluate_and_log_metrics(
 
     # ---- DAC decode helpers (model loaded once, reused) ----
     def _decode_one(frames, dac_model):
-        z = normalizer.denormalize(frames.T)
-        z_q, _, _ = dac_model.quantizer.from_latents(z.unsqueeze(0).float())
-        wav = dac_model.decode(z_q).squeeze()
-        return wav.cpu()
+        return decode_frames_to_wav(frames, normalizer, dac_model)
 
     def _decode(lat_list, dac_model):
         return [_decode_one(f, dac_model) for f in lat_list]
@@ -1009,7 +1632,7 @@ def evaluate_and_log_metrics(
     # Distributional metrics (FD-DAC + KL both directions) are latent-only and
     # share the SAME real reference (fd_dac_ref_stats). The DAC decode below is
     # needed ONLY for conditioning fidelity (re-extract from audio) and for the
-    # rich audio/spectrogram logging -- NOT for the distributional metrics.
+    # rich audio logging -- NOT for the distributional metrics.
     # `sampling.metrics_samples_per_forward` (spf) is the ONE knob for the metrics
     # generation, and it maps directly onto VRAM:
     #   0 -> do not fuse: reference serial path (lowest peak, slowest)
@@ -1021,7 +1644,15 @@ def evaluate_and_log_metrics(
     # or no condition is active (pure-unconditional run).
     any_cond_active = bool(frame_dims) or bool(global_configs)
     spf = int(sampling_cfg.get("metrics_samples_per_forward", 1))
-    paired = (spf >= 1 and compute_uncond and (guidance > 1.0) and any_cond_active)
+    # NOT gated on compute_uncond. Under CFG the unconditional velocity is
+    # computed at every step anyway (that IS the CFG math), so integrating it
+    # into a null LATENT is essentially free -- and that null is the baseline the
+    # condition-influence delta is measured against. Tying it to metrics_uncond,
+    # as this line used to, meant switching off a distributional metric silently
+    # emptied the delta column of the influence table.
+    # metrics_uncond now decides only whether the uncond DISTRIBUTIONAL metrics
+    # (Fd_dac_uncond / Kl_uncond / Fad_vggish_uncond) are computed and logged.
+    paired = (spf >= 1 and (guidance > 1.0) and any_cond_active)
     _unc_pre = None
     if paired:
         cond_lat, cond_targets, real_frames, cond_globals, _unc_pre = _generate_paired(spf)
@@ -1052,16 +1683,17 @@ def evaluate_and_log_metrics(
     # The null generations serve two roles: the uncond distributional metrics,
     # AND the baseline for the condition-INFLUENCE measure (how much closer to
     # the target the conditioned generation gets vs the unconditioned one).
-    frame_active = (fidelity_evaluator is not None and fidelity_evaluator.active)
-    text_active  = ("text" in (global_configs or {})) and (clap_audio_embedder is not None)
-    influence_active = frame_active or text_active
+    # frame_active / text_active / influence_active: hoisted above.
 
     fd_dac_uncond = None
     kl_uncond = {"kl_real_gen": None, "kl_gen_real": None}
-    unc_lat = []
+    # The null latents themselves are needed by the INFLUENCE baseline whatever
+    # metrics_uncond says; what metrics_uncond gates is scoring them
+    # distributionally (an extra FD/KL pass, and n_fad more DAC decodes below).
+    unc_lat = _unc_pre if _unc_pre is not None else []
     if compute_uncond:
-        # reuse the paired uncond latents if already generated, else generate now
-        unc_lat = _unc_pre if _unc_pre is not None else _generate(conditioned=False)[0]
+        if not unc_lat:
+            unc_lat = _generate(conditioned=False)[0]
         unc_stack = torch.stack(unc_lat)
         if has_ref:
             _mu = compute_dac_metrics(unc_stack, fd_dac_ref_stats,
@@ -1075,19 +1707,18 @@ def evaluate_and_log_metrics(
 
     # ===== AUDIO PART: STREAMED, memory-flat (this is the OOM fix) =====
     # FD-DAC/KL above are latent-only over ALL n_samples (cheap). The AUDIO part
-    # (DAC decode + re-extraction via basic-pitch/librosa + CLAP) is the
+    # (DAC decode + re-extraction via CREPE/librosa + CLAP) is the
     # RAM-hungry step. Instead of decoding ALL generations into a big list and
     # re-extracting from all of them at once (which OOM-kills the process at
     # large n_metrics_samples), we STREAM it: decode ONE generation -> re-extract
     # its descriptors -> ACCUMULATE the metric -> DISCARD the waveform. Peak RAM
     # is therefore independent of how many samples we score, so n_influence_samples
-    # can be raised freely -- the only cost of raising it is TIME (basic-pitch
+    # can be raised freely -- the only cost of raising it is TIME (the extractor
     # runs once per sample). We still HOLD the first n_keep decoded waveforms,
     # which are needed for the disk dump (n_val_save) and the TB previews (n_log).
-    n_val_save  = int(getattr(sampling_cfg, "n_val_save", 8) or 8)
-    n_influence = int(getattr(sampling_cfg, "n_influence_samples", 64) or 64)
-    n_keep = max(n_val_save, n_log)
-    n_fid  = min(n_influence, n_samples) if influence_active else 0
+    # n_val_save / n_influence / n_fid / n_keep were resolved above, before
+    # the generation pass: the audio panels need to know WHICH samples they
+    # describe in time to capture their real latent.
 
     dac_model = get_dac()    # load-once singleton (shared across the whole run)
 
@@ -1108,76 +1739,187 @@ def evaluate_and_log_metrics(
         CREPE work -- only WHICH samples are scored changes.
         """
         n_lat = len(lat_list)
-        fid_pos = []
-        if n_fid > 0 and n_lat > 0:
-            fid_pos = sorted(set(
-                torch.linspace(0, n_lat - 1, min(n_fid, n_lat))
-                .round().long().tolist()))
-        fid_set = set(fid_pos)
-        keep_set = set(range(min(n_keep, n_lat)))
+        # fid_pos was resolved once, before the generation pass, from n_samples;
+        # both passes score identically-sized lists, so the positions match and
+        # pair_influence can compare sample by sample.
+        pos = [p for p in fid_pos if p < n_lat]
+        fid_set = set(pos)
+        # The panel samples are KEPT even when they fall outside the first
+        # n_keep: their waveform is what the audio panel plays next to the image
+        # of the same sample. Cost: at most N extra waveforms in RAM.
+        keep_set = set(range(min(n_keep, n_lat))) | {p for p in plot_ids if p < n_lat}
         if frame_active:
             fidelity_evaluator.reset()
-        clap_sims, kept = [], []
+            # Retain the raw curves of the panel positions, for the TensorBoard
+            # comparison plots. plot_ids is deterministic, so these are the SAME
+            # validation samples at every metrics step and the plots can be read
+            # as a time series.
+            fidelity_evaluator.keep_contours_for(plot_ids)
+        clap_sims, kept = {}, {}
         for i in sorted(fid_set | keep_set):           # decode each index ONCE
             wav = _decode_one(lat_list[i], dac_model)  # decode ONE
             if i in fid_set:
                 wn = wav.numpy()
                 if frame_active:
+                    # sample_id=i: the conditioned and the null pass score the
+                    # SAME positions of the same list, so tagging with i is what
+                    # lets pair_influence compare them sample by sample instead
+                    # of mean against mean.
                     fidelity_evaluator.add_sample(
-                        wn, DAC_SAMPLE_RATE, n_frames, cond_targets[i])
+                        wn, DAC_SAMPLE_RATE, n_frames, cond_targets[i],
+                        sample_id=i)
                 if text_active:
                     t = cond_globals[i].get("text") if i < len(cond_globals) else None
                     if t is not None:
                         emb = clap_audio_embedder.embed(wn, DAC_SAMPLE_RATE)
-                        clap_sims.append(float(np.dot(emb, t)))
+                        clap_sims[i] = float(np.dot(emb, t))
             if i in keep_set:
-                kept.append(wav)                       # sorted -> order preserved
+                kept[i] = wav              # keyed by index: the kept set is not
+                                           # a prefix any more
             # else: wav is dropped here -> RAM stays flat regardless of n_fid
-        fid  = fidelity_evaluator.results() if frame_active else {}
-        # coverage travels WITH the means: reporting a score without saying how
-        # many samples reached it is how failures disappear from the numbers.
+        # PER-SAMPLE values, not means: the two passes are averaged only AFTER
+        # being intersected (pair_influence). Coverage travels with them --
+        # reporting a score without saying how many samples reached it is how
+        # failures disappear from the numbers.
+        per  = fidelity_evaluator.per_sample() if frame_active else {}
         cov  = fidelity_evaluator.coverage() if frame_active else {}
-        clap = float(np.mean(clap_sims)) if clap_sims else None
-        return fid, clap, kept, len(fid_pos), cov
+        # ALL conditions, not just f0: the comparison images are drawn for
+        # every active condition, so the curves of every one have to come back.
+        cont = fidelity_evaluator.contours() if frame_active else {}
+        return per, clap_sims, kept, len(pos), cov, cont
 
     if influence_active:
         print(f"    measuring condition influence on "
               f"{min(n_fid, len(cond_lat))} generations "
               f"(uniformly spread, streamed, memory-flat)...")
-    fid_cond, sim_cond, cond_wavs, n_fid_used, cov_cond = _stream_audio(cond_lat)
-    fid_null, sim_null, unc_wavs, cov_cond_null = {}, None, [], {}
-    if compute_uncond and unc_lat:
+    ps_cond, clap_cond, cond_wavs, n_fid_used, cov_cond, cont_cond = \
+        _stream_audio(cond_lat)
+    ps_null, clap_null, unc_wavs = {}, {}, {}
+    have_null = False
+    if unc_lat:
         if not any_cond_active:
             # Pure-unconditional run: unc_lat IS cond_lat (reused above), so the
             # decoded waveforms are identical -- reuse them instead of running the
             # DAC decoder (CPU-bound) a second time over the same latents.
             unc_wavs = cond_wavs
         else:
-            fid_null, sim_null, unc_wavs, _, cov_cond_null = _stream_audio(unc_lat)
+            ps_null, clap_null, unc_wavs, _, _, _ = _stream_audio(unc_lat)
+            have_null = True
+
+    # ===== PER-SUBSET GENERATIONS (condition-combination influence) =====
+    # One extra generation pass per subset, each scored against the SAME null
+    # pass computed above -- a shared baseline is what lets the rows of the
+    # matrix be compared with one another. The "all" subset is not regenerated:
+    # the conditioned pass above already IS it, bit for bit.
+    # Latents are dropped as soon as a subset has been scored, so peak memory
+    # does not grow with the number of subsets (only the time does).
+    subset_entries = []          # [(label, per_sample, coverage)]
+    subset_wavs = {}             # label -> {sample id: waveform} for the panels
+    if subset_specs and have_null:
+        _full = tuple(frame_dims or {})
+        for _lab, _names in subset_specs:
+            if _names == _full:
+                subset_entries.append((_lab, ps_cond, cov_cond))
+                subset_wavs[_lab] = cond_wavs
+                continue
+            print(f"    subset '{_lab}' [{'+'.join(_names)}]: "
+                  f"{n_samples} generations...")
+            _slat, _st, _srf, _sg = _generate(conditioned=True,
+                                              subset=set(_names))
+            _sps, _scl, _swav, _sn, _scov, _scont = _stream_audio(_slat)
+            subset_entries.append((_lab, _sps, _scov))
+            subset_wavs[_lab] = _swav
+            del _slat
+            if device == "cuda":
+                torch.cuda.empty_cache()
+    elif subset_specs:
+        print("    [subsets] skipped: they are deltas against the null pass, "
+              "and no null pass was generated (sampling.metrics_uncond=false "
+              "or guidance <= 1).")
+
+    # ===== FAD (VGGish) on the DECODED generations =====
+    # Latent-only metrics (FD-DAC / KL) score the DAC latent space; the FAD
+    # scores the AUDIO, through an embedder trained on real recordings, which is
+    # what the controllable-music literature reports. It therefore costs a DAC
+    # decode + a VGGish forward per sample, on top of everything above -- that is
+    # what sampling.n_fad_samples bounds. The statistics are accumulated as
+    # running sums (compute_audio_mu_sigma), so the peak memory does not grow
+    # with the sample count: raising it costs TIME, not RAM.
+    fad_cond = fad_uncond = None
+    if fad_embedder is not None and fad_ref_stats is not None and cond_lat:
+        n_fad_use = min(int(n_fad or 0), len(cond_lat))
+        if n_fad_use > 0:
+            fad_pos = sorted(set(
+                torch.linspace(0, len(cond_lat) - 1, n_fad_use)
+                .round().long().tolist()))
+
+            def _fad_clips(lat_list):
+                for i in fad_pos:
+                    yield (_decode_one(lat_list[i], dac_model).view(1, 1, -1),
+                           DAC_SAMPLE_RATE)
+
+            print(f"    FAD-VGGish on {len(fad_pos)} generations "
+                  f"(decode + embed, streamed)...")
+            _mu, _sig, _nv = compute_audio_mu_sigma(
+                _fad_clips(cond_lat), len(fad_pos), fad_embedder,
+                device=fad_device, desc="FAD cond")
+            fad_cond = compute_fad(_mu, _sig, fad_ref_stats, device=fad_device)
+            print(f"    FAD-VGGish cond: {len(fad_pos)} clips -> {_nv} embedding "
+                  f"vectors (128-D)")
+            if compute_uncond and unc_lat:
+                if not any_cond_active:
+                    # pure-unconditional run: the two lists ARE the same latents
+                    fad_uncond = fad_cond
+                else:
+                    _mu, _sig, _ = compute_audio_mu_sigma(
+                        _fad_clips(unc_lat), len(fad_pos), fad_embedder,
+                        device=fad_device, desc="FAD uncond")
+                    fad_uncond = compute_fad(_mu, _sig, fad_ref_stats,
+                                             device=fad_device)
+            del _mu, _sig
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
     del cond_lat, unc_lat    # latents no longer needed
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    # ===== CONDITION INFLUENCE (delta: with-cond vs null, paired) =====
+    # ===== CONDITION INFLUENCE (delta: with-cond vs null, PAIRED) =====
     # influence[cond_name][metric] = {"cond":.., "null":.., "delta":..}.
     # delta>0 means the condition pulled the generation toward its target. Built
     # only from the conditions ACTIVE in this run (registry-driven).
-    influence = {}
+    #
+    # All three columns are averaged over the SAME samples: those where the
+    # re-extraction produced a finite value on BOTH the conditioned and the null
+    # generation. Averaging each pass over "whatever survived in that pass" and
+    # subtracting would compare two means computed on two different sample sets,
+    # so a moving delta could come entirely from moving denominators. The
+    # coverage column reports the paired count and how many samples the pairing
+    # had to drop.
+    from condition_metrics import pair_influence, pair_scalar
+    influence, cov_paired = {}, {}
     if frame_active:
-        for key, cval in fid_cond.items():
-            name, _, metric = key.partition("/")
-            nval = fid_null.get(key)
-            influence.setdefault(name, {})[metric] = {
-                "cond": cval,
-                "null": nval,
-                "delta": (cval - nval) if (nval is not None) else None,
-            }
+        influence, cov_paired = pair_influence(
+            ps_cond, ps_null, coverage_cond=cov_cond, have_null=have_null)
+
+    # Each subset is paired against the SAME null pass as the reference above,
+    # so every row of the matrix is a delta over one shared baseline and the
+    # rows can be read against each other.
+    subset_tables = []
+    for _lab, _sps, _scov in subset_entries:
+        _sinf, _scovp = pair_influence(_sps, ps_null, coverage_cond=_scov,
+                                       have_null=have_null)
+        subset_tables.append((_lab, _sinf, _scovp))
     if text_active:
+        c_sim, n_sim, d_sim, n_pair = pair_scalar(
+            clap_cond, clap_null, have_null=have_null)
         influence["text"] = {"clap_sim": {
-            "cond": sim_cond, "null": sim_null,
-            "delta": (sim_cond - sim_null) if (sim_cond is not None and sim_null is not None) else None,
-        }}
+            "cond": c_sim, "null": n_sim, "delta": d_sim}}
+        cov_paired["text/clap_sim"] = {
+            "valid": n_pair,
+            "attempted": len(clap_cond),
+            "unpaired": (len(set(clap_cond) ^ set(clap_null)) if have_null else 0),
+        }
 
     # ---- image (CLIP): no direct audio<->CLIP metric available ----
     # Measuring image-condition influence on AUDIO needs an audio-visual model
@@ -1188,6 +1930,87 @@ def evaluate_and_log_metrics(
             "cond": None, "null": None, "delta": None,
             "note": "needs audio-visual model (e.g. Wav2CLIP)",
         }}
+
+    # ===== COMPARISON PLOTS, ONE PER ACTIVE CONDITION (IMAGES panel) =====
+    # Target vs the same quantity re-extracted from the generation it
+    # conditioned. The re-extraction ALREADY happened inside _stream_audio (it
+    # is what produces the table's rows); the evaluator was merely asked to keep
+    # the curves for these few samples instead of only the scalar they collapse
+    # into, so these plots cost NO extra generation and no extra extractor pass.
+    #
+    # Every active condition gets the same treatment -- f0_valid_vs_gen_XX,
+    # energy_valid_vs_gen_XX, chroma_valid_vs_gen_XX, rhythm_valid_vs_gen_XX --
+    # and each has a matching <cond>_probe_vs_gen_XX from the probe, so an
+    # ablation run on any single condition is read exactly the way the f0 one is.
+    if cont_cond and plot_ids:
+        from probe_conditions import plot_condition_comparison
+        for _cname in sorted(frame_dims or {}):
+            _cc = cont_cond.get(_cname, {})
+            if not _cc:
+                continue
+            # The score in the title is the condition's first metric, whatever
+            # it is named (corr / cosine / beat_corr).
+            _mk = sorted(k for k in ps_cond if k.startswith(f"{_cname}/"))
+            _corr = ps_cond.get(_mk[0], {}) if _mk else {}
+            for _j, _sid in enumerate(plot_ids):
+                if _sid not in _cc:
+                    continue
+                _tgt, _gen = _cc[_sid]
+                writer.add_image(
+                    f"validation_{_j:02d}/{_cname}_target_vs_gen",
+                    plot_condition_comparison(
+                        _cname, _tgt, _gen, kind="valid",
+                        label=f"validation sample #{_sid}",
+                        step=step, prefix=prefix, guidance=guidance,
+                        score=_corr.get(_sid)),
+                    global_step=step)
+
+    # ===== OUT-OF-THE-BOX JOINT PROBE (all active conditions at once) =====
+    # Runs AFTER the validation influence dicts have been read out of the
+    # evaluator (per_sample/coverage/contours all return copies), because the
+    # probe resets the same evaluator to score its own generations.
+    #
+    # ONE call, not one per condition: the panel drives every active condition
+    # together, which is the shape a model trained with p_drop_each_frame = 0.0
+    # actually saw. See run_joint_probe for why the stimuli are combined by
+    # index and deliberately not mutually aligned.
+    probe_influence, probe_cov = {}, {}
+    if probe_sets and frame_active:
+        # Collected separately as well: the matrix branch below renders from
+        # `subset_tables`, which never looks at `influence`, so probe rows added
+        # only there would vanish whenever subsets and probes are both on.
+        _paired = 'paired' if guidance > 1.0 else 'unpaired'
+        _pnames = [c for c in (frame_dims or {}) if c in probe_sets]
+        _npanel = min([len(probe_sets[c]) for c in _pnames], default=0)
+        if _npanel:
+            print(f"    joint probe: {_npanel} panels over {_pnames} "
+                  f"({_paired})...")
+            try:
+                probe_influence, probe_cov = run_joint_probe(
+                    probe_sets,
+                    model=model, normalizer=normalizer,
+                    n_frames=n_frames, step=step, writer=writer, device=device,
+                    output_dir=output_dir, use_amp=use_amp,
+                    sampling_cfg=sampling_cfg,
+                    guidance=guidance, frame_dims=frame_dims,
+                    global_configs=global_configs,
+                    fidelity_evaluator=fidelity_evaluator, dac_model=dac_model,
+                    prefix=prefix, n_plot=n_influence, n_audio=n_audio,
+                    metrics_seed=metrics_seed,
+                )
+                influence.update(probe_influence)
+                cov_paired.update(probe_cov)
+            except Exception as _e:
+                # The probe is a diagnostic bolted onto the metrics step; a
+                # failure (a missing probe wav, an OOM on its extra generations)
+                # must not take down a training run that is otherwise fine.
+                # Reported, not swallowed silently -- a probe that stops
+                # appearing without a reason in the log is worse than no probe.
+                print(f"    [probe] SKIPPED at step {step}: "
+                      f"{type(_e).__name__}: {_e}")
+                probe_influence, probe_cov = {}, {}
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
     # ===== LOG SCALARS (distributional quality only; influence -> panel) =====
     # The tag scheme follows the RUN MODE, so each dashboard matches its project:
@@ -1212,6 +2035,10 @@ def evaluate_and_log_metrics(
                               kl_uncond["kl_real_gen"], step)
             writer.add_scalar("Validation/Metrics/Kl_uncond/gen_real",
                               kl_uncond["kl_gen_real"], step)
+        if fad_cond is not None:
+            writer.add_scalar("Validation/Metrics/Fad_vggish_cond", fad_cond, step)
+        if fad_uncond is not None:
+            writer.add_scalar("Validation/Metrics/Fad_vggish_uncond", fad_uncond, step)
     else:
         # unconditional run: fd_dac_cond/kl_cond ARE the unconditional numbers
         if fd_dac_cond is not None:
@@ -1221,22 +2048,36 @@ def evaluate_and_log_metrics(
                               kl_cond["kl_real_gen"], step)
             writer.add_scalar("Validation/Metrics/Kl_gen_real",
                               kl_cond["kl_gen_real"], step)
+        if fad_cond is not None:
+            writer.add_scalar("Validation/Metrics/Fad_vggish", fad_cond, step)
 
     # ===== CONDITION-INFLUENCE PANEL (consolidated text table) =====
     # All per-condition adherence/influence lives HERE now, as a single table,
     # NOT as separate scalar curves. TensorBoard keeps a per-step history of the
     # text, so the step slider walks the panel across training.
     if influence:
-        from condition_metrics import format_influence_panel, format_influence_legend
-        panel_md = format_influence_panel(
-            influence, step=step, prefix=prefix,
-            guidance=guidance,
-            # the influence is measured on n_fid_used generations, NOT on the
-            # n_metrics_samples used for FD/KL: reporting the latter would claim
-            # a sample size that was never used for these numbers.
-            n_samples=n_fid_used,
-            coverage=cov_cond,
-        )
+        from condition_metrics import (format_influence_panel,
+                                       format_influence_matrix,
+                                       format_influence_legend)
+        # the influence is measured on n_fid_used generations, NOT on the
+        # n_metrics_samples used for FD/KL: reporting the latter would claim
+        # a sample size that was never used for these numbers.
+        if subset_tables:
+            # Subsets requested: the panel becomes the delta MATRIX (one row per
+            # combination) with the detailed tables underneath. The single-table
+            # form below is what a run with no subsets keeps.
+            panel_md = format_influence_matrix(
+                subset_tables, step=step, prefix=prefix,
+                guidance=guidance, n_samples=n_fid_used,
+                extra=probe_influence, extra_coverage=probe_cov,
+            )
+        else:
+            panel_md = format_influence_panel(
+                influence, step=step, prefix=prefix,
+                guidance=guidance,
+                n_samples=n_fid_used,
+                coverage=cov_paired,
+            )
         writer.add_text("Validation/Condition_influence", panel_md, step)
         # Log the explanatory legend ONCE, on its own tag. Pinned to step 0 so it
         # reads as a one-time preamble, not tied to a metrics step (TensorBoard
@@ -1251,38 +2092,43 @@ def evaluate_and_log_metrics(
         return f"{x:.4f}" if x is not None else "n/a"
     print(f"  [cond]   FD-DAC: {_f(fd_dac_cond)} | "
           f"KL(real||gen): {_f(kl_cond['kl_real_gen'])} | "
-          f"KL(gen||real): {_f(kl_cond['kl_gen_real'])}")
+          f"KL(gen||real): {_f(kl_cond['kl_gen_real'])}"
+          + (f" | FAD-VGGish: {_f(fad_cond)}" if fad_cond is not None else ""))
     if compute_uncond:
         print(f"  [uncond] FD-DAC: {_f(fd_dac_uncond)} | "
               f"KL(real||gen): {_f(kl_uncond['kl_real_gen'])} | "
-              f"KL(gen||real): {_f(kl_uncond['kl_gen_real'])}")
+              f"KL(gen||real): {_f(kl_uncond['kl_gen_real'])}"
+              + (f" | FAD-VGGish: {_f(fad_uncond)}" if fad_uncond is not None else ""))
     if influence:
         parts = []
         for cname, metrics in influence.items():
             for m, vals in metrics.items():
                 d = vals.get("delta")
-                parts.append(f"{cname}/{m} Δ={_f(d)}")
+                parts.append(f"{cname}/{m} delta={_f(d)}")
         if parts:
             print("  [influence] " + " | ".join(parts))
 
     # ===== SAVE VALIDATION ARTIFACTS TO DISK (one dir per step, one sub-dir per generation) =====
     # output_dir/step_{step}/generation_{i}/ contains, for generation i:
-    #   conditions.npz   - the EXACT input conditions used (melody, energy, ...)
-    #   cond_{name}.wav  - AUDIBLE rendering of each condition (melody as sine
-    #                      tones, energy as amplitude-modulated tone) so one can
-    #                      hear how it maps into the conditioned audio
+    #   conditions.npz   - the EXACT input conditions used (f0, energy, ...)
+    #   cond_{name}.wav  - AUDIBLE rendering of each condition (f0 as a sine
+    #                      contour, energy as an amplitude-modulated tone) so one
+    #                      can hear how it maps into the conditioned audio
     #   cond.wav         - the conditioned generation
     #   uncond.wav       - the unconditioned (null) generation, same index
-    #   real.wav         - the reference audio (first n_log generations only)
-    # How many generations are dumped is sampling.n_val_save (default: all).
+    #   real.wav         - the reference audio (panel samples only)
+    # How many generations are dumped is sampling.n_val_save; the samples that
+    # own a TensorBoard panel are always dumped too, even when they fall outside
+    # it, so what you hear on TB has a file on disk next to it.
     def _to_np(wav):
         return wav.numpy() if wav.dim() == 1 else wav.squeeze().numpy()
 
     from condition_metrics import sonify_condition
 
-    # n_val_save was already resolved above; the streamed cond_wavs list holds
-    # the first n_keep = max(n_val_save, n_log) decoded waveforms.
-    n_save = min(n_val_save, len(cond_wavs))
+    # cond_wavs is keyed by GENERATION INDEX (not a prefix any more): it holds
+    # the first n_keep decoded waveforms plus the panel samples.
+    save_ids = sorted({i for i in cond_wavs if i < n_val_save}
+                      | {i for i in plot_ids if i in cond_wavs})
     step_dir = os.path.join(output_dir, f"step_{step:07d}")
 
     def _gen_dir(i):
@@ -1290,7 +2136,7 @@ def evaluate_and_log_metrics(
         os.makedirs(d, exist_ok=True)
         return d
 
-    for i in range(n_save):
+    for i in save_ids:
         gdir = _gen_dir(i)
         if not any_cond_active:
             # Unconditional run: one generation per dir, nothing to sonify and no
@@ -1307,66 +2153,86 @@ def evaluate_and_log_metrics(
                 if son is not None:
                     sf.write(os.path.join(gdir, f"cond_{cname}.wav"),
                              son, DAC_SAMPLE_RATE)
-        if compute_uncond and i < len(unc_wavs):
+        if i in unc_wavs:
             sf.write(os.path.join(gdir, "uncond.wav"),
                      _to_np(unc_wavs[i]), DAC_SAMPLE_RATE)
-    print(f"    saved {n_save} validation generations "
+    print(f"    saved {len(save_ids)} validation generations "
           + ("(per-generation dirs: cond+uncond+conditions+sonified) to "
              if any_cond_active else "(per-generation dirs: generated+real) to ")
           + step_dir)
 
-    # ===== COMPARISON LOGGING on TensorBoard =====
-    # Tagged by the generating weights `w` ("EMA"/"Model"). The scheme follows the
-    # RUN MODE:
-    #   * conditioned run -> real / with-cond / without-cond for a direct A/B
-    #     (per-condition influence lives in the text panel);
-    #   * unconditional run -> real / generated only, under the unconditional
-    #     project's tag names (there is no with/without-cond A/B to make).
-    w = prefix  # "EMA" or "Model"
-
+    # ===== AUDIO PANELS on TensorBoard =====
+    # ONE BLOCK per validation sample -- audio_panel_tags builds the names and
+    # explains the layout -- holding one card per audio:
+    #   1_f0_validation_XX                 - the sonified f0 target
+    #   2_generation_with_f0_validation_XX - the generation it conditioned
+    #   3+_<condition>_validation_XX       - energy, chroma, ...
+    # The null generation and the real recording of the same sample are NOT in
+    # this block: they go to the collected groups, one card per sample --
+    #   uncond generation/uncond_validation_XX
+    #   ground truth/real_validation_XX
+    # Validation/f0_valid_vs_gen_XX is the f0 picture of the same sample, same XX.
+    # Everything is peak-normalized: these are meant to be A/B'd by ear, and a
+    # sonified condition is written at a fixed low level, so without this the
+    # comparison would be between loudnesses as much as between contents.
     def _log_audio(wav, tag):
-        wav_u = wav.unsqueeze(0) if wav.dim() == 1 else wav
-        wn = wav_u / (wav_u.abs().max() + 1e-8)
-        writer.add_audio(f"Validation/{tag}", wn, global_step=step,
+        writer.add_audio(tag, norm_wav(wav), global_step=step,
                          sample_rate=DAC_SAMPLE_RATE)
 
-    def _log_spec(wav, tag, title):
-        wav_u = wav.unsqueeze(0) if wav.dim() == 1 else wav
-        writer.add_image(f"Validation/{tag}",
-                         make_spectrogram(wav_u, DAC_SAMPLE_RATE, title),
-                         global_step=step)
+    # The panel samples are the ones the images describe, enumerated in the SAME
+    # order: block validation_03 must be the same validation sample in the Audio
+    # tab and in the Images tab. Filtering the list here (as this used to do)
+    # renumbered the audio whenever one generation was missing, so a block could
+    # end up holding the audio of one sample and the curves of another.
+    # With no condition active there are no contours and no plot_ids, so fall
+    # back to the first n_log generations: the window then holds real vs
+    # generated and nothing else.
+    panel_ids = list(plot_ids) or [i for i in sorted(cond_wavs)][:n_log]
 
-    for i in range(n_log):
+    for k, sid in enumerate(panel_ids):
+        if sid not in cond_wavs:
+            continue                     # index k stays tied to plot_ids
+        has_targets = any_cond_active and sid < len(cond_targets)
+        tags = audio_panel_tags("validation", k,
+                                cond_targets[sid] if has_targets else ())
+
+        if has_targets:
+            for cname, carr in sorted(cond_targets[sid].items()):
+                son = sonify_condition(cname, carr, DAC_SAMPLE_RATE)
+                if son is not None:
+                    writer.add_audio(tags["conditions"][cname], norm_wav(son),
+                                     global_step=step,
+                                     sample_rate=DAC_SAMPLE_RATE)
+
+        _log_audio(cond_wavs[sid], tags["generation"])
+
+        # One extra card per condition SUBSET, in the same block, so the whole
+        # combination ladder of one validation sample is played side by side.
+        # "all" is skipped: the card above already is that generation.
+        for _lab, _names in subset_specs:
+            if _lab == "all":
+                continue
+            _w = subset_wavs.get(_lab, {}).get(sid)
+            if _w is not None:
+                _log_audio(_w, subset_generation_tag("validation", k, _lab))
+
+        # With no condition active "generation" already IS the uncond tag
+        # (audio_panel_tags maps both keys to it), so the guard is what keeps
+        # the same card from being written twice for one step.
+        if any_cond_active and k < n_audio and sid in unc_wavs:
+            _log_audio(unc_wavs[sid], tags["generation_no_cond"])
+
         # ---------- REAL ----------
-        real_wav = _decode_one(real_frames[i], dac_model)
-        _log_audio(real_wav, f"Audio_real_{i:02d}")
-        _log_spec(real_wav, f"Spectrogram_real_{i:02d}",
-                  f"real {i} - step {step}" if any_cond_active
-                  else f"Real sample {i}")
-        sf.write(os.path.join(_gen_dir(i), "real.wav"),
-                 real_wav.numpy(), DAC_SAMPLE_RATE)
-
-        if any_cond_active:
-            # ---------- GENERATED WITH COND ----------
-            cwav = cond_wavs[i]
-            _log_audio(cwav, f"Audio_generated_with_cond_{w}_{i:02d}")
-            _log_spec(cwav, f"Spectrogram_generated_with_cond_{w}_{i:02d}",
-                      f"generated with cond ({w}) {i} - step {step} - guidance={guidance}")
-
-            # ---------- GENERATED WITHOUT COND ----------
-            if compute_uncond:
-                uwav = unc_wavs[i]
-                _log_audio(uwav, f"Audio_generated_without_cond_{w}_{i:02d}")
-                _log_spec(uwav, f"Spectrogram_generated_without_cond_{w}_{i:02d}",
-                          f"generated without cond ({w}) {i} - step {step}")
-        else:
-            # Unconditional run: there is no with/without-cond A/B to make (the
-            # two are the same samples), so log ONE generation under the EXACT
-            # tags/titles of the unconditional project.
-            gwav = cond_wavs[i]
-            _log_audio(gwav, f"Audio_generated_{w}_{i:02d}")
-            _log_spec(gwav, f"Spectrogram_generated_{w}_{i:02d}",
-                      f"{w} sample {i} - step {step}")
+        # The card goes to the collected "ground truth" group, bounded by
+        # n_audio_samples like its uncond twin; the .wav on disk is written for
+        # every dumped generation regardless (it is what makes a dumped
+        # generation listenable against its source).
+        if sid in real_frames:
+            real_wav = _decode_one(real_frames[sid], dac_model)
+            if k < n_audio:
+                _log_audio(real_wav, tags["real"])
+            sf.write(os.path.join(_gen_dir(sid), "real.wav"),
+                     real_wav.numpy(), DAC_SAMPLE_RATE)
 
     # dac_model is the shared singleton (get_dac) -> do NOT delete it; just free
     # any CUDA scratch from the metrics step.
@@ -1418,12 +2284,21 @@ def infinite_loader(loader):
 
 
 # ======================
-# RNG STATE (exact resume: continue the stream, not restart from the seed)
+# RNG STATE (resume continues the RNG streams instead of restarting from the seed)
 # ======================
 def _capture_rng_state(data_generator=None):
-    """Snapshot of every RNG stream so a --resume can continue EXACTLY where it
-    left off (not restart from the seed): python, numpy, torch CPU, torch CUDA,
-    and the DataLoader shuffle generator. Mirrors training.py."""
+    """Snapshot of every RNG stream so a --resume continues them instead of
+    restarting from the seed: python, numpy, torch CPU, torch CUDA, and the
+    DataLoader shuffle generator. Mirrors training.py.
+
+    NOT a bit-exact resume, and it cannot be: `infinite_loader` starts a FRESH
+    epoch, so the sampler draws a NEW permutation from the restored generator
+    while the interrupted run was mid-way through a permutation drawn earlier.
+    Measured: the training loss diverges from the FIRST step after a resume,
+    while weights, optimizer, scheduler and EMA are restored exactly. The
+    resumed run is statistically equivalent, never byte-identical. Making it
+    exact needs a step-indexed permutation or a stateful sampler
+    (torchdata.StatefulDataLoader), neither of which is used here."""
     state = {
         "python": random.getstate(),
         "numpy":  np.random.get_state(),
@@ -1450,7 +2325,9 @@ def _restore_rng_state(state, data_generator=None):
             torch.cuda.set_rng_state_all(state["torch_cuda"])
         if data_generator is not None and state.get("data_generator") is not None:
             data_generator.set_state(state["data_generator"])
-        print("[SEED] RNG state restored from checkpoint (exact resume).")
+        print("[SEED] RNG streams restored from checkpoint (x0, t, CFG dropout). "
+              "Batch ORDER restarts on a fresh epoch, so a resumed run is "
+              "statistically equivalent, not bit-identical.")
     except Exception as e:
         print(f"[SEED] WARNING: could not fully restore RNG state ({type(e).__name__}: "
               f"{e}); continuing with the freshly seeded RNG.")
@@ -1470,8 +2347,10 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
     batch sizes, etc. `model_kind` and the per-condition dims are also kept as
     top-level fields for backward compatibility with sampling_cond.py /
     test_cond.py (which read them directly from the checkpoint). `rng_state`
-    stores every RNG stream so --resume continues EXACTLY (x0, t, CFG dropout,
-    shuffle) rather than restarting from the seed. Mirrors training.py.
+    stores every RNG stream so --resume continues them (x0, t, CFG dropout)
+    rather than restarting from the seed -- see _capture_rng_state for why the
+    batch order is the one thing that does NOT resume exactly. Mirrors
+    training.py.
     """
     data = {
         "model_state_dict":     model.state_dict(),
@@ -1525,13 +2404,19 @@ if __name__ == "__main__":
     # Paths derived from the above directories
     normalizer_path   = os.path.join(cache_dir, "normalizer.pt")
     fd_dac_cache_path = os.path.join(cache_dir, "fd_dac_ref_stats.pt")
+    # The FAD reference depends on HOW it was built (real wavs vs DAC-decoded
+    # val latents), so the mode is part of the file name: switching
+    # metrics.fad_reference must not silently reuse the other one's statistics.
+    _fad_ref_mode = str((cfg.get("metrics", None) or {}).get("fad_reference", "wav"))
+    fad_cache_path = os.path.join(cache_dir, f"fad_vggish_ref_{_fad_ref_mode}.pt")
 
     # Cache safety (report #3): tie the shared normalizer / FD-DAC reference to
     # the dataset + duration + split they were computed on, so a stale cache from
     # a different preprocessing / split can never be silently reused.
     _n_frames_fp = frames_per_chunk(cfg.paths.dataset_root, cfg.model.duration_s)
     _validate_cache(cache_dir, _cache_fingerprint(cfg, _n_frames_fp),
-                    guarded_files=[normalizer_path, fd_dac_cache_path])
+                    guarded_files=[normalizer_path, fd_dac_cache_path,
+                                   fad_cache_path])
 
     # Config's dump (with CLI override already applied) in the run dir
     config_dump_path = os.path.join(run_dir, "config.yaml")
@@ -1573,15 +2458,15 @@ if __name__ == "__main__":
     # startup (not a silent skip), so you never train for hours believing a
     # metric is on when it is not.
     metrics_enabled = list(
-        metrics_cfg.get("enabled", list(DAC_METRICS))
-        if metrics_cfg is not None else list(DAC_METRICS))
-    _unknown = [m for m in metrics_enabled if m not in DAC_METRICS]
+        metrics_cfg.get("enabled", list(COND_METRICS))
+        if metrics_cfg is not None else list(COND_METRICS))
+    _unknown = [m for m in metrics_enabled if m not in COND_METRICS]
     if _unknown:
         raise SystemExit(
             f"[metrics] metrics.enabled contains {_unknown}, which the CONDITIONED "
-            f"pipeline does not provide. Available: {list(DAC_METRICS)}. "
-            f"(The audio-FAD metrics fad_encodec/fad_vggish belong to the "
-            f"unconditional evaluate_generation path and are not wired here.)")
+            f"pipeline does not provide. Available: {list(COND_METRICS)}. "
+            f"(fad_encodec needs the Encodec embedder and is not wired here; "
+            f"fad_vggish is.)")
     print(f"[metrics] enabled: {metrics_enabled or '(none: distributional metrics off)'}")
 
     if device == "cuda":
@@ -1637,7 +2522,7 @@ if __name__ == "__main__":
                 f"No frame conditions found on disk under "
                 f"{cfg.paths.condition_root}. Extract them first, e.g.:\n"
                 f"  python extract_conditions.py <dataset_root> "
-                f"--conditions melody --device cuda")
+                f"--conditions f0 --device cuda")
     else:
         # Explicit subset: every requested condition MUST be extracted.
         missing = [c for c in enabled_f if c not in extracted]
@@ -1711,12 +2596,10 @@ if __name__ == "__main__":
             registry=registry,
             preload=False,
             strict_conditions=strict_conditions,
-            # split config (data.split in the YAML; leakage-safe defaults)
-            split_ratios=tuple(_split_param(cfg, "ratios", [0.8, 0.1, 0.1])),
-            split_seed=int(_split_param(cfg, "seed", 42)),
-            group_by_source=bool(_split_param(cfg, "group_by_source", True)),
-            stratify_by_class=bool(_split_param(cfg, "stratify_by_class", True)),
-            save_test_manifest=bool(_split_param(cfg, "save_test_manifest", True)),
+            # The split is READ from the dataset's splits.json, written by
+            # preprocess_stream.py. There is nothing to configure here any more:
+            # ratios/seed/stratification are decided once, with the dataset.
+            splits_path=cfg.paths.get("splits_path", None),
         )
 
     n_classes = len(label_map)
@@ -1725,7 +2608,7 @@ if __name__ == "__main__":
           f"val {split_info['file_counts']['val']} | "
           f"test {split_info['file_counts']['test']}")
     if split_info["manifest_path"]:
-        print(f"[split] test manifest: {split_info['manifest_path']}")
+        print(f"[split] read from: {split_info['manifest_path']}")
 
     # Save the normalizer in the cache_dir
     if not os.path.exists(normalizer_path):
@@ -1812,9 +2695,86 @@ if __name__ == "__main__":
         print("Reference stats SKIPPED: no distributional metric enabled "
               "(metrics.enabled is empty).\n")
 
+    # ---- FAD (VGGish): embedder + real reference, only if requested ----
+    # Everything here is skipped unless 'fad_vggish' is in metrics.enabled, so a
+    # run that does not ask for it pays nothing and loads no VGGish weights.
+    fad_embedder = None
+    fad_ref_stats = None
+    n_fad = 0
+    fad_device = "cpu"
+    if "fad_vggish" in metrics_enabled:
+        from metrics import VGGishEmbedder
+        fad_device = str(cfg.metrics.get("fad_device", "cuda"))
+        if fad_device.startswith("cuda") and not torch.cuda.is_available():
+            print("[metrics] fad_device='cuda' but no GPU is available "
+                  "-> FAD falls back to CPU.")
+            fad_device = "cpu"
+        n_fad = int(cfg.sampling.get("n_fad_samples", 512) or 0)
+        fad_embedder = VGGishEmbedder(device=fad_device)
+        print(f"[metrics] FAD-VGGish enabled | device={fad_device} | "
+              f"n_fad_samples={n_fad} | reference={_fad_ref_mode}")
+
+        # The reference is the REAL validation audio. The dataset is split-less
+        # on disk, so the wav/ tree holds train, val AND test together: the file
+        # list is derived from the VAL SPLIT, never by globbing the directory,
+        # or the "real" distribution would include the test set.
+        _val_npy = sorted({str(smp[0]) for smp in val_dataset.samples})
+        if _fad_ref_mode == "wav":
+            _lat_root = Path(cfg.paths.dataset_root)
+            _wav_root = Path(cfg.paths.wav_root)
+            _val_wavs = [_wav_root / Path(f).relative_to(_lat_root).with_suffix(".wav")
+                         for f in _val_npy]
+            _missing = [w for w in _val_wavs if not w.exists()]
+            if _missing:
+                raise SystemExit(
+                    f"[metrics] fad_vggish with metrics.fad_reference='wav' needs the "
+                    f"real validation wavs, but {len(_missing)}/{len(_val_wavs)} are "
+                    f"missing under {_wav_root} (first: {_missing[0]}).\n"
+                    f"  Either re-run preprocess_stream.py with --save_wav (it does "
+                    f"NOT re-encode the latents), or set metrics.fad_reference="
+                    f"'decoded' to build the reference by decoding the validation "
+                    f"latents through DAC instead. NB: 'decoded' compares two "
+                    f"DAC-decoded distributions, which isolates the model from the "
+                    f"codec but is NOT comparable with published FAD values.")
+            fad_ref_stats = precompute_audio_reference(
+                _val_wavs, fad_embedder, cache_path=fad_cache_path,
+                device=fad_device)
+        elif _fad_ref_mode == "decoded":
+            _dac = get_dac()
+
+            def _real_clips():
+                for i in range(len(val_dataset)):
+                    frames = val_dataset[i][0]
+                    yield (decode_frames_to_wav(frames, normalizer, _dac)
+                           .view(1, 1, -1), DAC_SAMPLE_RATE)
+
+            if os.path.exists(fad_cache_path):
+                print(f"[Audio ref] loading cache: {fad_cache_path}")
+                fad_ref_stats = torch.load(fad_cache_path, map_location="cpu",
+                                           weights_only=False)
+            else:
+                print(f"[Audio ref] embedding {len(val_dataset)} DAC-decoded val "
+                      f"latents (metrics.fad_reference='decoded')...")
+                _mu, _sig, _n = compute_audio_mu_sigma(
+                    _real_clips(), len(val_dataset), fad_embedder,
+                    device=fad_device, desc="FAD ref")
+                fad_ref_stats = {"mu": _mu.cpu(), "sigma": _sig.cpu(), "n_total": _n}
+                _tmp = fad_cache_path + ".tmp"      # atomic publish, as elsewhere
+                torch.save(fad_ref_stats, _tmp)
+                os.replace(_tmp, fad_cache_path)
+                print(f"[Audio ref] cache saved: {fad_cache_path}")
+        else:
+            raise SystemExit(
+                f"[metrics] metrics.fad_reference='{_fad_ref_mode}' is not a valid "
+                f"choice. Use 'wav' (real validation wavs, comparable with the "
+                f"literature) or 'decoded' (validation latents decoded through "
+                f"DAC, no wavs needed).")
+        print(f"FAD reference ready: {fad_ref_stats['n_total']} embedding "
+              f"vectors (128-D)\n")
+
     # Conditioning-influence evaluators (validation only, never affect training):
     #   - frame conditions: re-extract the enabled frame conditions from the
-    #     generations and compare, paired, to the input ones (melody RPA/RCA,
+    #     generations and compare, paired, to the input ones (f0 corr,
     #     chroma cosine, rhythm/energy correlation).
     #   - text (CLAP): the audio side of the same CLAP checkpoint, to score
     #     audio<->text adherence; loaded lazily ONLY if 'text' is active.
@@ -1852,6 +2812,110 @@ if __name__ == "__main__":
         clap_audio_embedder = ClapAudioEmbedder(model_name=clap_model_name,
                                                 device=_fid_device)
         print(f"Text-influence (CLAP audio) enabled: {clap_model_name}")
+
+    # ---- OUT-OF-THE-BOX PROBE SETS (proof of concept) ----
+    # A bank is built for EVERY condition active in this run, and the panels
+    # then drive them all together (see run_joint_probe). Each bank is built
+    # ONCE and cached (keyed by the stimuli, the chunk geometry and the
+    # extractor's parameters), the same contract as the normalizer and the
+    # FD-DAC reference -- shared by every run over the same setup, rebuilt
+    # automatically if any of those change.
+    #
+    # This is the CONTROLLABILITY instrument. On unambiguous synthetic stimuli
+    # it answers whether the conditioning of this run moves the generation at
+    # all -- the question the validation rows cannot answer on their own,
+    # because on real material a condition is often not cleanly extractable and
+    # a middling score there does not separate weak conditioning from an
+    # ambiguous target. It costs one paired generation pass per panel, whatever
+    # the number of conditions, because the panel drives them jointly.
+    #
+    # sampling.n_influence_samples is the SINGLE knob of the influence set: N
+    # probe stimuli and N validation samples, all of them scored, plotted and
+    # played. It replaces the old trio n_probes / n_cond_plot / (the former,
+    # larger) n_influence_samples, which let the table describe one set of
+    # samples while the panels showed another.
+    probe_sets = {}
+    _n_probes = influence_set_size(cfg.sampling)
+    # RNG GUARD. The probe banks are built HERE, before ConditionedAudioDiT is
+    # constructed further down, and building the f0 bank runs torchcrepe, which
+    # draws from the global torch-CPU and numpy generators (chroma/energy/rhythm
+    # draw nothing -- their synthesis uses local np.random.default_rng(seed)).
+    # Left unguarded, a COLD cache (bank built) and a WARM one (bank loaded from
+    # disk) hand the model two different RNG states, so the same config and the
+    # same training.seed produce two DIFFERENT initialisations -- measured on
+    # five runs: all 54 tensors differ, max|dW| = 1.08. Snapshotting around the
+    # whole loop makes the bank RNG-neutral, so the init depends only on the
+    # seed and ablation runs stay comparable whatever the cache state.
+    _rng_guard = (
+        torch.get_rng_state(),
+        np.random.get_state(),
+        random.getstate(),
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    )
+    for _cond in FRAME_COND_DIMS:
+        if _n_probes <= 0:
+            continue
+        try:
+            from probe_conditions import build_condition_probe_set
+            # One builder for all four. The only per-condition thing left is
+            # WHERE the cache lives: f0 keeps its historical directory (and the
+            # paths.f0_probe_dir override) so an existing f0 cache is still a
+            # hit; the others sit next to it under cache_dir.
+            if _cond == "f0":
+                _probe_root = (cfg.paths.get("f0_probe_dir", None)
+                               or os.path.join(cfg.paths.cache_dir, "f0_probe"))
+            else:
+                _probe_root = os.path.join(cfg.paths.cache_dir,
+                                           f"probe_{_cond}")
+            # WHICH extractor builds the bank. NOT registry.frame_extractors:
+            # that object is the one CONDITION_CONFIG pins to device="cpu" (the
+            # device the preprocessing DataLoader workers need), and building the
+            # f0 bank with it runs CREPE-full on CPU with batch_size=512 -- a
+            # multi-GB RSS spike per stimulus, sixteen times in a row, which is
+            # enough to get the job SIGKILLed part way through the bank. That
+            # death is invisible here: it is not a Python exception, so the
+            # except below never sees it and the run simply disappears.
+            # The fidelity evaluator already holds a shallow COPY of the very
+            # same extractor, moved to metrics.fidelity_device, with every
+            # value-bearing parameter identical -- so building the bank with it
+            # is the same extraction, on the GPU, at no extra cost. Measured:
+            # 16 stimuli in 7s, 1.4 GB VRAM (the model is not built yet here).
+            # It is not BIT-identical to the CPU one -- CREPE's convolutions are
+            # not, ~1.4e-3 mean on the normalized pitch, corr 0.9997 -- which is
+            # orders of magnitude below anything the influence panel resolves.
+            # SAFE FOR THE CACHES: probe_conditions._fingerprint excludes the
+            # device on purpose ("speed, never values"), so a bank built on
+            # either device stays a hit for the other, and every existing cache
+            # keeps working. Falls back to the registry object if the evaluator
+            # has no extractor for this condition.
+            _probe_extractor = fidelity_evaluator.extractors.get(
+                _cond, registry.frame_extractors[_cond])
+            _probe_dev = getattr(_probe_extractor, "device",
+                                 getattr(_probe_extractor, "_device", "cpu"))
+            _ps = build_condition_probe_set(
+                _cond, _probe_root, val_dataset.n_frames,
+                extractor=_probe_extractor,
+                n_probes=_n_probes,
+                duration_s=float(cfg.model.duration_s),
+                sr=DAC_SAMPLE_RATE,
+            )
+            probe_sets[_cond] = _ps
+            print(f"{_cond} probe: {len(_ps)} elementary stimuli, "
+                  f"all plotted on TB | device={_probe_dev} | dir={_ps.dir}")
+        except Exception as e:
+            # A probe that cannot be built must not take the training run down
+            # with it: it is a diagnostic, not part of the objective.
+            print(f"[{_cond}-probe] disabled -- could not build it: {e}")
+    # Close the RNG guard opened before the loop: whatever the probe banks drew
+    # (or did not draw) is rolled back, so the model init below sees the state
+    # left by the seeding block and nothing else.
+    torch.set_rng_state(_rng_guard[0])
+    np.random.set_state(_rng_guard[1])
+    random.setstate(_rng_guard[2])
+    if _rng_guard[3] is not None:
+        torch.cuda.set_rng_state_all(_rng_guard[3])
+    if probe_sets:
+        print()
 
     metrics_uncond = bool(cfg.sampling.get("metrics_uncond", True))
     print(f"Conditioning influence: frame={list(FRAME_COND_DIMS.keys()) or 'none'}"
@@ -1908,10 +2972,15 @@ if __name__ == "__main__":
     # NB: no chunk_counts here -- with duration_s equal to the preprocessing chunk
     # length each latent file yields exactly ONE training chunk, so it would just
     # repeat file_counts.
+    # The split is not a training parameter any more, so what gets logged is
+    # what was READ: the file it came from and the parameters it was created
+    # with. That is what makes a TensorBoard run self-describing about its own
+    # val/test sets without having to go and open the dataset.
     _cfg_log.data.split.composition = {
         "file_counts":  dict(split_info["file_counts"]),
         "n_classes":    int(split_info["n_classes"]),
-        "test_manifest": split_info["manifest_path"],
+        "splits_file":  split_info["manifest_path"],
+        "params":       dict(split_info.get("params", {})),
     }
 
     # Parameter counts, nested under the config's `model` section (same panel) and
@@ -1993,9 +3062,10 @@ if __name__ == "__main__":
                 ema = EMAModel(model, decay=cfg.training.ema_decay)
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
-        # Restore every RNG stream so the run continues EXACTLY (x0, t, CFG
-        # dropout, shuffle) instead of restarting from the seed. Best-effort for
-        # old checkpoints without rng_state.
+        # Restore every RNG stream so the run continues them (x0, t, CFG
+        # dropout) instead of restarting from the seed. The batch ORDER does not
+        # resume: a fresh epoch draws a new permutation (see
+        # _capture_rng_state). Best-effort for old checkpoints without rng_state.
         _restore_rng_state(ckpt.get("rng_state"), data_generator)
         start_step = ckpt["step"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
@@ -2054,9 +3124,14 @@ if __name__ == "__main__":
               f"{fd_dac_ref_stats['n_total']} reference frames")
     else:
         print("Metrics: distributional metrics DISABLED (metrics.enabled: [])")
+    # .get: a config written before per-condition dropout existed stays valid
+    # and keeps its exact previous behaviour (0.0 disables stage 2).
+    P_DROP_EACH_FRAME = float(cfg.conditioning.get("p_drop_each_frame", 0.0))
     print(f"CFG dropout: all={cfg.conditioning.p_drop_all} "
           f"frame={cfg.conditioning.p_drop_frame} "
-          f"global={cfg.conditioning.p_drop_global}")
+          f"global={cfg.conditioning.p_drop_global} "
+          f"each_frame={P_DROP_EACH_FRAME}"
+          + ("  (partial subsets ON)" if P_DROP_EACH_FRAME > 0 else ""))
     print(f"CFG guidance scale (validation): {cfg.conditioning.guidance_scale}")
     print(f"DATASET_ROOT:   {cfg.paths.dataset_root}")
     print(f"WAV_ROOT:       {cfg.paths.wav_root}")
@@ -2068,19 +3143,23 @@ if __name__ == "__main__":
     # Real reference audio, logged ONCE at step 0 (it never changes during
     # training, unlike the generations). Mirrors the unconditional project, and
     # means the reference is audible from the start instead of only appearing at
-    # the first metrics step. Tags: Validation/Audio_real_* / Spectrogram_real_*.
+    # the first metrics step. Tags: ground truth/real_validation_XX.
     log_real_audio_samples(
         val_dataset=val_dataset,
         normalizer=normalizer,
         writer=writer,
         n_samples=cfg.sampling.n_audio_samples,
+        sampling_cfg=cfg.sampling,
+        frame_dims=FRAME_COND_DIMS,
     )
 
     # ======================
-    # Real audio / spectrogram / melody are logged inside evaluate_and_log_metrics
-    # at every metrics step (tags Validation/*_real_*), alongside the with-cond
-    # and without-cond generations, so the whole comparison sits in the same
-    # windows and walks with the TensorBoard step slider.
+    # Real audio / conditions are logged inside evaluate_and_log_metrics at every
+    # metrics step: the sonified conditions and the conditioned generation into
+    # the per-sample block, the null generation into the "uncond generation"
+    # group and the recording into "ground truth". All of them walk with the
+    # TensorBoard step slider (the reals are also written once at step 0, so the
+    # ground-truth group is populated before the first metrics step).
 
     # ======================
     # TRAIN LOOP
@@ -2112,6 +3191,7 @@ if __name__ == "__main__":
                     p_drop_all=cfg.conditioning.p_drop_all,
                     p_drop_frame=cfg.conditioning.p_drop_frame,
                     p_drop_global=cfg.conditioning.p_drop_global,
+                    p_drop_each_frame=P_DROP_EACH_FRAME,
                     training=True,
                 ) / cfg.data.grad_accum
                 scaler.scale(loss).backward()
@@ -2183,6 +3263,7 @@ if __name__ == "__main__":
                             p_drop_all=cfg.conditioning.p_drop_all,
                             p_drop_frame=cfg.conditioning.p_drop_frame,
                             p_drop_global=cfg.conditioning.p_drop_global,
+                            p_drop_each_frame=P_DROP_EACH_FRAME,
                             training=False,
                             x0=fixed_x0,
                             t=fixed_t,
@@ -2200,6 +3281,7 @@ if __name__ == "__main__":
                                 p_drop_all=cfg.conditioning.p_drop_all,
                                 p_drop_frame=cfg.conditioning.p_drop_frame,
                                 p_drop_global=cfg.conditioning.p_drop_global,
+                                p_drop_each_frame=P_DROP_EACH_FRAME,
                                 training=False,
                                 x0=fixed_x0,
                                 t=fixed_t,
@@ -2243,14 +3325,14 @@ if __name__ == "__main__":
 
             # ======================
             # AUDIO PREVIEW (optional, conditioned-only, separate from metrics)
-            # Generated-audio preview every intervals.audio steps (tags
-            # Validation/Audio_generated_*). The richer real / with-cond /
-            # without-cond comparison is logged separately at every metrics step.
-            # NB: no enable flag -- `intervals.audio` means what it says. (It used
-            # to be gated by an `audio_preview` toggle, so the interval silently
-            # did nothing; set intervals.audio very large to effectively disable.)
-            # ======================
-            if step > 0 and step % cfg.intervals.audio == 0:
+            # Audio preview every intervals.audio steps, written into the
+            # SAME validation_XX/ audio blocks the metrics step uses: it
+            # refreshes the condition and the with-cond generation, while
+            # the "uncond generation" and "ground truth" groups are filled
+            # by the metrics step. Skipped when the two cadences coincide,
+            # so a card never gets two values for the same step.
+            if (step > 0 and step % cfg.intervals.audio == 0
+                    and step % cfg.intervals.metrics != 0):
                 pbar.write(f"\n  Audio preview step {step}...")
                 gen_model = (ema.model
                               if cfg.training.use_ema and step >= cfg.training.ema_start
@@ -2336,6 +3418,11 @@ if __name__ == "__main__":
                             else "Model"),
                     metrics_seed=metrics_seed,
                     metrics_enabled=metrics_enabled,
+                    fad_embedder=fad_embedder,
+                    fad_ref_stats=fad_ref_stats,
+                    n_fad=n_fad,
+                    fad_device=fad_device,
+                    probe_sets=probe_sets,
                 )
                 # Report ONLY the metrics that were actually requested: with
                 # metrics.enabled=["fd_dac"] the KL values are None (and vice

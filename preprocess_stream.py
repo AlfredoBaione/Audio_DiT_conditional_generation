@@ -33,10 +33,11 @@ WHY NOT reuse ChunkedAudioFileDataset directly?
     are documented on VendoredChunker (min_duration on the time axis; the
     deterministic sub-selection path only).
 
-NO TRAIN/VAL/TEST SPLIT is produced here (by design): the split is a training-time
-concern and will be handled on the training side. The output MIRRORS THE SOURCE
-DIRECTORY TREE verbatim (the class folders of the raw dataset are reproduced), so
-training can use those same directories as the classes to split on:
+THE TRAIN/VAL/TEST SPLIT IS DECIDED HERE and recorded in splits.json. It is
+assigned over the SOURCE FILES (the leakage-safe unit) before anything is
+decoded, which is what makes "save only the validation wavs" expressible at all.
+The output still MIRRORS THE SOURCE DIRECTORY TREE verbatim -- there are no
+train/val/test directories on disk, the split is a lookup table:
 
     OUT/
         latents/<same/subdir/as/source>/<name>.npy   <- (72, T) float32, DAC
@@ -44,6 +45,15 @@ training can use those same directories as the classes to split on:
         conditions/<same/subdir/as/source>/<name>.npz <- only with --conditions
         global_conditions/<text|image>/<class>.npy    <- only with --global
         dataset_meta.json                             <- chunk params, re-run safety
+        splits.json                                   <- source -> train/val/test
+        source_manifest.json                          <- what each source produced
+
+    The split NEVER moves a source it has already assigned: a re-run only places
+    the NEW ones. Re-deciding it needs --resplit, because promoting yesterday's
+    training material to today's test set silently invalidates every evaluation
+    of an existing checkpoint. Datasets built before the split lived here get
+    theirs with --split_only (fresh) or --import_legacy_split (reproduces the
+    split the training used to compute in-code, for runs already in flight).
 
     e.g. SRC/rock/song.mp3  ->  OUT/latents/rock/song__c0000.npy, ...__c0001.npy
     Source directory names are preserved verbatim; only per-chunk file names are
@@ -53,7 +63,7 @@ training can use those same directories as the classes to split on:
 INCREMENTAL / IDEMPOTENT
     Every stage is idempotent per chunk, so you can:
       1) run once with latents + some conditions:
-           python preprocess_stream.py SRC OUT --conditions melody
+           python preprocess_stream.py SRC OUT --conditions f0
       2) later add another condition WITHOUT recomputing latents / other conds:
            python preprocess_stream.py SRC OUT --conditions energy
          Because chunking is deterministic, re-running regenerates the exact same
@@ -77,30 +87,60 @@ Usage:
     # latents only, GPU:
     python preprocess_stream.py SRC OUT --device cuda
 
-    # latents + per-chunk melody + energy conditions:
-    python preprocess_stream.py SRC OUT --device cuda --conditions melody,energy
+    # latents + per-chunk f0 + energy conditions:
+    python preprocess_stream.py SRC OUT --device cuda --conditions f0,energy
 
     # with YOUR acoustic treatment (stereo split + constant-gain loudnorm + trim):
     python preprocess_stream.py SRC OUT --device cuda --acoustic_rules
 
-    # also keep the per-chunk WAV (for FAD / listening):
-    python preprocess_stream.py SRC OUT --device cuda --save_wav
+    # keep the per-chunk WAV of the VALIDATION split only (FAD reference):
+    python preprocess_stream.py SRC OUT --device cuda --save_wav val
+
+    # everything driven by a config file instead of flags:
+    python preprocess_stream.py --config configs/preprocess_default.yaml
+
+    # give an ALREADY-PREPROCESSED dataset a split, without redoing any work:
+    python preprocess_stream.py SRC OUT --split_only
 
     # add f0 (CREPE) later, incrementally, without recomputing latents:
     python preprocess_stream.py SRC OUT --device cuda --conditions f0
 
     # large dataset: parallel CPU workers + batched DAC encode
-    python preprocess_stream.py SRC OUT --device cuda --conditions melody,energy \
+    python preprocess_stream.py SRC OUT --device cuda --conditions f0,energy \
         --num_workers 8 --batch_size 16
 
+    # keep f0 on CPU even though the DAC is on the GPU:
+    python preprocess_stream.py SRC OUT --device cuda --cond_device cpu \
+        --conditions f0
+
 Throughput:
-    The CPU work (audio load, acoustic ffmpeg, chunking, condition extraction,
-    WAV writing) runs on DataLoader workers (--num_workers), in parallel with the
-    GPU, which batches the DAC encode (--batch_size chunks per forward). Workers
-    write conditions/WAV straight to disk; the main process only encodes+saves
-    the latents. Conditions are frame-aligned to the constant DAC latent length T
-    (discovered once), so workers never wait on the GPU. num_workers=0 (default)
-    runs the identical path in a single process.
+    Work is divided by RESOURCE, not by stage.
+
+    WORKERS (--num_workers, CPU, parallel): audio load (the soundfile/ffmpeg
+    decoding ladder), acoustic ffmpeg pass, chunking, the CPU-only conditions
+    (chroma, energy) and WAV writing -- each a per-chunk side effect
+    written straight to disk.
+
+    MAIN PROCESS (the only owner of the GPU): the batched DAC encode
+    (--batch_size chunks per forward) AND the GPU-capable conditions -- f0 via
+    torchcrepe, rhythm via beat_this -- over the SAME chunks, in the same pass.
+    They cannot share one tensor (the DAC takes 44.1 kHz, CREPE 16 kHz), but they
+    share the pass, which is what keeps the card busy instead of alternating
+    between a loaded CPU and an idle GPU.
+
+    This is why --cond_device exists and why no worker ever touches CUDA: one
+    process owns the card, so N workers cannot contend with the DAC for VRAM or
+    time-slice the GPU between themselves. --cond_device cpu puts the GPU-capable
+    conditions back in the workers, which is the pre-split behaviour.
+
+    Conditions are frame-aligned to the constant DAC latent length T (discovered
+    once), so workers never wait on the GPU. num_workers=0 (default) runs the
+    identical path in a single process.
+
+    A chunk is handed to the main process if it still needs a latent OR still
+    needs a GPU-side condition, tracked independently -- so adding f0 to a
+    dataset whose latents already exist re-reads the audio without re-encoding a
+    single latent.
 
 MULTIPROCESSING SAFETY
     Workers use the "spawn" start method by default, prefetch only one batch and
@@ -130,7 +170,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("NUMBA_NUM_THREADS", "1")
 
-# IRCAM: redirect model caches (DAC, basic-pitch, HuggingFace) to the local disk
+# IRCAM: redirect model caches (DAC, CREPE, beat_this, HuggingFace) to the local disk
 # instead of the NFS HOME. Guarded so the script stays portable off-IRCAM.
 _IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
 if os.path.isdir(_IRCAM_LOCAL):
@@ -142,6 +182,7 @@ if os.path.isdir(_IRCAM_LOCAL):
 import re
 import json
 import math
+import random
 import shutil
 import hashlib
 import argparse
@@ -257,8 +298,13 @@ def _atomic_save_wav(path: Path, audio, sr: int):
         tmp.unlink(missing_ok=True)
 
 
-def _latent_file_is_valid(path: Path, n_frames: int) -> bool:
-    """A resume skips only a readable float32 latent with geometry (72, T)."""
+def _latent_file_is_valid(path: Path, n_frames: int, verbose: bool = True) -> bool:
+    """A resume skips only a readable float32 latent with geometry (72, T).
+
+    mmap_mode reads the .npy HEADER only, so this costs one open per file and
+    never the array -- which is what makes it usable as a pre-flight check over
+    a whole dataset, not just per chunk. `verbose=False` silences the per-file
+    report for that bulk pass (the chunk that gets re-encoded reports itself)."""
     path = Path(path)
     if not path.exists():
         return False
@@ -267,14 +313,15 @@ def _latent_file_is_valid(path: Path, n_frames: int) -> bool:
         z = np.load(str(path), mmap_mode="r", allow_pickle=False)
         valid = z.shape == (72, int(n_frames)) and z.dtype == np.dtype(np.float32)
     except Exception as e:
-        print(f"[resume] invalid latent will be regenerated: {path} ({e})")
+        if verbose:
+            print(f"[resume] invalid latent will be regenerated: {path} ({e})")
         return False
     finally:
         if z is not None:
             mm = getattr(z, "_mmap", None)
             if mm is not None:
                 mm.close()
-    if not valid:
+    if not valid and verbose:
         print(f"[resume] invalid latent will be regenerated: {path} "
               f"(expected shape=(72,{n_frames}), dtype=float32)")
     return valid
@@ -285,7 +332,7 @@ SUPPORTED_AUDIO_EXTS = {
     ".wma", ".mpc", ".oma", ".ape", ".aac",
 }
 
-PREPROCESS_BUILD = "2026-07-18-multiprocessing-safe-v1"
+PREPROCESS_BUILD = "2026-09-04-split-and-config-v1"
 
 
 # ============================================================
@@ -441,6 +488,72 @@ def write_source_manifest(out_root: Path, prev: dict, produced: dict,
     return len(merged)
 
 
+def source_outputs_complete(chunks, latent_root: Path, cond_root: Path,
+                            wav_root: Path, n_frames: int, cond_names,
+                            check_latents: bool, want_wav: bool) -> bool:
+    """True if EVERY output this run would produce for one source already exists.
+
+    The manifest records which chunks a source owns, so this answers "is there
+    anything left to do for this file?" from METADATA ALONE -- a handful of
+    stat()s and .npy/.npz headers -- instead of decoding the source, re-chunking
+    it and discovering chunk by chunk that everything was already there.
+
+    That is the whole cost of a no-op re-run: on a dataset that is already
+    complete the pipeline currently re-decodes every mp3 to conclude it has
+    nothing to write. Skipping the file outright is what makes "add the wavs of
+    the validation split" touch ~10% of the corpus instead of all of it.
+
+    Deliberately conservative: a source with NO recorded chunks is never
+    reported complete (it may simply never have been processed), and the checks
+    mirror exactly what this run would write -- latents only when it encodes
+    them, conditions only for the names it was asked for, wavs only where they
+    were requested.
+    """
+    if not chunks:
+        return False
+    cond_names = list(cond_names or ())
+    for rel_chunk in chunks:
+        if check_latents and not _latent_file_is_valid(
+                latent_root / f"{rel_chunk}.npy", n_frames, verbose=False):
+            return False
+        if cond_names and _npz_missing(cond_root / f"{rel_chunk}.npz", cond_names):
+            return False
+        if want_wav and not (wav_root / f"{rel_chunk}.wav").exists():
+            return False
+    return True
+
+
+def filter_complete_sources(files, prev_manifest: dict, changed_srcs,
+                            latent_root: Path, cond_root: Path, wav_root: Path,
+                            n_frames: int, cond_names, check_latents: bool,
+                            wav_sources) -> Tuple[list, int]:
+    """Drop the sources that have nothing left to produce. Returns (files, n_skipped).
+
+    A source is only considered when the manifest both KNOWS it and agrees with
+    its bytes on disk: an unknown source (dataset built before the manifest, or
+    never processed) and a CHANGED one are always re-processed, so the fast path
+    can never be the reason something stale survives.
+    """
+    changed = set(changed_srcs or ())
+    kept, skipped = [], 0
+    for item in files:
+        rel_src = item[4]
+        entry = prev_manifest.get(rel_src)
+        if entry is None or rel_src in changed:
+            kept.append(item)
+            continue
+        want_wav = (wav_sources == "all"
+                    or (isinstance(wav_sources, (set, frozenset))
+                        and rel_src in wav_sources))
+        if source_outputs_complete(
+                entry.get("chunks", []), latent_root, cond_root, wav_root,
+                n_frames, cond_names, check_latents, want_wav):
+            skipped += 1
+        else:
+            kept.append(item)
+    return kept, skipped
+
+
 def prune_orphans(out_root: Path, prev: dict, removed: list) -> int:
     """Delete the outputs of sources that no longer exist. Only touches files the
     manifest attributes to those sources -- never a blind directory sweep."""
@@ -456,6 +569,351 @@ def prune_orphans(out_root: Path, prev: dict, removed: list) -> int:
                     f.unlink()
                     n += 1
     return n
+
+
+# ============================================================
+# TRAIN / VAL / TEST SPLIT -- decided HERE, at preprocessing time
+# ============================================================
+# The split used to be recomputed by the training at every startup from whatever
+# latents happened to be on disk. Deciding it here makes it a PROPERTY OF THE
+# DATASET instead of a property of one training run:
+#   * it is decided over the SOURCE FILES, before a single byte is decoded, so
+#     "save only the validation wavs" becomes answerable at preprocessing time;
+#   * it is WRITTEN DOWN (splits.json) instead of being re-derived, so two runs
+#     over the same dataset cannot silently disagree on what the test set was;
+#   * it is leakage-safe by construction (the source file is the unit) rather
+#     than by reconstructing the source grouping from chunk names afterwards.
+#
+# The group key is byte-for-byte the one audio_dataset_npy._source_group_of()
+# derives from a latent path -- "<rel_parent>/<sanitized_stem>_<src_hash>" -- so
+# the training side only has to LOOK EACH LATENT UP. There is exactly one
+# implementation of the grouping rule, and it is the one used to name the files.
+#
+# GROWTH RULE (the one that matters): a re-run NEVER reassigns a source that
+# already has one. New sources are placed into the existing split and the
+# recorded assignments are read back verbatim. Re-deciding the split of an
+# existing dataset silently promotes yesterday's training material to today's
+# test set -- an already-trained checkpoint would then be evaluated on data it
+# has seen -- so it requires an explicit --resplit.
+
+SPLITS_NAME = "splits.json"
+SPLIT_NAMES = ("train", "val", "test")
+
+
+def source_group_key(rel_parent: Path, src_name: str, src_hash: str) -> str:
+    """The leakage-safe id of one source file, as the SPLIT and the CHUNK NAMES
+    both see it.
+
+    Chunks are named "<sanitized_stem>_<src_hash>[__ch<n>]__c<idx>" under
+    rel_parent, and audio_dataset_npy._source_group_of() recovers the group of a
+    latent as "<rel_parent>/<stem before the first '__'>". Building the key from
+    the SAME two pieces here is what lets the training resolve a latent to its
+    split with a dict lookup instead of a second, drift-prone reimplementation.
+    """
+    return (Path(rel_parent) / f"{sanitize_filename(src_name)}_{src_hash}").as_posix()
+
+
+def _split_params(ratios, seed: int, stratify_by_class: bool) -> dict:
+    """The knobs that DEFINE the split. Recorded in splits.json and compared on
+    every re-run: changing one of them changes who is in the test set."""
+    return {
+        "ratios": [float(r) for r in ratios],
+        "seed": int(seed),
+        "stratify_by_class": bool(stratify_by_class),
+        # Recorded for the reader's benefit: the split unit is always the source
+        # file here (that IS the leakage-safe unit), so it is not a knob.
+        "group_by_source": True,
+        "unit": "source",
+    }
+
+
+def load_splits(out_root: Path) -> Optional[dict]:
+    """Read splits.json, or None if this dataset has no split yet."""
+    p = Path(out_root) / SPLITS_NAME
+    if not p.exists():
+        return None
+    try:
+        payload = json.loads(p.read_text())
+    except Exception as e:
+        raise SystemExit(
+            f"[split] {p} exists but is unreadable ({e}). Refusing to continue: "
+            f"silently recomputing the split would change the test set of a "
+            f"dataset that already has one. Fix or delete the file."
+        )
+    if "groups" not in payload:
+        raise SystemExit(f"[split] {p} has no 'groups' key -- refusing to guess.")
+    return payload
+
+
+def assign_source_splits(files, ratios, seed: int, stratify_by_class: bool,
+                         existing: Optional[dict] = None) -> Tuple[dict, int]:
+    """Assign every scanned source to train/val/test, honouring `existing`.
+
+    `files` are the scan tuples; `existing` maps group_key -> split for the
+    sources already assigned. Returns (group_key -> split, n_new).
+
+    The allocation math is IMPORTED from audio_dataset_npy rather than copied:
+    the two sides must agree on how a bucket of N groups is cut into
+    (train, val, test), and one shared implementation is the only way to keep
+    that true as the code moves.
+    """
+    from audio_dataset_npy import _allocate_three, _seed_for
+
+    existing = dict(existing or {})
+    # bucket -> keys, in the same stratification the training used: per class,
+    # or one global bucket when stratification is off.
+    buckets: dict = {}
+    key_class = {}
+    for path, rel_parent, leaf_class, src_hash, _rel in files:
+        gk = source_group_key(rel_parent, Path(path).name, src_hash)
+        bucket = leaf_class if stratify_by_class else "__all__"
+        key_class[gk] = bucket
+        buckets.setdefault(bucket, set()).add(gk)
+
+    out = {}
+    n_new = 0
+    for bucket in sorted(buckets):
+        keys = sorted(buckets[bucket])
+        have = {k: existing[k] for k in keys if k in existing}
+        new_keys = [k for k in keys if k not in existing]
+        # Deterministic order, independent of PYTHONHASHSEED and of the order
+        # the filesystem happened to return the files in.
+        random.Random(_seed_for(seed, bucket)).shuffle(new_keys)
+        out.update(have)
+        if not new_keys:
+            continue
+        n_new += len(new_keys)
+
+        if not have:
+            # Fresh bucket: exactly the training's allocation, same order
+            # (train first, then val, then test).
+            n_tr, n_val, _n_te = _allocate_three(len(new_keys), ratios)
+            for i, k in enumerate(new_keys):
+                if i < n_tr:
+                    out[k] = "train"
+                elif i < n_tr + n_val:
+                    out[k] = "val"
+                else:
+                    out[k] = "test"
+            continue
+
+        # GROWING bucket: aim the TOTAL at the ratios instead of cutting the new
+        # arrivals on their own -- otherwise adding 3 files to a 300-file class
+        # would hand one of them to test regardless of how the class already
+        # stands. Existing assignments are read, never rewritten.
+        total = len(have) + len(new_keys)
+        target = dict(zip(SPLIT_NAMES, _allocate_three(total, ratios)))
+        current = {s: sum(1 for v in have.values() if v == s) for s in SPLIT_NAMES}
+        # Fill the small splits first: a deficit in test/val is what actually
+        # breaks an evaluation, while train absorbs any remainder harmlessly.
+        it = iter(new_keys)
+        for s in ("test", "val", "train"):
+            deficit = max(0, target[s] - current[s])
+            for _ in range(deficit):
+                k = next(it, None)
+                if k is None:
+                    break
+                out[k] = s
+        for k in it:                      # rounding remainder -> train
+            out[k] = "train"
+
+    # A key that is in splits.json but no longer on disk stays recorded: its
+    # latents may still exist (a source can be deleted after encoding), and
+    # forgetting its assignment is how a former test file quietly returns as
+    # training data. --prune_orphans is the deliberate way to drop them.
+    for k, v in existing.items():
+        out.setdefault(k, v)
+    return out, n_new
+
+
+def summarize_splits(groups: dict) -> dict:
+    counts = {s: 0 for s in SPLIT_NAMES}
+    for v in groups.values():
+        if v in counts:
+            counts[v] += 1
+    return counts
+
+
+def write_splits(out_root: Path, groups: dict, params: dict, source: str):
+    payload = {
+        "version": 1,
+        "unit": "source",
+        "source": source,          # "assigned" | "imported-from-training-split"
+        "params": params,
+        "counts": summarize_splits(groups),
+        "groups": dict(sorted(groups.items())),
+    }
+    _atomic_write_json(Path(out_root) / SPLITS_NAME, payload)
+    return payload
+
+
+def count_chunks_by_split(out_root: Path, groups: dict) -> Optional[dict]:
+    """How many CHUNKS -- the unit the TRAINING actually sees -- each split holds.
+
+    splits.json counts SOURCES, because the source file is the unit the split is
+    assigned over (that is what makes it leakage-safe). The number of training
+    samples is a different number: a source yields as many chunks as its duration
+    allows, so 80/10/10 over sources is only approximately 80/10/10 over samples.
+
+    The manifest records which chunks every source owns, and the group key is
+    recovered from a chunk name exactly as audio_dataset_npy._source_group_of()
+    does it -- the stem before the first "__", which strips __ch<n>/__c<idx> --
+    so this count cannot drift from the one the training reports on startup.
+
+    Returns None when there is no manifest to count (nothing encoded yet): an
+    absent number is honest, a zero would be a lie.
+    """
+    sources = load_source_manifest(Path(out_root))
+    if not sources:
+        return None
+    counts = {s: 0 for s in SPLIT_NAMES}
+    unassigned = 0
+    for info in sources.values():
+        for rel_chunk in info.get("chunks", []):
+            parent, _, name = rel_chunk.rpartition("/")
+            stem = name.split("__")[0]
+            gk = f"{parent}/{stem}" if parent else stem
+            split = groups.get(gk)
+            if split in counts:
+                counts[split] += 1
+            else:
+                unassigned += 1
+    return {"counts": counts, "unassigned": unassigned}
+
+
+def record_chunk_counts(out_root: Path, groups: dict) -> Optional[dict]:
+    """Write the per-split CHUNK counts into splits.json, next to the source ones.
+
+    Written at the END of a run, when the manifest is final: the split is decided
+    before anything is encoded, so how many samples it holds is simply not known
+    when write_splits() first runs. write_splits() rebuilds the payload from
+    scratch, so a later run that CHANGES the assignment drops these numbers
+    instead of leaving stale ones behind -- and this puts them back.
+
+    Only 'chunk_counts' is added; 'groups' and 'params' are untouched, so the
+    training's cache fingerprint (a digest of the assignment) does not move.
+    """
+    res = count_chunks_by_split(out_root, groups)
+    payload = load_splits(out_root)
+    if res is None or payload is None:
+        return None
+    payload["chunk_counts"] = res["counts"]
+    payload["chunk_counts_unassigned"] = res["unassigned"]
+    _atomic_write_json(Path(out_root) / SPLITS_NAME, payload)
+    return res
+
+
+def print_chunk_counts(out_root: Path, groups: dict):
+    """Record the chunk counts and say them out loud at the end of the run."""
+    res = record_chunk_counts(out_root, groups)
+    if res is None:
+        print("  samples per split: not counted "
+              f"(no {MANIFEST_NAME} yet -- nothing encoded)")
+        return
+    c = res["counts"]
+    print(f"  samples (latent chunks) per split: train {c['train']} | "
+          f"val {c['val']} | test {c['test']}  (tot {sum(c.values())})")
+    print(f"  recorded as 'chunk_counts' in {Path(out_root) / SPLITS_NAME}")
+    if res["unassigned"]:
+        print(f"  WARNING: {res['unassigned']} chunk(s) belong to a source with "
+              f"no split assignment -- re-run with --split_only to assign it.")
+
+
+def resolve_splits(out_root: Path, files, ratios, seed: int,
+                   stratify_by_class: bool, resplit: bool) -> dict:
+    """Load-or-create the dataset's split and return group_key -> split.
+
+    This is the only place a split is decided. It refuses two things loudly:
+    a parameter change (the recorded split answers to different numbers than the
+    ones asked for) and an implicit re-decision of an existing split.
+    """
+    want = _split_params(ratios, seed, stratify_by_class)
+    prev = load_splits(out_root)
+
+    if prev is not None and resplit:
+        print(f"[split] --resplit: discarding the recorded split "
+              f"({summarize_splits(prev['groups'])}) and deciding it again. "
+              f"Any checkpoint trained on the previous split is now evaluated "
+              f"on data it may have seen.")
+        prev = None
+
+    existing = None
+    if prev is not None:
+        old = prev.get("params", {})
+        diff = {k: (old.get(k), want[k]) for k in want if old.get(k) != want[k]}
+        if diff:
+            raise SystemExit(
+                f"[split] {Path(out_root) / SPLITS_NAME} was written with "
+                f"different split parameters (recorded vs requested): {diff}\n"
+                f"  The recorded split is what the existing latents were (or "
+                f"will be) trained against. Honour it by passing the same "
+                f"values, or pass --resplit to decide the split again from "
+                f"scratch -- which reshuffles train/val/test and invalidates "
+                f"every evaluation made against the old one."
+            )
+        existing = prev["groups"]
+
+    groups, n_new = assign_source_splits(
+        files, ratios, seed, stratify_by_class, existing=existing)
+
+    if existing is None:
+        write_splits(out_root, groups, want, "assigned")
+        print(f"[split] created {Path(out_root) / SPLITS_NAME}: "
+              f"{summarize_splits(groups)} source(s)")
+    elif n_new:
+        write_splits(out_root, groups, want, prev.get("source", "assigned"))
+        print(f"[split] {n_new} new source(s) assigned into the existing split "
+              f"-> {summarize_splits(groups)}")
+    else:
+        print(f"[split] reusing {Path(out_root) / SPLITS_NAME}: "
+              f"{summarize_splits(groups)} source(s), nothing new to assign")
+
+    # A ratio > 0 that produced nothing is a silent trap: the training would
+    # later build an empty val/test dataset and fail at the first index.
+    counts = summarize_splits(groups)
+    r = dict(zip(SPLIT_NAMES, want["ratios"]))
+    for name in ("val", "test"):
+        if r[name] > 0 and counts[name] == 0:
+            raise SystemExit(
+                f"[split] the '{name}' split is EMPTY despite ratio={r[name]} > 0. "
+                f"Every class has too few source files (a class with a single "
+                f"source goes entirely to train, which is what keeps the split "
+                f"leakage-safe). Add more sources, disable stratification, or "
+                f"set the '{name}' ratio to 0 on purpose.")
+    return groups
+
+
+def import_legacy_split(out_root: Path, latent_root: Path, ratios, seed: int,
+                        stratify_by_class: bool) -> dict:
+    """Freeze the split the TRAINING would have computed in-code into splits.json.
+
+    Datasets built before the split moved here have no splits.json, and a run
+    already in flight was trained against the in-code split. Recomputing it from
+    the sources would be a different assignment, so a resumed run would evaluate
+    on latents it had already trained on. This reproduces the OLD split exactly
+    -- it calls the training's own compute_split() over the latents on disk --
+    and records it in the new format, keeping those runs reproducible.
+    """
+    from audio_dataset_npy import compute_split, _source_group_of
+
+    latent_root = Path(latent_root)
+    if not latent_root.exists():
+        raise SystemExit(f"[split] --import_legacy_split: no latents under "
+                         f"{latent_root}. Nothing to import.")
+    res = compute_split(
+        latent_root, ratios=tuple(ratios), seed=seed,
+        group_by_source=True, stratify_by_class=stratify_by_class,
+        save_test_manifest=False,
+    )
+    groups = {}
+    for name in SPLIT_NAMES:
+        for f in res["splits"][name]:
+            groups[_source_group_of(Path(f), latent_root)] = name
+    params = _split_params(ratios, seed, stratify_by_class)
+    write_splits(out_root, groups, params, "imported-from-training-split")
+    print(f"[split] imported the in-code training split into "
+          f"{out_root / SPLITS_NAME}: {summarize_splits(groups)} source(s)")
+    return groups
 
 
 # ============================================================
@@ -693,16 +1151,45 @@ class DACEncoder:
 # ============================================================
 # CONDITIONS (frame-level, incremental merge into per-chunk .npz)
 # ============================================================
+def _npz_missing(cond_path: Path, names, force: bool = False) -> bool:
+    """True if `names` are not all already stored in cond_path (or force).
+
+    Reads only the archive's key list, never the arrays: np.load on an .npz is
+    lazy, so `.files` costs one read of the zip central directory. Used to
+    decide whether a chunk still has GPU-side work to do, WITHOUT paying for the
+    data of a chunk that turns out to be complete."""
+    names = set(names or ())
+    if not names:
+        return False
+    if force or not cond_path.exists():
+        return True
+    try:
+        with np.load(str(cond_path)) as data:
+            return not names.issubset(set(data.files))
+    except Exception:
+        return True          # unreadable -> treat as missing, it gets rewritten
+
+
 def extract_and_merge_frame_conditions(
     registry, chunk_audio_np, sr: int, n_frames: int,
-    cond_path: Path, force: bool = False,
+    cond_path: Path, force: bool = False, names=None,
 ) -> bool:
     """
     Extract ONLY the frame conditions that are missing from cond_path and merge
     them in (mirrors extract_conditions.py). Returns True if the .npz changed.
+
+    `names` restricts the work to a SUBSET of the registry's conditions, which
+    is what lets the CPU-side conditions be extracted in the DataLoader workers
+    while the GPU-side ones are extracted later, in the main process, from the
+    same chunk. None = every condition in the registry (the original behaviour).
+
+    Splitting the .npz across two producers is safe because the merge below
+    always re-reads what is on disk and preserves the keys it was not asked to
+    compute -- and because the worker writes BEFORE handing the chunk over, so
+    the two writes are ordered by the queue, never concurrent.
     """
     import numpy as np
-    required = set(registry.frame_names)
+    required = set(registry.frame_names if names is None else names)
     if not required:
         return False
 
@@ -1010,34 +1497,139 @@ def _chunk_mean_dbfs(chunk) -> float:
 # batches the DAC on the GPU)
 # ------------------------------------------------------------
 # Division of labour by RESOURCE, to overlap CPU and GPU and to keep CUDA out of
-# forked workers:
-#   * WORKERS (CPU, parallel): load + acoustic ffmpeg + chunking + condition
-#     extraction + WAV writing. Each of these is a per-chunk side effect written
-#     straight to disk (distinct files, no contention). Conditions are aligned to
-#     n_frames_fixed (the constant DAC T for a fixed chunk length, discovered once
-#     on the main GPU), so a worker never needs to wait for the DAC.
-#   * MAIN (GPU): batched DAC encode of the chunks that still need a latent.
-# Workers yield ONLY chunks whose latent is missing (or --force); everything else
-# is fully handled worker-side. With num_workers=0 this same path runs in-process.
+# the workers entirely:
+#   * WORKERS (CPU, parallel): load + acoustic ffmpeg + chunking + the CPU-only
+#     conditions (chroma, energy) + WAV writing. Each is a per-chunk side
+#     effect written straight to disk (distinct files, no contention). Conditions
+#     are aligned to n_frames_fixed (the constant DAC T for a fixed chunk length,
+#     discovered once on the main GPU), so a worker never waits for the DAC.
+#   * MAIN (GPU): batched DAC encode AND the GPU-capable conditions (f0, rhythm)
+#     over the same chunks, in one pass. The card has exactly one owner, which is
+#     what makes worker parallelism and GPU conditions compatible instead of an
+#     either/or -- N workers each holding a model would contend for VRAM and
+#     time-slice the GPU between processes.
+# Workers yield a chunk when it still needs a latent OR a GPU-side condition, the
+# two tracked independently so each resumes on its own; everything else is fully
+# handled worker-side. With num_workers=0 this same path runs in-process.
 # ============================================================
 def _shard_files(files, worker_id: int, num_workers: int):
     return files[worker_id::num_workers] if num_workers and num_workers > 1 else files
 
 
-def _force_cpu_extractors(registry):
-    """Force any model-backed extractor onto CPU. CUDA inside forked DataLoader
-    workers is fragile and would contend with the main DAC; f0 on GPU is only
-    advisable with --num_workers 0."""
+def _extractor_device_attr(ext) -> Optional[str]:
+    """Name of the attribute an extractor keeps its device in, or None if it has
+    no device at all (a pure-DSP extractor: chroma, energy).
+
+    Two names because the classes disagree: CrepeF0Extractor exposes `device`,
+    RhythmExtractor `_device`. Checking only the public one -- which is what this
+    file used to do -- silently missed rhythm, so a call meant to pin everything
+    to CPU left it wherever it was. Its default happens to be "cpu", so nothing
+    broke; the guard was simply not doing what its name said."""
+    for attr in ("device", "_device"):
+        if hasattr(ext, attr):
+            return attr
+    return None
+
+
+def _split_extractors_by_device(registry):
+    """Partition the frame conditions into (gpu_capable, cpu_only) name lists.
+
+    GPU-capable = has a device knob (f0 via torchcrepe, rhythm via beat_this).
+    CPU-only = pure DSP (chroma, energy) or a backend with no device knob
+    exposed here. Driven by the extractor objects rather
+    than a hardcoded name list, so a condition added later lands on the right
+    side by itself."""
+    if registry is None:
+        return [], []
+    gpu, cpu = [], []
+    for name, ext in getattr(registry, "frame_extractors", {}).items():
+        (gpu if _extractor_device_attr(ext) else cpu).append(name)
+    return gpu, cpu
+
+
+def _set_extractor_device(registry, names, device: str):
+    """Point the named extractors at `device`. The device never changes the
+    values an extractor produces, only the speed -- so this is safe to flip per
+    run and is deliberately NOT part of any output fingerprint."""
     if registry is None:
         return
-    for ext in list(getattr(registry, "frame_extractors", {}).values()):
-        if hasattr(ext, "device"):
-            ext.device = "cpu"
+    for name in names or ():
+        ext = registry.frame_extractors.get(name)
+        if ext is None:
+            continue
+        attr = _extractor_device_attr(ext)
+        if attr:
+            setattr(ext, attr, device)
+
+
+def _force_cpu_extractors(registry, names=None):
+    """Pin the named extractors to CPU (all of them if `names` is None).
+
+    Why it still exists now that the GPU-side conditions run in the main
+    process: the extractors that STAY in the DataLoader workers must never touch
+    CUDA. N workers each holding a model on the one card would contend with the
+    DAC for VRAM and time-slice the GPU between processes. Since the GPU-side
+    conditions have left the workers entirely, this now applies to the CPU-side
+    group only -- applying it to all of them, as before, would put f0 back on
+    CPU and undo the point of the split."""
+    if registry is None:
+        return
+    if names is None:
+        names = list(getattr(registry, "frame_extractors", {}).keys())
+    _set_extractor_device(registry, names, "cpu")
+
+
+def _process_gpu_batch(dac_enc, batch, sr, n_frames: int,
+                       registry=None, gpu_names=None, force=False):
+    """Everything the GPU owes this batch of chunks, in the MAIN process.
+
+    Two GPU steps over the SAME chunks, back to back:
+      1. the batched DAC encode -> latents;
+      2. the GPU-side conditions (f0 / rhythm) -> merged into each chunk's .npz.
+
+    They cannot share one tensor -- the DAC wants 44.1 kHz audio and CREPE wants
+    16 kHz, they are different models with different inputs -- but they run over
+    the same chunks in the same pass, which is what keeps the card busy instead
+    of alternating between a busy CPU and an idle GPU.
+
+    The conditions are NOT batched across chunks, on purpose: torchcrepe already
+    batches internally at the FRAME level (its `batch_size` is CREPE frames per
+    forward), and one 5 s chunk is ~500 frames -- a full forward on its own once
+    `batch_size` is raised to match. Stacking chunks on top of that would add
+    framing complexity at the boundaries for no throughput.
+
+    Each item carries its own two flags: `latent_path` is None when the latent is
+    already valid, `cond_path` is None when the .npz already holds every GPU-side
+    condition. A chunk is handed over if EITHER is outstanding, so the two kinds
+    of work resume independently -- adding f0 to a dataset whose latents are all
+    encoded re-reads the audio without re-encoding a single latent.
+
+    Returns (n_latents, n_conditions) actually written.
+    """
+    if not batch:
+        return 0, 0
+
+    n_lat = _encode_and_save_batch(
+        dac_enc, [it for it in batch if it.get("latent_path")], sr, n_frames)
+
+    n_cond = 0
+    if registry is not None and gpu_names:
+        for it in batch:
+            cp = it.get("cond_path")
+            if not cp:
+                continue
+            audio = it["audio"]
+            chunk_np = audio.numpy() if hasattr(audio, "numpy") else np.asarray(audio)
+            extract_and_merge_frame_conditions(
+                registry, chunk_np, sr, n_frames, Path(cp),
+                force=force, names=gpu_names)
+            n_cond += 1
+    return n_lat, n_cond
 
 
 def _encode_and_save_batch(dac_enc, batch, sr, n_frames: int) -> int:
     """Batched DAC encode of a list of worker items -> save each latent."""
-    if not batch:
+    if not batch or dac_enc is None:
         return 0
     audios = [it["audio"] for it in batch]
     lats = dac_enc.encode_batch(audios, sr)      # list of (72, T)
@@ -1071,16 +1663,25 @@ class StreamingChunkDataset(IterableDataset):
     """
 
     def __init__(self, files, chunker, registry, latent_root, wav_root, cond_root,
-                 sr, save_wav, force, n_frames_fixed,
-                 acoustic, acoustic_kw, silence_thresh_db, tmp_dir):
+                 sr, wav_sources, force, n_frames_fixed,
+                 acoustic, acoustic_kw, silence_thresh_db, tmp_dir,
+                 cpu_cond_names=None, gpu_cond_names=None):
         self.files = files
         self.chunker = chunker
         self.registry = registry
+        # Which conditions this worker extracts itself, and which it only has to
+        # REPORT as outstanding so the main process can do them on the GPU.
+        self.cpu_cond_names = list(cpu_cond_names or [])
+        self.gpu_cond_names = list(gpu_cond_names or [])
         self.latent_root = Path(latent_root)
         self.wav_root = Path(wav_root)
         self.cond_root = Path(cond_root)
         self.sr = sr
-        self.save_wav = save_wav
+        # "all" | None | set of rel_source. The SET form is what makes
+        # "keep only the validation wavs" cost nothing to express here: main
+        # resolves the split once and ships the (small) selected subset, so a
+        # worker never needs the split table to decide.
+        self.wav_sources = wav_sources
         self.force = force
         self.n_frames_fixed = n_frames_fixed
         self.acoustic = acoustic
@@ -1096,9 +1697,13 @@ class StreamingChunkDataset(IterableDataset):
         else:
             shard = _shard_files(self.files, wi.id, wi.num_workers)
 
-        has_conditions = self.registry is not None and bool(self.registry.frame_names)
+        has_cpu_conditions = self.registry is not None and bool(self.cpu_cond_names)
+        has_gpu_conditions = self.registry is not None and bool(self.gpu_cond_names)
 
         for path, rel_parent, _leaf, src_hash, rel_src in shard:
+            want_wav = (self.wav_sources == "all"
+                        or (isinstance(self.wav_sources, (set, frozenset))
+                            and rel_src in self.wav_sources))
             if self.acoustic:
                 items = acoustic_preprocess_file(path, self.tmp_dir, self.sr, **self.acoustic_kw)
                 cleanup = [w for w, _ in items]
@@ -1122,15 +1727,19 @@ class StreamingChunkDataset(IterableDataset):
                         wav_path = self.wav_root / rel_parent / f"{name}.wav"
                         cond_path = self.cond_root / rel_parent / f"{name}.npz"
 
-                        # conditions (CPU, in the worker), aligned to the fixed T
-                        if has_conditions:
+                        # CPU-side conditions, in the worker, aligned to the
+                        # fixed T. The GPU-side ones (f0 / rhythm) are NOT done
+                        # here: they belong to the main process, which is the
+                        # only one allowed to touch CUDA.
+                        if has_cpu_conditions:
                             chunk_np = chunk.squeeze(0).cpu().numpy()
                             extract_and_merge_frame_conditions(
                                 self.registry, chunk_np, self.sr,
-                                self.n_frames_fixed, cond_path, force=self.force)
+                                self.n_frames_fixed, cond_path,
+                                force=self.force, names=self.cpu_cond_names)
 
                         # optional per-chunk WAV (also worker-side)
-                        if self.save_wav and (self.force or not wav_path.exists()):
+                        if want_wav and (self.force or not wav_path.exists()):
                             _atomic_save_wav(
                                 wav_path, chunk.squeeze(0).cpu().numpy(), self.sr
                             )
@@ -1146,10 +1755,21 @@ class StreamingChunkDataset(IterableDataset):
                                 latent_path, self.n_frames_fixed
                             )
                         )
-                        if needs_latent:
+                        # The .npz was just written above (CPU conditions), so
+                        # this reads the CURRENT state: only the GPU-side names
+                        # still absent make the chunk worth handing over.
+                        needs_gpu_cond = has_gpu_conditions and _npz_missing(
+                            cond_path, self.gpu_cond_names, force=self.force)
+                        if needs_latent or needs_gpu_cond:
                             audio = chunk.squeeze(0).detach().clone()
+                            # Each flag travels as "the path to write, or None":
+                            # the main process then does exactly the outstanding
+                            # half and never redoes the finished one.
                             yield {"audio": audio,
-                                   "latent_path": str(latent_path)}
+                                   "latent_path": (str(latent_path)
+                                                   if needs_latent else None),
+                                   "cond_path": (str(cond_path)
+                                                 if needs_gpu_cond else None)}
             finally:
                 for w in cleanup:
                     Path(w).unlink(missing_ok=True)
@@ -1280,15 +1900,23 @@ def check_or_write_meta(out_root: Path, meta: dict):
 # ============================================================
 # MAIN
 # ============================================================
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Streaming preprocessing (chunk -> DAC encode -> latents), "
                     "supervisor-style. Optional per-chunk WAV/conditions, "
-                    "incremental, no train/val/test split.",
+                    "incremental, with the train/val/test split decided here "
+                    "and recorded in splits.json.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("source_dir", type=str)
-    parser.add_argument("output_dir", type=str)
+    # Optional so the whole run can be described by --config alone; a positional
+    # given on the command line still wins over the file (see _resolve_args).
+    parser.add_argument("source_dir", type=str, nargs="?", default=None)
+    parser.add_argument("output_dir", type=str, nargs="?", default=None)
+    parser.add_argument("--config", type=str, default=None,
+                        help="YAML file with any of these options (keys are the "
+                             "long flag names without '--'). Precedence: "
+                             "built-in defaults < config file < command line, so "
+                             "a flag you type always wins over the file.")
 
     # chunking
     parser.add_argument("--sr", type=int, default=44100,
@@ -1341,12 +1969,60 @@ def main():
                              "(default: --chunk_duration).")
 
     # outputs
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_wav", action="store_true",
-                        help="Also save the per-chunk WAV under wav/<class>/.")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Device for the DAC encoder (and, unless "
+                             "--cond_device says otherwise, for the GPU-capable "
+                             "condition extractors).")
+    parser.add_argument("--cond_device", type=str, default=None,
+                        help="Device for the GPU-capable condition extractors "
+                             "(f0 via torchcrepe, rhythm via beat_this). "
+                             "Default: follow --device. These run in the MAIN "
+                             "process, next to the DAC batch, so no worker ever "
+                             "touches CUDA. Pure-DSP conditions (chroma, energy) "
+                             "always run on CPU in the workers, "
+                             "whatever this says. The device changes speed only, "
+                             "never the extracted values.")
+    parser.add_argument("--save_wav", type=str, nargs="?", default="none",
+                        const="all", metavar="SPLITS",
+                        help="Also save the per-chunk WAV under wav/<class>/, for "
+                             "the listed splits: 'none' (default), 'all', or a "
+                             "comma-separated subset of train,val,test (e.g. "
+                             "--save_wav val). A bare --save_wav means 'all', as "
+                             "before. Anything but 'none'/'all' needs the split, "
+                             "so it is resolved from splits.json. The wavs are "
+                             "the REAL source audio (never DAC round-trips): "
+                             "'val' is what a standard FAD reference is built "
+                             "from, and it costs ~10x less disk than 'all'.")
+
+    # ---- train / val / test split (decided here, recorded in splits.json) ----
+    parser.add_argument("--split_ratios", type=str, default="0.8,0.1,0.1",
+                        help="train,val,test ratios over SOURCE FILES (not "
+                             "chunks). Applied per class when stratifying.")
+    parser.add_argument("--split_seed", type=int, default=42,
+                        help="Seed of the split. Part of its identity: changing "
+                             "it on an existing dataset is refused without "
+                             "--resplit.")
+    parser.add_argument("--no_stratify", action="store_true",
+                        help="Do NOT balance the split per class (default is to "
+                             "stratify, matching the training's old behaviour).")
+    parser.add_argument("--resplit", action="store_true",
+                        help="Decide the split again from scratch, discarding "
+                             "the recorded one. This REASSIGNS sources across "
+                             "train/val/test, so any checkpoint trained on the "
+                             "old split is then evaluated on data it has seen.")
+    parser.add_argument("--split_only", action="store_true",
+                        help="Only create/extend splits.json and exit: no "
+                             "decoding, no encoding, no conditions. This is how "
+                             "an already-preprocessed dataset gets a split.")
+    parser.add_argument("--import_legacy_split", action="store_true",
+                        help="Write splits.json by reproducing the split the "
+                             "TRAINING used to compute in-code, from the latents "
+                             "on disk. Use it once on datasets built before the "
+                             "split moved here, so runs already in flight keep "
+                             "the exact same val/test sets. Implies --split_only.")
     parser.add_argument("--conditions", type=str, default=None,
                         help="Comma-separated frame conditions to extract, e.g. "
-                             "'melody' or 'melody,energy'. None = skip conditions.")
+                             "'f0' or 'f0,energy'. None = skip conditions.")
     parser.add_argument("--global", dest="global_conds", type=str, default=None,
                         help="Comma-separated global conditions to pre-cache "
                              "('text' and/or 'image'). Class-level sidecars.")
@@ -1403,8 +2079,126 @@ def main():
                         help="Safe multiprocessing start method (default: "
                              "spawn). Avoids forking workers from a process "
                              "that already initialized CUDA.")
+    return parser
 
-    args = parser.parse_args()
+
+_UNSET = object()      # a default argparse will never try to type-convert
+
+
+def _explicitly_given(argv=None) -> dict:
+    """Which options the user actually TYPED, as opposed to inherited defaults.
+
+    A second parser whose every default is a unique sentinel returns only the
+    options present on the command line, which is what lets the config file fill
+    in the rest without ever overriding something asked for explicitly.
+
+    The sentinel is an object() and not argparse.SUPPRESS on purpose: SUPPRESS is
+    the STRING '==SUPPRESS==', and argparse runs `type=` over string defaults --
+    so '--sr' would fail with int('==SUPPRESS==') before parsing even started.
+    """
+    p = build_parser()
+    for a in p._actions:
+        if a.dest != "help":
+            a.default = _UNSET          # the action, not parser.set_defaults()
+    ns = vars(p.parse_args(argv))
+    return {k: v for k, v in ns.items() if v is not _UNSET}
+
+
+def _load_preprocess_config(path: str, parser) -> dict:
+    """Read the YAML and validate its keys against the parser.
+
+    An unknown key is an ERROR, not a shrug: a typo in a config that is meant to
+    be the memory of how a dataset was built would otherwise be indistinguishable
+    from a setting that silently did nothing."""
+    import yaml
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"[config] no such file: {p}")
+    try:
+        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        raise SystemExit(f"[config] {p} is not readable YAML: {e}")
+    if not isinstance(raw, dict):
+        raise SystemExit(f"[config] {p} must contain a mapping of option -> value.")
+    known = {a.dest for a in parser._actions if a.dest != "help"} - {"config"}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise SystemExit(
+            f"[config] {p} has {len(unknown)} unknown option(s): {unknown}\n"
+            f"  Keys are the long flags without '--'. Known: {sorted(known)}")
+    return raw
+
+
+def _resolve_args(argv=None):
+    """Built-in defaults < --config file < command line."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.config:
+        cfg = _load_preprocess_config(args.config, parser)
+        typed = _explicitly_given(argv)
+        applied = []
+        for k, v in cfg.items():
+            if k in typed:                # the command line wins, always
+                continue
+            setattr(args, k, v)
+            applied.append(k)
+        print(f"[config] {args.config}: applied {len(applied)} option(s)"
+              + (f"; overridden on the command line: "
+                 f"{sorted(set(cfg) & set(typed))}"
+                 if set(cfg) & set(typed) else ""))
+    for name in ("source_dir", "output_dir"):
+        if not getattr(args, name):
+            raise SystemExit(
+                f"[preprocess_stream] {name} is required: pass it positionally "
+                f"(SRC OUT) or set '{name}' in the --config file.")
+    return args
+
+
+def _parse_ratios(spec) -> Tuple[float, float, float]:
+    """'0.8,0.1,0.1' (or a YAML list) -> the three ratios, validated."""
+    if isinstance(spec, (list, tuple)):
+        parts = list(spec)
+    else:
+        parts = [p for p in str(spec).split(",") if p.strip() != ""]
+    if len(parts) != 3:
+        raise SystemExit(f"[split] --split_ratios needs exactly 3 values "
+                         f"(train,val,test), got {spec!r}.")
+    try:
+        r = tuple(float(x) for x in parts)
+    except ValueError:
+        raise SystemExit(f"[split] --split_ratios must be numbers, got {spec!r}.")
+    if any(x < 0 for x in r):
+        raise SystemExit(f"[split] --split_ratios must be >= 0, got {r}.")
+    if not math.isclose(sum(r), 1.0, rel_tol=0, abs_tol=1e-6):
+        raise SystemExit(f"[split] --split_ratios must sum to 1.0, got {r} "
+                         f"(sum={sum(r)}).")
+    return r
+
+
+def _parse_wav_splits(spec) -> frozenset:
+    """'none' | 'all' | 'val' | 'train,val' -> the set of splits to save."""
+    if spec is None or spec is False:
+        return frozenset()
+    if spec is True:                      # save_wav: true in the YAML
+        return frozenset(SPLIT_NAMES)
+    if isinstance(spec, (list, tuple)):
+        parts = [str(x).strip().lower() for x in spec]
+    else:
+        parts = [p.strip().lower() for p in str(spec).split(",") if p.strip()]
+    if not parts or parts == ["none"]:
+        return frozenset()
+    if parts == ["all"]:
+        return frozenset(SPLIT_NAMES)
+    bad = sorted(set(parts) - set(SPLIT_NAMES))
+    if bad:
+        raise SystemExit(
+            f"[wav] --save_wav got {bad}; expected 'none', 'all', or a "
+            f"comma-separated subset of {list(SPLIT_NAMES)}.")
+    return frozenset(parts)
+
+
+def main():
+    args = _resolve_args()
 
     if not _TORCH_OK:
         raise SystemExit("[preprocess_stream] PyTorch is required to run "
@@ -1442,6 +2236,34 @@ def main():
     # NOTE: dataset_meta.json is written AFTER the real latent T is discovered
     # (see below), so it records latent_frames_per_chunk as part of the contract.
 
+    split_ratios = _parse_ratios(args.split_ratios)
+    stratify = not args.no_stratify
+    wav_splits = _parse_wav_splits(args.save_wav)
+
+    # ---- split-only modes: decide the split and stop ----
+    # Placed BEFORE the condition registry so neither mode loads CREPE/CLAP/DAC:
+    # writing a split is a metadata operation and must stay one, otherwise
+    # "give this finished dataset a split" would cost a model load per run.
+    if args.import_legacy_split or args.split_only:
+        if args.import_legacy_split:
+            groups = import_legacy_split(out_root, latent_root, split_ratios,
+                                         args.split_seed, stratify)
+        else:
+            print("Scanning source files ...")
+            files = scan_audio_files(args.source_dir, args.single_class,
+                                     args.class_name)
+            if not files:
+                raise SystemExit(f"[ERROR] No audio files under {args.source_dir}")
+            print(f"  {len(files)} files")
+            groups = resolve_splits(out_root, files, split_ratios,
+                                    args.split_seed, stratify, args.resplit)
+        print(f"\nDONE (split only)\n  output: {out_root / SPLITS_NAME}")
+        # The latents of a previous run are already on disk, so the samples per
+        # split are countable here too -- and this is the cheap way to ask for
+        # them: --split_only decodes nothing.
+        print_chunk_counts(out_root, groups)
+        return
+
     # ---- condition registry (frame + optional global selection) ----
     enabled_frame = None
     if args.conditions is not None:
@@ -1451,15 +2273,46 @@ def main():
         enabled_global = [c.strip() for c in args.global_conds.split(",") if c.strip()]
 
     registry = None
+    gpu_cond_names, cpu_cond_names = [], []
     if enabled_frame or enabled_global:
         from conditions import ConditionRegistry
         registry = ConditionRegistry(
             enabled_frame=enabled_frame if enabled_frame else [],
             enabled_global=enabled_global if enabled_global else [],
         )
+
+        # ---- split the frame conditions by WHERE they can run ----
+        # GPU-capable ones (f0, rhythm) move to the MAIN process, alongside the
+        # DAC batch: the card stays owned by one process, so the reason workers
+        # were barred from CUDA is satisfied by construction rather than by a
+        # rule. Everything else stays in the workers, on CPU.
+        cond_device = args.cond_device or args.device
+        if cond_device.startswith("cuda") and not torch.cuda.is_available():
+            print("[cond] cond_device='cuda' but no GPU is available "
+                  "-> condition extraction falls back to CPU.")
+            cond_device = "cpu"
+
+        gpu_capable, cpu_only = _split_extractors_by_device(registry)
+        if cond_device.startswith("cuda"):
+            gpu_cond_names, cpu_cond_names = gpu_capable, cpu_only
+            _set_extractor_device(registry, gpu_cond_names, cond_device)
+        else:
+            # Everything on CPU: the extraction all happens worker-side, exactly
+            # as before this split existed.
+            gpu_cond_names, cpu_cond_names = [], gpu_capable + cpu_only
+
         if args.num_workers > 0:
-            # CUDA in forked workers is fragile; keep model-backed extractors on CPU.
-            _force_cpu_extractors(registry)
+            # The extractors that REMAIN in the workers must never touch CUDA:
+            # one model per worker on a single card would contend with the DAC
+            # for VRAM and time-slice the GPU between processes. Scoped to the
+            # CPU-side group -- applying it to all of them, as it used to, would
+            # put f0 straight back on CPU and undo the split above.
+            _force_cpu_extractors(registry, cpu_cond_names)
+
+        if registry.frame_names:
+            print(f"[cond] frame conditions: "
+                  f"GPU({cond_device})={gpu_cond_names or 'none'} in the main "
+                  f"process | CPU={cpu_cond_names or 'none'} in the workers")
 
     # ---- scan ----
     print("Scanning source files ...")
@@ -1469,6 +2322,32 @@ def main():
         return
     classes = sorted({leaf for _, _, leaf, _, _ in files})
     print(f"  {len(files)} files, {len(classes)} classes")
+
+    # ---- split: load or create, ALWAYS (it is part of the dataset) ----
+    # Resolved even when no wavs are requested: the split is what the training
+    # will read back, so a dataset produced by this script always carries one and
+    # never depends on when someone first happened to ask for it.
+    split_groups = resolve_splits(out_root, files, split_ratios, args.split_seed,
+                                  stratify, args.resplit)
+
+    # ---- which sources get a WAV ----
+    # "all" travels as a sentinel rather than a set of every source: the workers
+    # are separate processes and would each be shipped a copy of it.
+    if not wav_splits:
+        wav_sources = None
+    elif set(wav_splits) == set(SPLIT_NAMES):
+        wav_sources = "all"
+    else:
+        wav_sources = {
+            rel for path, rel_parent, _leaf, src_hash, rel in files
+            if split_groups.get(
+                source_group_key(rel_parent, Path(path).name, src_hash)
+            ) in wav_splits
+        }
+    if wav_splits:
+        _n = len(files) if wav_sources == "all" else len(wav_sources)
+        print(f"[wav] saving the per-chunk WAV of {sorted(wav_splits)} "
+              f"-> {_n}/{len(files)} source(s)")
 
     # ---- chunking backend ----
     backend_kw = dict(
@@ -1575,6 +2454,26 @@ def main():
             else:
                 print(f"           -> pass --prune_orphans to delete them.")
 
+    # ---- skip the sources that have nothing left to produce ----
+    # Runs AFTER the audit (which needs the complete scan to spot changed and
+    # removed sources) and only when the manifest can vouch for a source. With
+    # --force there is nothing to skip: it means "redo what you encounter".
+    if not args.force and prev_manifest:
+        _run_cond_names = list(cpu_cond_names) + list(gpu_cond_names)
+        n_before = len(files)
+        files, n_skipped = filter_complete_sources(
+            files, prev_manifest, changed_srcs,
+            latent_root, cond_root, wav_root, n_frames_fixed,
+            _run_cond_names, dac_enc is not None, wav_sources)
+        if n_skipped:
+            print(f"[resume] {n_skipped}/{n_before} source(s) already have every "
+                  f"output this run would write -> not decoded at all.")
+        if not files:
+            # Deliberately NOT an early return: the class-level global conditions
+            # below are not per-source, so a dataset whose chunks are all complete
+            # can still be missing them.
+            print("[resume] no source needs per-chunk work this run.")
+
     # ---- acoustic-rules setup (optional) ----
     tmp_dir = None
     min_chunk_sec = args.min_chunk_sec if args.min_chunk_sec is not None else args.chunk_duration
@@ -1597,8 +2496,9 @@ def main():
     dataset = StreamingChunkDataset(
         files=files, chunker=chunker, registry=registry,
         latent_root=latent_root, wav_root=wav_root, cond_root=cond_root,
-        sr=args.sr, save_wav=args.save_wav, force=args.force,
+        sr=args.sr, wav_sources=wav_sources, force=args.force,
         n_frames_fixed=n_frames_fixed,
+        cpu_cond_names=cpu_cond_names, gpu_cond_names=gpu_cond_names,
         acoustic=args.acoustic_rules, acoustic_kw=acoustic_kw,
         silence_thresh_db=args.silence_thresh_db, tmp_dir=tmp_dir,
     )
@@ -1637,8 +2537,24 @@ def main():
         file_bar = None
 
     n_lat = 0
-    pending = []          # real chunks awaiting a full DAC batch
+    n_gcond = 0
+    pending = []          # real chunks awaiting a full GPU batch
     produced = {}         # rel_source -> {size, mtime_ns, chunks} for the manifest
+    # A batch is worth assembling if the main process owes it ANY GPU work: the
+    # DAC encode, the GPU-side conditions, or both. With --skip_dac and f0 on the
+    # GPU there is no encoder but there is still work, so the old "no encoder ->
+    # drop everything" shortcut would have silently skipped the f0 of every chunk.
+    _dac_on = not (args.skip_dac or dac_enc is None)
+    _gpu_work = _dac_on or bool(gpu_cond_names)
+
+    def _flush(items):
+        nonlocal n_lat, n_gcond
+        a, b = _process_gpu_batch(
+            dac_enc if _dac_on else None, items, args.sr, n_frames_fixed,
+            registry=registry, gpu_names=gpu_cond_names, force=args.force)
+        n_lat += a
+        n_gcond += b
+
     try:
         for batch in loader:                        # each batch = list of items
             for it in batch:
@@ -1650,20 +2566,16 @@ def main():
                         produced[src] = it["ident"]
                     continue
                 pending.append(it)
-            if args.skip_dac or dac_enc is None:
+            if not _gpu_work:
                 pending.clear()                     # workers already wrote conds/wav
                 continue
-            # keep the DAC batches at exactly batch_size (the markers must not
+            # keep the GPU batches at exactly batch_size (the markers must not
             # shrink them), flushing the remainder after the stream ends.
             while len(pending) >= args.batch_size:
-                n_lat += _encode_and_save_batch(
-                    dac_enc, pending[:args.batch_size], args.sr,
-                    n_frames_fixed)
+                _flush(pending[:args.batch_size])
                 del pending[:args.batch_size]
-        if pending and not (args.skip_dac or dac_enc is None):
-            n_lat += _encode_and_save_batch(
-                dac_enc, pending, args.sr, n_frames_fixed
-            )
+        if pending and _gpu_work:
+            _flush(pending)
             pending.clear()
     finally:
         if file_bar is not None:
@@ -1687,8 +2599,12 @@ def main():
 
     print("\nDONE")
     print(f"  latents encoded this run: {n_lat}")
-    print("  conditions / wav were written in-stream by the workers "
+    if gpu_cond_names:
+        print(f"  GPU conditions {gpu_cond_names} extracted this run: {n_gcond} "
+              f"chunk(s)")
+    print("  CPU conditions / wav were written in-stream by the workers "
           "(counts not aggregated across processes).")
+    print_chunk_counts(out_root, split_groups)
     print(f"  output: {out_root}")
 
 

@@ -5,7 +5,7 @@
 # Mirrors the structure of configs/uncond_default.yaml (model / data / training
 # / intervals / sampling / metrics / paths) and adds a `conditioning` section for
 # the multi-modal conditioning specific to this project:
-#   - frame-level conditions (melody, chroma, rhythm, energy) are CONCATENATED on
+#   - frame-level conditions (f0, chroma, rhythm, energy) are CONCATENATED on
 #     the feature dimension at the model input, JASCO-style (see network_cond.py);
 #   - global conditions (text-CLAP, image-CLIP) are injected via AdaLN, exactly
 #     as the class label in the official DiT;
@@ -13,7 +13,7 @@
 #   - classifier-free guidance during validation (audio + metrics).
 #
 # Name of the experiment (organises runs on disk and in TensorBoard):
-#   python training_cond.py --run_name "cond_S_melody"
+#   python training_cond.py --run_name "cond_S_f0"
 #   (default: timestamp YYYY-MM-DD_HH-MM-SS)
 #
 # To resume a training (a new run starts from the given checkpoint):
@@ -21,7 +21,7 @@
 #
 # Override on the CLI with dotlist syntax, e.g.:
 #   python training_cond.py --config configs/cond_default.yaml \
-#       --run_name "cond_S_melody" model.kind=S training.num_steps=500000
+#       --run_name "cond_S_f0" model.kind=S training.num_steps=500000
 #
 # The project-wide pool of available conditions lives in CONDITION_CONFIG in
 # conditions.py. What lives in YAML is the per-run SELECTION of a subset of that
@@ -53,32 +53,33 @@ data:
   num_workers: 4         # DataLoader workers; set 0 on Windows or for simple/debug runs
 
   # ----------------------------------------------------------------
-  # TRAIN / VAL / TEST split (decided in code; the dataset is split-less on
-  # disk, produced by preprocess_stream.py). The split is:
-  #   * stratified by class (each class contributes to every split by ratio);
-  #   * grouped by SOURCE file (all chunks AND both stereo channels of one
-  #     source go to the same split) -> no chunk-level train/test leakage;
-  #   * deterministic from `seed`;
-  #   * the TEST set is persisted to  <dataset_root>/../splits/test_split_<hash>.json
-  #     so every run on the same dataset+params reuses the SAME test set
-  #     (comparable conditioned generations across checkpoints); train/val are
-  #     re-derived deterministically and need not be saved.
-  # Changing any of these values changes the cached normalizer / FD-DAC
-  # reference fingerprint, so a fresh paths.cache_dir is required.
+  # TRAIN / VAL / TEST split: THERE IS NOTHING TO CONFIGURE HERE ANY MORE.
+  #
+  # The split is decided by preprocess_stream.py -- over the SOURCE FILES, before
+  # anything is encoded -- and recorded in <dataset_root>/../splits.json. The
+  # training READS that file (audio_dataset_npy.load_source_split). Ratios, seed
+  # and stratification are set in configs/preprocess_default.yaml, once, with the
+  # dataset; they are not a per-run knob, because a split that can be re-decided
+  # at startup is a split that can silently move a training source into the test
+  # set between two runs of the same experiment.
+  #
+  # The recorded ASSIGNMENT (not just its parameters) is part of the cached
+  # normalizer / FD-DAC fingerprint: if the split changes, or new sources are
+  # assigned into it, the cache is refused as stale and a fresh paths.cache_dir
+  # is required -- the normalizer is fitted on the train split.
+  #
+  # A dataset built before this change has no splits.json; create it once with
+  #   python preprocess_stream.py SRC OUT --import_legacy_split
+  # which reproduces the split the training used to compute in-code, so a run
+  # already in flight keeps exactly the same val/test sets.
   # ----------------------------------------------------------------
-  split:
-    ratios: [0.8, 0.1, 0.1]   # train / val / test (per-class, over source groups)
-    seed: 42
-    group_by_source: true      # leakage-safe (keep true)
-    stratify_by_class: true
-    save_test_manifest: true
 
 
 # ============================================================
 # TRAINING
 # ============================================================
 training:
-  num_steps: 1000000
+  num_steps: 1000001
   lr: 1.0e-4
   seed: 42                # global run seed: x0, t-sampling, CFG dropout, DataLoader
                           # shuffle. null = off (free-running). Matches uncond.
@@ -114,7 +115,11 @@ training:
 # ============================================================
 intervals:
   val:     1000           # validation loss
-  audio:   25000          # generated-audio preview on TB (Validation/Audio_generated_*)
+  audio:   25000          # audio preview into the per-sample panels on TB
+                          # (the validation_XX/ blocks: the condition cards
+                          # plus 2_generation_with_f0_validation_XX).
+                          # Skipped when the step is
+                          # also a metrics step, which writes the same panels.
                           # sampling.n_audio_samples generations. The real reference
                           # audio is logged ONCE at step 0. The richer
                           # real/with-cond/without-cond comparison is logged at
@@ -133,6 +138,81 @@ sampling:
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4      # conditioned audios logged on TB for listening
+
+  # ---------------------------------------------------------------
+  # THE INFLUENCE SET -- one N, three windows
+  # ---------------------------------------------------------------
+  # N validation samples AND N out-of-the-box probe stimuli. The SAME samples
+  # produce all three diagnostic windows, which is the point: the number you
+  # read in the table is about the curve you are looking at and the audio you
+  # are hearing.
+  #
+  #   IMAGES  validation_XX/<cond>_target_vs_gen   target vs re-extracted
+  #           probe_XX/<cond>_target_vs_gen        idem, on the probe stimuli
+  #   AUDIO   validation_XX/ , probe_XX/           one card per condition
+  #                                                (sonified) + the generation
+  #                                                conditioned on it
+  #   TEXT    Validation/Condition_influence       for each family, how close
+  #                                                the generated condition is to
+  #                                                its target, MINUS how close a
+  #                                                generation WITHOUT conditions
+  #                                                lands. That subtraction is
+  #                                                what makes it an influence.
+  #
+  # Both windows group per sample, so N=16 reads as 16 collapsible sections,
+  # not one flat wall of images.
+  #
+  # This is NOT n_metrics_samples: FD-DAC / KL / FAD estimate a covariance and
+  # want hundreds of samples; the influence set is read panel by panel by a
+  # human, so it is small and fully shown.
+  #
+  # COST per metrics step: N paired generations for validation + N for the probe
+  # (paired = with conditions and without, from the same noise -- the "without"
+  # is what the delta is measured against), plus one re-extraction each. This is
+  # the knob to lower if the metrics step gets too long. Max 16 for the probe
+  # (the size of each bank in probe_conditions.py).
+  n_influence_samples: 16
+
+  # ---- OUT-OF-THE-BOX PROBE PANELS ----
+  # Probe panel i drives EVERY condition active in the run at once, taking the
+  # i-th stimulus of each condition's own bank: the f0 of a scale, the chroma of
+  # a triad, the energy of a crescendo, the rhythm of a 120 bpm grid. The banks
+  # are combined BY INDEX and are therefore NOT mutually aligned -- deliberate,
+  # see below. Which stimuli each panel combines is written to
+  # Validation/Probe_combinations. Set n_influence_samples: 0 to disable.
+                          #
+                          # WHY JOINT. With p_drop_each_frame = 0.0 (see below)
+                          # the model only ever sees all of its conditions or
+                          # none, so probing one at a time with the others
+                          # nulled would ask it for a subset it never saw. The
+                          # joint panel presents the shape it was trained on.
+                          #
+                          # WHY NOT ALIGNED. The probe is an out-of-the-box
+                          # controllability check on unambiguous stimuli: it
+                          # answers "does this conditioning move the generation
+                          # at all". The validation rows carry the aligned,
+                          # in-corpus case, but there a condition is often not
+                          # cleanly extractable (a smeared chromagram, a beat
+                          # grid that does not exist) and a middling score does
+                          # not separate weak conditioning from an ambiguous
+                          # target. The two rows answer different questions and
+                          # neither replaces the other.
+                          #
+                          # The stimuli live in probe_conditions.py:
+                          #   f0     -> scales, arpeggios, octave leaps, ...
+                          #   energy -> crescendo, diminuendo, stabs, staircases
+                          #   chroma -> sustained triads, I-IV-V, clusters
+                          #   rhythm -> click grids at fixed tempi
+                          # Build one standalone to look at it before training:
+                          #   python probe_conditions.py energy ./cache/probe_energy --n_frames 431
+
+  # NB: three older knobs are GONE, and the code no longer reads any of them --
+  # a leftover in your own config would do nothing:
+  #   n_probes      -> now sampling.n_influence_samples (probe stimuli)
+  #   n_cond_plot   -> gone: every sample of the influence set is plotted
+  #   n_f0_plot     -> gone (it was already only an alias of n_cond_plot)
+  #   n_<cond>_probe (f0/energy/chroma/rhythm) -> gone, they were already inert
+
   n_metrics_samples: 512  # conditioned samples used to compute FD-DAC + KL. 512 is a
                           # stable estimate for a 72-dim covariance; 1024 doubles the
                           # metrics-step TIME for a marginal statistical gain -- keep it
@@ -143,14 +223,46 @@ sampling:
   # so it is BOUNDED to small subsets -- decoding/re-extracting all of a large
   # n_metrics_samples is what OOM-kills the process. Keep these small.
   #
-  # How many generations get re-extracted to measure condition influence
-  # (melody RPA/RCA, energy corr, ...). The audio influence is computed in a
-  # STREAMING, memory-flat way (decode one -> re-extract -> discard), so peak RAM
-  # does NOT grow with this number: you can raise it as high as you like and the
-  # only cost is TIME (basic-pitch runs once per sample). 64 is already a stable
-  # mean; raising to e.g. 256/512 buys little statistically but costs proportional
-  # time per metrics step.
-  n_influence_samples: 64
+  # (The influence set size lives above, as sampling.n_influence_samples: it is
+  # one knob for the validation samples, the probe stimuli and the panels.)
+
+  # ---------------------------------------------------------------
+  # CONDITION SUBSETS -- the delta MATRIX
+  # ---------------------------------------------------------------
+  # Which COMBINATIONS of the active frame conditions to generate and score at
+  # each metrics step. The Condition_influence panel then becomes a matrix:
+  # one row per combination, one column per (condition, metric), each cell the
+  # Δ against the SAME null pass -- a shared baseline is what makes the rows
+  # comparable with one another.
+  #
+  # Columns cover EVERY active condition, not only the ones given in that row.
+  # The off-subset cells (marked °) are the interesting ones: give f0 alone and
+  # watch what happens to chroma.
+  #
+  # Entries are either an explicit list of condition names, or a keyword:
+  #   "all"        -> every active condition (the reference row; costs NOTHING
+  #                   extra, the conditioned pass the step already runs IS it)
+  #   "loo"        -> leave-one-out: N rows, each missing one condition. The
+  #                   MARGINAL contribution of each condition at the point where
+  #                   the model is actually used. This is the standard ablation.
+  #   "singletons" -> N rows, each with exactly one condition. The standalone
+  #                   power of each, but far from the model's operating point.
+  #
+  # COST: each row other than "all" is a FULL extra generation pass over
+  # n_influence_samples, so the metrics step grows LINEARLY with the number of
+  # rows. With 4 conditions, "loo" alone adds 4 passes; ["loo", "singletons",
+  # "all"] adds 8. Start small and read the metrics-step timing before growing.
+  #
+  # [] (the default) -> off: one conditioned pass, one table, exactly as before.
+  # Needs a null pass to subtract, so it is skipped when metrics_uncond=false
+  # or guidance <= 1 (with a printed note, never silently).
+  #
+  # Examples:
+  #   influence_subsets: []                          # off
+  #   influence_subsets: ["all", "loo"]              # the standard ablation
+  #   influence_subsets: ["all", "loo", "singletons"]
+  #   influence_subsets: [["f0"], ["f0", "energy"]]  # hand-picked
+  influence_subsets: []
   # How many validation generations to DUMP TO DISK per metrics step (each:
   # conditions .npz + sonified conditions + conditioned .wav + unconditioned
   # .wav + real.wav), under runs/<run>/audio/step_<step>/generation_<i>/.
@@ -159,7 +271,7 @@ sampling:
   # samples (null conditions, no guidance) and logs Fd_dac_uncond / Kl_uncond,
   # which are the only metrics comparable with the unconditional model. Doubles
   # the generation cost of the metrics step. Set false to skip it.
-  metrics_uncond: true
+  metrics_uncond: false
 
   # How many SAMPLES the metrics step fuses into one forward. Each sample needs 3
   # rows (conditioned / cfg-null / unconditional: all three are required by the
@@ -177,6 +289,15 @@ sampling:
   # metrics_uncond=false, or no condition is active.
   metrics_samples_per_forward: 1
 
+  # How many generations the FAD-VGGish is computed on (only when 'fad_vggish'
+  # is in metrics.enabled; ignored otherwise). Each one costs a DAC decode plus
+  # a VGGish forward ON TOP of everything else in the metrics step -- this is
+  # the knob that bounds that extra time. The default matches
+  # n_metrics_samples, so FAD and FD-DAC describe the SAME generations; lower it
+  # if the metrics step gets too long. The statistics are accumulated as running
+  # sums, so raising it costs time, never RAM.
+  n_fad_samples: 512
+
 
 # ============================================================
 # METRICS
@@ -188,8 +309,18 @@ sampling:
 metrics:
   # Which distributional metrics to compute at each metrics step, mirroring the
   # unconditional project's registry. Available in this (conditioned) pipeline:
-  #   fd_dac : Frechet distance on the DAC latents  (latent-only, frame-level)
-  #   kl_dac : KL in BOTH directions on DAC latents (latent-only, frame-level)
+  #   fd_dac     : Frechet distance on the DAC latents  (latent-only, frame-level)
+  #   kl_dac     : KL in BOTH directions on DAC latents (latent-only, frame-level)
+  #   fad_vggish : Frechet Audio Distance on VGGish embeddings (~0.96 s window).
+  #                Scores the AUDIO, not the latent space, against real
+  #                recordings -- the number the controllable-music literature
+  #                reports, so it is what makes your results comparable with
+  #                published ones. It DECODES the generations, so it costs a DAC
+  #                decode + a VGGish forward per sample (see
+  #                sampling.n_fad_samples) and needs the VGGish weights, fetched
+  #                once via torch.hub. Off by default: add it to the list below.
+  # (fad_encodec exists in metrics.py but is NOT wired into this pipeline:
+  #  listing it is a hard error at startup rather than a silent skip.)
   # Each is computed for both axes (conditioned + unconditional -> Fd_dac_cond /
   # Fd_dac_uncond / Kl_cond / Kl_uncond). Listing a metric is an EXPLICIT request:
   # an unknown/unsupported name is a hard error at startup, not a silent skip.
@@ -197,7 +328,7 @@ metrics:
   # building their reference); the condition-influence panel is unaffected.
   # NOTE: the two share the generated mu/covariance, so asking for both costs
   # essentially the same as asking for one -- the heavy part is fitted once.
-  enabled: ["fd_dac", "kl_dac"]
+  enabled: ["fd_dac", "kl_dac", "fad_vggish"]
   seed: 0
 
   # Device for the re-extraction at the metrics step (CREPE-full / beat_this /
@@ -209,19 +340,80 @@ metrics:
   # escape hatch for VRAM: at the metrics step the model and the DAC decoder are
   # both resident, and CREPE-full on top can overflow a card with little margin.
   fidelity_device: "cuda"
-  
+
+  # ---- FAD-VGGish (inert unless 'fad_vggish' is in `enabled` above) ----
+  # Device for the VGGish embedder. As with fidelity_device it does not change
+  # the values, only the speed.
+  fad_device: "cuda"
+
+  # WHAT the generations are compared against:
+  #   "wav"     -> the REAL validation wavs on disk. This is the standard
+  #                definition of FAD and the only one comparable with published
+  #                numbers. It requires preprocess_stream.py to have been run
+  #                with --save_wav; if the wavs are missing the run stops at
+  #                startup and says so (no silent fallback).
+  #   "decoded" -> the validation LATENTS decoded through DAC. Needs no wavs and
+  #                works on any dataset; both sides then pass through the same
+  #                codec, which isolates the model from the codec's own
+  #                artifacts -- arguably a fairer measure of the MODEL, but the
+  #                absolute value is NOT comparable with the literature.
+  # The file list always comes from the VAL SPLIT, never from globbing the wav
+  # directory: the dataset is split-less on disk, so a glob would build the
+  # "real" reference on the test set as well.
+  # The choice is part of the cache file name, so switching it never reuses the
+  # other mode's statistics.
+  fad_reference: "wav"
+
 
 
 # ============================================================
 # CONDITIONING
 # ============================================================
 conditioning:
-  # CFG dropout (per-sample) applied during training.
+  # CFG dropout (per-sample) applied during training, in two stages.
+  #
+  # STAGE 1 -- GROUP buckets. One coin per sample picks one of these:
   # p_drop_all + p_drop_frame + p_drop_global must be < 1.0; the remaining
-  # probability mass keeps both branches active.
+  # probability mass keeps both branches active. These are the branches
+  # classifier-free guidance extrapolates FROM, so their mass is reserved and
+  # stage 2 never eats into it.
   p_drop_all:    0.10     # drop ALL conditions       -> pure unconditional
-  p_drop_frame:  0.05     # drop only frame-level (melody / chroma / rhythm)
+  p_drop_frame:  0.05     # drop only frame-level (f0 / chroma / rhythm / energy)
   p_drop_global: 0.05     # drop only global (text / image)
+
+  # STAGE 2 -- PER-CONDITION dropout. On top of the buckets above, EVERY frame
+  # condition flips its OWN independent coin at this probability, so the model
+  # also trains on the partial subsets (f0 alone, f0+energy, chroma alone, ...).
+  #
+  # WHY: with stage 1 only, the frame conditions are always ALL present or ALL
+  # absent, so asking the model for ONE condition at inference -- nulls in the
+  # other slots -- is out of distribution: one slot says "conditioned", the
+  # others say "unconditional", a combination never seen in training. The
+  # generation still runs (network_cond.py zero-fills any missing condition)
+  # but nothing guarantees the result. This is what turns partial conditioning
+  # into a capability of the model.
+  #
+  # MUST BE DECIDED BEFORE THE RUN: it changes what the model learns and cannot
+  # be added at sampling time.
+  #
+  # HOW BIG: with P here and N active frame conditions, a sample in the "keep"
+  # bucket still carries all N with probability (1-P)^N -- at N=3, P=0.2 that
+  # is 0.51, i.e. all three survive about half the time, one is dropped 38% of
+  # the time, two 10%. Higher P buys subset coverage and costs joint-condition
+  # signal. 0.0 disables stage 2 and restores the old behaviour exactly.
+  # DEFAULT 0.0 -- the project trains DEDICATED models: one model per condition
+  # combination, each seeing its own set always present or (via stage 1) fully
+  # absent. Stage 2 exists for the alternative design, a single FLEXIBLE model
+  # conditionable on any subset at inference; set it to 0.20 only if that is
+  # what you are training. Note the two designs also want different diagnostics:
+  # dedicated -> joint probe + influence_subsets: [] ; flexible -> per-condition
+  # probes + influence_subsets: ["all", "loo"].
+  #
+  # NB this is stage 2 ONLY. p_drop_all / p_drop_frame above must stay > 0
+  # whatever you choose: they are what teaches the model the NULL case, without
+  # which classifier-free guidance has no v_u to extrapolate from and the
+  # influence panel has no baseline for its delta column.
+  p_drop_each_frame: 0.0
 
   # Classifier-free guidance scale used when generating audio at validation
   # time (both for listening and for the metrics).
@@ -236,16 +428,16 @@ conditioning:
   #            in CONDITION_CONFIG, otherwise the registry raises)
   #
   # Examples:
-  #   enabled_frame:  ["melody"]                      # melody only
-  #   enabled_frame:  ["melody", "chroma"]            # melody + harmony
-  #   enabled_frame:  ["melody", "chroma", "rhythm", "energy"]  # all four frame conds
+  #   enabled_frame:  ["f0"]                          # pitch only
+  #   enabled_frame:  ["f0", "chroma"]                # pitch + harmony
+  #   enabled_frame:  ["f0", "chroma", "rhythm", "energy"]  # all four frame conds
   #   enabled_frame:  []                              # no frame conditioning
   #   enabled_global: []                              # no text/image AdaLN
   #
-  # DEFAULT: f0-only. This matches the current preprocessing line (--conditions f0)
-  # and needs NO optional dependency (f0 uses torchcrepe, already installed;
-  # melody would need basic-pitch, which is optional). Switch to ["melody", ...]
-  # once you have extracted those conditions AND installed basic-pitch.
+  # DEFAULT: f0-only. This matches the current preprocessing line
+  # (--conditions f0). Add "energy" / "chroma" / "rhythm" once you have
+  # extracted them onto the dataset; the training refuses to start otherwise
+  # (see training.strict_conditions).
   # ---------------------------------------------------------------
   enabled_frame:  ["f0"]
   enabled_global: []
@@ -259,6 +451,11 @@ paths:
   dataset_root:   "./dataset_ready_cond/latents"
   wav_root:       "./dataset_ready_cond/wav"
   condition_root: "./dataset_ready_cond/conditions"
+
+  # Where the train/val/test split is read from. null = the dataset's own
+  # (<dataset_root>/../splits.json), which is what preprocess_stream.py writes.
+  # Only set this to point a run at a split file kept elsewhere.
+  splits_path:    null
 
   # Class-organised image folders (image_root/<class>/*.jpg)
   image_root:     "./image_dataset_cond"
@@ -275,6 +472,16 @@ paths:
   # Shared cache among runs over the same dataset (normalizer, FD-DAC + KL reference).
   # Computed once, reused by all subsequent runs.
   cache_dir:      "./cache"
+
+  # Where the out-of-the-box f0 probe set (synthesized melodies + their f0
+  # targets) is built and cached. null -> <cache_dir>/f0_probe. Like the other
+  # caches it is keyed by a fingerprint (melodies + chunk geometry + f0
+  # extractor parameters), so it rebuilds itself when any of those change.
+  # Build it standalone to inspect it before training:
+  #   python probe_conditions.py f0 ./cache/f0_probe --n_frames <N> --device cuda
+  # (the other three banks the same way: energy | chroma | rhythm, each
+  #  cached under cache_dir/probe_<cond>)
+  f0_probe_dir:   null
 
   # Name of the run (folder under runs_dir/).
   # Priority: CLI --run_name > YAML run_name > self-generated timestamp.
