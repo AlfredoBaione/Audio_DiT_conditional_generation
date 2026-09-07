@@ -672,14 +672,21 @@ def build_references(enabled, val_dataset, val_wav_root, embedders, cache_dir,
     DAC reference is the real val latents; the FAD references are the real val
     wavs embedded directly (no DAC).
 
+    NOT USED BY THE CONDITIONED PIPELINE. training_cond.py builds its own
+    references inline (it needs the val file list to come from the recorded
+    split, never from globbing the wav directory); this entry point belongs to
+    the unconditional project, which shares this module. There is therefore no
+    `metrics.strict` key in cond_default.yaml — an earlier version of this
+    docstring pointed at one, and it never existed.
+
     A metric in `enabled` is an EXPLICIT request, so by default
     (strict=True) a FAD reference that cannot be built — missing val wavs, an
     unloadable audio backend (FFmpeg / torchcodec), or VGGish weights that
     cannot be fetched — is a HARD ERROR that STOPS the run at startup, BEFORE
     any training, with a clear message. This prevents silently training for
-    hours believing a metric is on when it is not. Set strict=False
-    (cfg.metrics.strict) only when you deliberately want the run to proceed and
-    skip any FAD that cannot be built (e.g. a sweep across offline nodes)."""
+    hours believing a metric is on when it is not. Pass strict=False only when
+    you deliberately want the run to proceed and skip any FAD that cannot be
+    built (e.g. a sweep across offline nodes)."""
     cache_dir = Path(cache_dir)
     refs = {}
     if "fd_dac" in enabled or "kl_dac" in enabled:
@@ -703,7 +710,8 @@ def build_references(enabled, val_dataset, val_wav_root, embedders, cache_dir,
                     f"[Metrics] FATAL: metric '{name}' is enabled but its reference "
                     f"could not be built ({type(e).__name__}: {e}). {need} "
                     f"Fix the environment, remove '{name}' from metrics.enabled, "
-                    f"or set metrics.strict=false to skip it and continue.") from e
+                    f"or call build_references(strict=False) to skip it and "
+                    f"continue.") from e
             print(f"[Metrics] WARNING (strict=false): could not build the {name} "
                   f"reference ({type(e).__name__}: {e}). Skipping {name} this run — {need}")
     return refs

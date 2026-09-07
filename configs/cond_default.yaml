@@ -47,7 +47,7 @@ data:
   train_batch_size: 8
   val_batch_size: 16
   grad_accum: 1
-  num_val_batches: 11       # max fixed validation batches (11 x 16 covers 165 samples)
+  num_val_batches: 89       # max fixed validation batches (89 x 16 covers all 1421 val samples; last batch is partial)
   validation_shuffle: true  # deterministic shuffle before selecting the fixed subset
   validation_seed: 12345    # fixed subset/noise; live and EMA get the same exam
   num_workers: 4         # DataLoader workers; set 0 on Windows or for simple/debug runs
@@ -178,8 +178,9 @@ sampling:
   # i-th stimulus of each condition's own bank: the f0 of a scale, the chroma of
   # a triad, the energy of a crescendo, the rhythm of a 120 bpm grid. The banks
   # are combined BY INDEX and are therefore NOT mutually aligned -- deliberate,
-  # see below. Which stimuli each panel combines is written to
-  # Validation/Probe_combinations. Set n_influence_samples: 0 to disable.
+  # see below. Which stimulus a panel used is written in the TITLE of that
+  # panel's comparison image, in the IMAGES window.
+  # Set n_influence_samples: 0 to disable.
                           #
                           # WHY JOINT. With p_drop_each_frame = 0.0 (see below)
                           # the model only ever sees all of its conditions or
@@ -226,6 +227,28 @@ sampling:
   # (The influence set size lives above, as sampling.n_influence_samples: it is
   # one knob for the validation samples, the probe stimuli and the panels.)
 
+  # ---- GLOBAL-CONDITION SIMILARITY SCALARS ----
+  # How many validation generations the two similarity curves are averaged over:
+  #   Validation/Metrics/Audio_text_similarity   (cosine in CLAP's space)
+  #   Validation/Metrics/Audio_image_similarity  (cosine in CLIP's space, via
+  #                                               Wav2CLIP)
+  # They are logged beside FD-DAC / KL / FAD and read the same way: a curve
+  # across training, not a number at a step.
+  #
+  # WHY ITS OWN KNOB, and not n_metrics_samples. FD-DAC and KL estimate a
+  # covariance and want hundreds of samples, but they are LATENT-ONLY and so
+  # cost almost nothing per sample. These two are the mean of one scalar per
+  # sample -- which converges fast -- but each sample they touch must be DECODED
+  # through the DAC and pushed through an embedder. That decode is the
+  # expensive half of the metrics step. 128 gives a mean whose standard error
+  # is already small; going to 512 quadruples the cost to halve it.
+  # 0 disables the two curves without touching anything else.
+  #
+  # NB the influence TABLE is unaffected by this number: its rows are a paired
+  # delta measured on the influence set (n_influence_samples), against the null
+  # pass. This knob only widens the sample the two SCALARS are averaged over.
+  n_similarity_samples: 128
+
   # ---------------------------------------------------------------
   # CONDITION SUBSETS -- the delta MATRIX
   # ---------------------------------------------------------------
@@ -267,10 +290,22 @@ sampling:
   # conditions .npz + sonified conditions + conditioned .wav + unconditioned
   # .wav + real.wav), under runs/<run>/audio/step_<step>/generation_<i>/.
   n_val_save: 8
-  # If true, the metrics step ALSO generates n_metrics_samples UNCONDITIONAL
-  # samples (null conditions, no guidance) and logs Fd_dac_uncond / Kl_uncond,
-  # which are the only metrics comparable with the unconditional model. Doubles
-  # the generation cost of the metrics step. Set false to skip it.
+  # If true, the metrics step ALSO scores the UNCONDITIONED branch
+  # distributionally and logs Fd_dac_uncond / Kl_uncond / Fad_vggish_uncond --
+  # the only metrics comparable with the unconditional model. It costs a second
+  # FD/KL pass and, with fad_vggish on, n_fad_samples MORE DAC decodes and VGGish
+  # forwards, which is the expensive half of the metrics step.
+  #
+  # DEFAULT false. It is a comparison against the unconditional PROJECT, and this
+  # one trains dedicated models: the number is rarely what you are reading.
+  #
+  # IMPORTANT -- what this does NOT switch off any more: the generation without
+  # conditions itself. That is the baseline of the condition-influence delta (in
+  # BOTH the validation and the probe rows) and it is nearly free under CFG,
+  # since the unconditional velocity is computed at every step anyway. It is now
+  # produced whenever guidance > 1, regardless of this flag. Until 4 Sept 2026
+  # the two were tied, so setting this to false silently emptied the delta column
+  # of the influence table -- the very number the probe exists to produce.
   metrics_uncond: false
 
   # How many SAMPLES the metrics step fuses into one forward. Each sample needs 3
@@ -458,7 +493,11 @@ paths:
   splits_path:    null
 
   # Class-organised image folders (image_root/<class>/*.jpg)
-  image_root:     "./image_dataset_cond"
+  # Read ONLY to display the conditioning picture in the validation panels --
+  # the embeddings themselves come from the dataset's own
+  # global_conditions/image/ bank, built once by preprocess_stream.py. A wrong
+  # or missing path costs the image CARDS, nothing else.
+  image_root:     "./Museart_2_reduced/Images"
 
   # Portable defaults (relative to the working dir). On IRCAM, override with the
   # shared absolute paths, e.g. on the CLI:

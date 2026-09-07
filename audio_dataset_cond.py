@@ -6,8 +6,8 @@
 #   - frames:       (n_frames, 72)   normalized DAC pre-quantizer latents
 #   - frame_conds:  {f0, chroma, rhythm, ...} pre-extracted conditions
 #   - label_idx:    int                 class index
-#   - text_emb:     (text_dim,)         CLAP text embedding (pre-computed)
-#   - image_emb:    (image_dim,)        CLIP embedding (pre-computed)
+#   - text_emb:     (text_dim,)         CLAP embedding OF THIS CHUNK's audio
+#   - image_emb:    (image_dim,)        CLIP embedding of one image of the class
 #
 # ------------------------------------------------------------------------------
 # NEW on-disk contract (produced by preprocess_stream.py): the dataset is
@@ -15,10 +15,25 @@
 #
 #   dataset_root/
 #       latents/<class...>/*.npy       <- (72, T) float32 pre-quant DAC latents
-#       conditions/<class...>/*.npz    <- f0, chroma, rhythm, energy, ...
+#       conditions/<class...>/*.npz    <- f0, chroma, ... AND the per-chunk
+#                                         global 'text' (one (dim,) vector)
+#       global_conditions/image/       <- <class>.npy  (n_images, dim) CLIP bank
+#                                         <class>.json the file names, in order
 #       wav/<class...>/*.wav           <- optional (val/test used for FAD)
 #       splits.json                    <- source -> train/val/test (READ here)
 #       dataset_meta.json              <- chunk/acoustic params
+#
+# NOTHING IS ENCODED AT TRAINING TIME ANY MORE. This module used to load CLAP
+# and CLIP at startup, on the training GPU, to embed the class names and up to
+# ten images per class. Both are now read from what the preprocessing wrote:
+#   * text  -- one vector per CHUNK, in that chunk's own .npz. It is the CLAP
+#     embedding of the chunk's AUDIO (AudioLDM-style: the two CLAP towers share
+#     a space, so a written prompt can take its place at inference). It is NOT
+#     the embedding of the class name, which would have carried the same single
+#     bit as the image condition and made the two impossible to tell apart.
+#   * image -- the whole per-class CLIP bank, from which a sample draws one
+#     image at random per epoch (that draw IS the augmentation). No ten-image
+#     cap: the bank holds every picture of the class.
 #
 # The train/val/test split is DECIDED BY preprocess_stream.py and read back here
 # (load_source_split). It is not recomputed at training time, because a split
@@ -37,6 +52,8 @@
 # part before the first `__` (sanitize_filename never emits `__` inside a stem),
 # which is exactly the key preprocess_stream.py writes into splits.json.
 
+import hashlib
+import json
 import random
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -55,10 +72,11 @@ from audio_dataset_npy import (
     load_source_split, compute_split, _class_of_file, _chunks_from_files,
     _meta_latent_frames, NORMALIZER_MAX_CHUNKS,
 )
-from conditions import (
-    ConditionRegistry, ImageDatasetManager,
-    CLAPTextCondition, ImageCondition,
-)
+from conditions import ConditionRegistry
+# NB: CLAPTextCondition / ImageCondition / ImageDatasetManager are deliberately
+# NOT imported. Nothing is encoded here any more -- the embeddings are read from
+# what preprocess_stream.py wrote -- and importing them would put the option of
+# loading CLAP or CLIP back inside the training process.
 
 
 # ============================================================
@@ -88,7 +106,6 @@ class ConditionedAudioDataset(Dataset):
         duration_s:      float = 5.0,
         normalizer:      Optional[LatentNormalizer] = None,
         registry:        Optional[ConditionRegistry] = None,
-        image_manager:   Optional[ImageDatasetManager] = None,
         preload_latents: bool  = True,
         strict_conditions: bool = True,
     ):
@@ -99,7 +116,6 @@ class ConditionedAudioDataset(Dataset):
         self.normalizer     = normalizer
         self.duration_s     = duration_s
         self.registry       = registry
-        self.image_manager  = image_manager
         self.preload_latents = preload_latents
         self.strict_conditions = strict_conditions
         self._cond_warned = False
@@ -121,13 +137,13 @@ class ConditionedAudioDataset(Dataset):
         if preload_latents:
             self._preload_latents()
 
-        self._text_embeddings: Dict[str, np.ndarray] = {}
         self._text_dim: int = 0
-        self._precompute_text_embeddings()
+        self._probe_text_dim()
 
         self._image_embeddings: Dict[str, List[np.ndarray]] = {}
+        self._image_files: Dict[str, List[str]] = {}
         self._image_dim: int = 0
-        self._precompute_image_embeddings()
+        self._load_image_bank()
 
         self._print_summary()
 
@@ -136,7 +152,7 @@ class ConditionedAudioDataset(Dataset):
         print(f"[CondDataset/{self.split}] {len(self.samples)} samples | "
               f"n_frames={self.n_frames} | "
               f"frame_conds={'ON' if has_frame_conds else 'OFF'} ({self._get_frame_names()}) | "
-              f"text={'ON' if self._text_embeddings else 'OFF'} | "
+              f"text={'ON' if self._text_dim else 'OFF'} | "
               f"image={'ON' if self._image_embeddings else 'OFF'}")
 
     def _get_frame_names(self) -> List[str]:
@@ -265,56 +281,159 @@ class ConditionedAudioDataset(Dataset):
         gb = sum(t.nelement() * 4 for t in self._latent_cache.values()) / 1e9
         print(f"[CondDataset/{self.split}] {gb:.2f} GB in RAM")
 
-    def _precompute_text_embeddings(self):
+    def _probe_text_dim(self):
+        """Learn the text embedding's width from the data, not from the model.
+
+        The width is needed up front to build the null vector a sample falls
+        back to, and the obvious way to get it -- ask the extractor for .dim --
+        loads CLAP onto the training GPU just to read an integer off a config.
+        The .npz already knows: read the key's shape from the first chunk that
+        has it. Only the archive's header is touched (np.load on an .npz is
+        lazy), so this costs one header read, not an embedding.
+        """
         if self.registry is None or "text" not in self.registry.global_extractors:
             return
-        text_ext: CLAPTextCondition = self.registry.global_extractors["text"]
-        self._text_dim = text_ext.dim
+        for _npy, cond_path, _s, _l, _c in self.samples:
+            if cond_path is None:
+                continue
+            try:
+                with np.load(str(cond_path)) as data:
+                    if "text" in data:
+                        arr = data["text"]
+                        if arr.ndim != 1:
+                            raise RuntimeError(
+                                f"'text' in {cond_path} has shape {arr.shape}; "
+                                f"a global condition is one vector, (dim,). "
+                                f"This .npz was written by an older "
+                                f"preprocess_stream.py -- re-extract it.")
+                        self._text_dim = int(arr.shape[0])
+                        print(f"[CondDataset/{self.split}] text: per-chunk CLAP "
+                              f"embeddings from the .npz (dim={self._text_dim})")
+                        return
+            except RuntimeError:
+                raise
+            except Exception:
+                continue
+        # Asked for, never written: this cannot be papered over with zeros --
+        # the model would train on a null condition and the run would look fine.
+        raise RuntimeError(
+            f"[CondDataset/{self.split}] the 'text' global condition is active "
+            f"but no chunk carries it. Extract it with:\n"
+            f"    python preprocess_stream.py SRC {self.latent_root.parent} "
+            f"--global text\n"
+            f"(it re-reads the audio but re-encodes no latent, and keeps every "
+            f"condition already on disk).")
 
-        class_names = self._present_classes or list(self.label_to_idx.keys())
-        prompts = [c.replace("_", " ") for c in class_names]
+    @staticmethod
+    def _image_split_of(file_name: str) -> str:
+        """Which split one picture belongs to, from a hash of its FILE NAME.
 
-        embs = text_ext.encode_batch(prompts)   # (n_classes, dim)
-        for class_name, emb in zip(class_names, embs):
-            self._text_embeddings[class_name] = emb
+        The images have no split of their own -- they are not the audio -- but
+        the validation panels must not show a picture the model was conditioned
+        on during training, or the panel would be measuring recall of a seen
+        image rather than the conditioning.
 
-        print(f"[CondDataset/{self.split}] CLAP text embeddings: "
-              f"{len(self._text_embeddings)} classes (dim={self._text_dim})")
-        text_ext.unload()
+        Hashed by name, not by position, so the assignment survives the bank
+        growing: dropping ten new pictures into a class folder and re-running
+        the preprocessing re-sorts the list and would shift every index, moving
+        images across splits and quietly invalidating the separation. The
+        proportions mirror the audio's 80/10/10.
+        """
+        h = int(hashlib.sha1(file_name.encode("utf-8")).hexdigest()[:8], 16) % 10
+        return "train" if h < 8 else ("val" if h == 8 else "test")
 
-    def _precompute_image_embeddings(self, max_per_class: int = 10):
+    def _load_image_bank(self):
+        """Read the per-class CLIP bank written by preprocess_stream.py.
+
+        No CLIP here: the bank is a plain .npy of L2-normalized rows, and the
+        .json beside it names the file of every row. The class name is taken
+        from that .json rather than reconstructed from the file name, so this
+        never has to replicate the preprocessing's name sanitizer -- and cannot
+        drift from it.
+        """
         if (self.registry is None
-                or "image" not in self.registry.global_extractors
-                or self.image_manager is None):
+                or "image" not in self.registry.global_extractors):
             return
+        bank_dir = self.latent_root.parent / "global_conditions" / "image"
+        if not bank_dir.exists():
+            raise RuntimeError(
+                f"[CondDataset/{self.split}] the 'image' global condition is "
+                f"active but {bank_dir} does not exist. Build it with:\n"
+                f"    python preprocess_stream.py SRC {self.latent_root.parent} "
+                f"--global image --image_root <folder of <class>/*.jpg>\n"
+                f"(it encodes only the images; no latent is touched).")
 
-        img_ext: ImageCondition = self.registry.global_extractors["image"]
-        self._image_dim = img_ext.dim
+        wanted = set(self._present_classes or list(self.label_to_idx.keys()))
+        found, empty_split, missing = 0, [], []
+        for jp in sorted(bank_dir.glob("*.json")):
+            try:
+                meta = json.loads(jp.read_text(encoding="utf-8"))
+                class_name = meta["class"]
+                files = list(meta["files"])
+            except Exception as e:
+                print(f"[CondDataset/{self.split}] WARNING: unreadable "
+                      f"{jp.name} ({type(e).__name__}: {e}) -> skipped")
+                continue
+            if class_name not in wanted:
+                continue
+            bank = np.load(str(jp.with_suffix(".npy"))).astype(np.float32)
+            if bank.shape[0] != len(files):
+                raise RuntimeError(
+                    f"[CondDataset/{self.split}] {jp.name} lists {len(files)} "
+                    f"files but the bank holds {bank.shape[0]} rows. The two "
+                    f"are written together; re-run the extraction with --force.")
+            self._image_dim = int(bank.shape[1])
+            keep = [i for i, f in enumerate(files)
+                    if self._image_split_of(f) == self.split]
+            if not keep:
+                # Too few pictures for the hash to reach this split. Showing a
+                # training image beats showing none -- but say so, because the
+                # separation this method exists for is not holding for it.
+                empty_split.append(f"{class_name}({len(files)})")
+                keep = list(range(len(files)))
+            self._image_embeddings[class_name] = [bank[i] for i in keep]
+            self._image_files[class_name] = [files[i] for i in keep]
+            found += 1
 
-        orphan_classes = []
-        for class_name in (self._present_classes or list(self.label_to_idx.keys())):
-            images = self.image_manager.get_all_images(class_name)[:max_per_class]
-            embs = []
-            for img_path in images:
-                try:
-                    embs.append(img_ext.encode_image(str(img_path)))
-                except Exception as e:
-                    print(f"  [WARN] Image not loaded {img_path}: {e}")
-            if embs:
-                self._image_embeddings[class_name] = embs
-            else:
-                orphan_classes.append(class_name)
-
+        missing = sorted(wanted - set(self._image_embeddings))
         total = sum(len(v) for v in self._image_embeddings.values())
-        print(f"[CondDataset/{self.split}] Image embeddings: "
-              f"{total} images in {len(self._image_embeddings)}/{len(self._present_classes)} classes "
-              f"(dim={self._image_dim})")
-        if orphan_classes:
-            print(f"[CondDataset/{self.split}] WARNING: {len(orphan_classes)} classes without "
-                  f"images -> will use null fallback (image=zeros): {orphan_classes}")
-        # CLIP is large: offload after pre-computing.
-        if hasattr(img_ext, "unload"):
-            img_ext.unload()
+        print(f"[CondDataset/{self.split}] image: {total} embeddings over "
+              f"{found}/{len(wanted)} classes (dim={self._image_dim}), "
+              f"read from {bank_dir}")
+        if empty_split:
+            print(f"[CondDataset/{self.split}] WARNING: too few images to hold "
+                  f"back a '{self.split}' share for {len(empty_split)} class(es) "
+                  f"-> the whole bank is used, so a picture here may also have "
+                  f"been seen in training: {empty_split[:8]}")
+        if missing:
+            print(f"[CondDataset/{self.split}] WARNING: no image bank for "
+                  f"{len(missing)} class(es) -> those samples get a NULL image "
+                  f"(zeros), i.e. no image conditioning at all: {missing[:8]}"
+                  f"{' ...' if len(missing) > 8 else ''}")
+
+    def image_file_for(self, idx: int) -> Optional[Tuple[str, str]]:
+        """-> (class name, image file name) that sample `idx` is conditioned on,
+        or None when there is no image for it.
+
+        Only meaningful for val/test, where the choice is deterministic; in
+        train the picture is redrawn at every access, so there is no single
+        answer and this returns None. It exists for the panels: they must SHOW
+        the image a generation was conditioned on, and an embedding cannot be
+        turned back into a picture. The file has to be re-opened from the
+        original image folder -- the dataset itself never does, and this hands
+        out the name rather than the image so that stays true.
+
+        MUST mirror the choice made in __getitem__ exactly; if one changes, the
+        panel starts displaying a different picture from the one that
+        conditioned the sound, which is worse than showing none.
+        """
+        if self.split == "train" or not (0 <= idx < len(self.samples)):
+            return None
+        class_name = self.samples[idx][4]
+        files = self._image_files.get(class_name)
+        if not files:
+            return None
+        return class_name, files[idx % len(files)]
 
     def __len__(self):
         return len(self.samples)
@@ -354,7 +473,14 @@ class ConditionedAudioDataset(Dataset):
         frame_cond = {}
         frame_names = self._get_frame_names()
 
-        if cond_path is not None and frame_names:
+        # The .npz is opened when ANY per-chunk condition is wanted from it --
+        # a frame condition, or the 'text' global, which lives in the same
+        # archive. Gating this on frame_names alone (as it used to) meant a run
+        # conditioned on text ALONE never opened the file and silently trained
+        # on null text.
+        want_text = self._text_dim > 0
+        text_raw = None
+        if cond_path is not None and (frame_names or want_text):
             try:
                 data = np.load(str(cond_path))
             except Exception as e:
@@ -366,6 +492,7 @@ class ConditionedAudioDataset(Dataset):
                 self._warn_cond_once(f"load failed for {cond_path.name}: {e}")
                 data = None
             if data is not None:
+                text_raw = data["text"] if "text" in data else None
                 for name in frame_names:
                     if name not in data:
                         continue
@@ -424,20 +551,48 @@ class ConditionedAudioDataset(Dataset):
                 dim = self.registry.frame_cond_dims[name]
                 frame_cond[name] = torch.zeros(self.n_frames, dim)
 
-        # 3. TEXT EMBEDDING
-        if class_name in self._text_embeddings:
-            text_emb = torch.from_numpy(self._text_embeddings[class_name])
-        elif self._text_dim > 0:
-            text_emb = torch.zeros(self._text_dim)
-        else:
+        # 3. TEXT EMBEDDING -- this chunk's own, read from the .npz above.
+        # Per CHUNK, not per class: two excerpts of the same piece get different
+        # vectors, which is the whole reason the text condition is not simply
+        # the class name (see the module header).
+        if not want_text:
             text_emb = torch.zeros(1)
-
-        # 4. IMAGE EMBEDDING (train: random -> augmentation; val/test: first -> deterministic)
-        if class_name in self._image_embeddings:
-            if self.split == "train":
-                img_emb = torch.from_numpy(random.choice(self._image_embeddings[class_name]))
+        elif text_raw is not None:
+            t = np.asarray(text_raw, dtype=np.float32).reshape(-1)
+            if t.shape[0] != self._text_dim or not np.isfinite(t).all():
+                if self.strict_conditions:
+                    raise RuntimeError(
+                        f"'text' for {npy_path.name} has shape {t.shape} "
+                        f"(expected ({self._text_dim},))"
+                        f"{' and contains NaN/Inf' if not np.isfinite(t).all() else ''}. "
+                        f"Re-extract it, or set training.strict_conditions=false.")
+                self._warn_cond_once("'text' malformed -> zero-filled")
+                text_emb = torch.zeros(self._text_dim)
             else:
-                img_emb = torch.from_numpy(self._image_embeddings[class_name][0])
+                text_emb = torch.from_numpy(t)
+        else:
+            # Wanted, and this chunk has none.
+            if self.strict_conditions:
+                raise RuntimeError(
+                    f"'text' missing for {npy_path.name} (cond_path={cond_path}). "
+                    f"Re-run: python preprocess_stream.py SRC "
+                    f"{self.latent_root.parent} --global text  "
+                    f"-- or set training.strict_conditions=false to zero-fill it.")
+            self._warn_cond_once("'text' missing -> zero-filled")
+            text_emb = torch.zeros(self._text_dim)
+
+        # 4. IMAGE EMBEDDING -- one picture of this sample's class.
+        # train: drawn at random every epoch, which IS the augmentation this
+        # condition exists for. val/test: deterministic, so a panel shows the
+        # same picture at every checkpoint and the curves stay comparable; the
+        # index is derived from the CHUNK rather than fixed at 0, so the panels
+        # do not all end up conditioned on the same one image of the class.
+        if class_name in self._image_embeddings:
+            bank = self._image_embeddings[class_name]
+            if self.split == "train":
+                img_emb = torch.from_numpy(random.choice(bank))
+            else:
+                img_emb = torch.from_numpy(bank[idx % len(bank)])
         elif self._image_dim > 0:
             img_emb = torch.zeros(self._image_dim)
         else:
@@ -527,12 +682,17 @@ def build_conditioned_datasets(
         # once is a pointless RAM peak at the worst possible moment.
         del chunks
 
-    # 3. image managers only if image conditioning is active
-    image_active = (registry is not None
-                    and "image" in getattr(registry, "global_extractors", {}))
-    image_mgr = None
-    if image_active and image_root and Path(image_root).exists():
-        image_mgr = ImageDatasetManager(image_root, split=None)
+    # 3. NO image manager any more.
+    # The per-class CLIP bank is read from the dataset itself
+    # (global_conditions/image/), written once by preprocess_stream.py, so the
+    # raw image folder is not needed at training time and CLIP is never loaded
+    # here. `image_root` is accepted and ignored, so an existing config or
+    # caller does not break; it is only used by the preprocessing now.
+    if image_root:
+        print("[build_conditioned_datasets] note: image_root is no longer read "
+              "at training time. The image condition comes from the dataset's "
+              "own global_conditions/image/ bank (preprocess_stream.py "
+              "--global image --image_root ...).")
 
     common = dict(
         label_to_idx=label_to_idx,
@@ -542,7 +702,6 @@ def build_conditioned_datasets(
         duration_s=duration_s,
         normalizer=normalizer,
         registry=registry,
-        image_manager=image_mgr,
         strict_conditions=strict_conditions,
     )
 

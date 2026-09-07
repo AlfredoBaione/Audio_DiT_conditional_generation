@@ -1149,8 +1149,75 @@ class DACEncoder:
 
 
 # ============================================================
-# CONDITIONS (frame-level, incremental merge into per-chunk .npz)
+# CONDITIONS (incremental merge into per-chunk .npz)
+# ------------------------------------------------------------
+# THE AXIS THAT MATTERS HERE IS NOT frame-vs-global.
+#
+# conditions.py divides conditions by what the MODEL does with them: a frame
+# condition is concatenated per timestep, a global one is added to the AdaLN
+# vector. That is the right axis there and the wrong one here, because the
+# preprocessing does not care how a value is consumed -- it cares WHERE the
+# value comes from, which is what decides where in this file the work happens:
+#
+#   PER-CHUNK   computed from one chunk's own audio, so it is produced inside
+#               the stream, once per chunk, and merged into that chunk's .npz.
+#               Every frame condition is per-chunk, and so is the "text"
+#               global (the CLAP embedding of the chunk's audio).
+#   PER-CLASS   computed once for a whole class from something that is not the
+#               audio at all -- the "image" global reads a folder of pictures
+#               -- so it is produced after the stream, into a sidecar.
+#
+# A global condition is per-chunk exactly when its extractor exposes
+# encode_audio(); nothing here holds a list of names, so a condition added to
+# conditions.py later lands on the correct side by itself. It is also what lets
+# the two kinds compose freely: --conditions and --global only SELECT names,
+# and each name then flows down whichever path its extractor implies. Asking
+# for frame conditions alone, globals alone, or any subset of both is therefore
+# not a special case anywhere below -- it is the same code with a shorter list.
 # ============================================================
+def _global_is_chunk_level(ext) -> bool:
+    """True when this global condition is computed from a chunk's own audio.
+
+    Read off the OBJECT -- an extractor that can encode_audio() is one -- and
+    not from a hardcoded name list, for the same reason _extractor_device_attr
+    reads the device off the object: a list here goes stale the moment
+    conditions.py gains a condition, and it goes stale SILENTLY, by routing the
+    new condition down the wrong path."""
+    return callable(getattr(ext, "encode_audio", None))
+
+
+def _split_globals_by_stage(registry):
+    """-> (per-chunk global names, per-class global names), both sorted.
+
+    Both empty when no global was selected, which is what lets a frame-only run
+    behave exactly as it did before any of this existed."""
+    if registry is None:
+        return [], []
+    chunk, klass = [], []
+    for name, ext in getattr(registry, "global_extractors", {}).items():
+        (chunk if _global_is_chunk_level(ext) else klass).append(name)
+    return sorted(chunk), sorted(klass)
+
+
+def _chunk_extractor(registry, name):
+    """The object that produces `name` for one chunk -> (extractor, kind).
+
+    `kind` is "frame" or "global", and it exists only because the two are
+    CALLED differently: a frame extractor takes (audio, sr, n_frames) and
+    returns (n_frames, dim); a per-chunk global takes (audio, sr) and returns
+    (dim,). That signature is the last place the distinction survives here."""
+    ext = getattr(registry, "frame_extractors", {}).get(name)
+    if ext is not None:
+        return ext, "frame"
+    ext = getattr(registry, "global_extractors", {}).get(name)
+    if ext is not None and _global_is_chunk_level(ext):
+        return ext, "global"
+    raise KeyError(
+        f"'{name}' is not a per-chunk condition of this registry "
+        f"(frame: {sorted(getattr(registry, 'frame_extractors', {}))}, "
+        f"per-chunk global: {_split_globals_by_stage(registry)[0]})")
+
+
 def _npz_missing(cond_path: Path, names, force: bool = False) -> bool:
     """True if `names` are not all already stored in cond_path (or force).
 
@@ -1170,18 +1237,26 @@ def _npz_missing(cond_path: Path, names, force: bool = False) -> bool:
         return True          # unreadable -> treat as missing, it gets rewritten
 
 
-def extract_and_merge_frame_conditions(
+def extract_and_merge_chunk_conditions(
     registry, chunk_audio_np, sr: int, n_frames: int,
     cond_path: Path, force: bool = False, names=None,
 ) -> bool:
     """
-    Extract ONLY the frame conditions that are missing from cond_path and merge
-    them in (mirrors extract_conditions.py). Returns True if the .npz changed.
+    Extract ONLY the per-chunk conditions that are missing from cond_path and
+    merge them in (mirrors extract_conditions.py). Returns True if the .npz
+    changed.
+
+    Handles both kinds of per-chunk condition, and stores them side by side in
+    the same archive under their own names:
+        frame  -> (n_frames, dim), one row per latent frame
+        global -> (dim,), one vector for the whole chunk
+    They are told apart on the way OUT by their shape, so no extra bookkeeping
+    file is needed and a reader can stay agnostic.
 
     `names` restricts the work to a SUBSET of the registry's conditions, which
     is what lets the CPU-side conditions be extracted in the DataLoader workers
     while the GPU-side ones are extracted later, in the main process, from the
-    same chunk. None = every condition in the registry (the original behaviour).
+    same chunk. None = every per-chunk condition in the registry.
 
     Splitting the .npz across two producers is safe because the merge below
     always re-reads what is on disk and preserves the keys it was not asked to
@@ -1189,7 +1264,12 @@ def extract_and_merge_frame_conditions(
     the two writes are ordered by the queue, never concurrent.
     """
     import numpy as np
-    required = set(registry.frame_names if names is None else names)
+    if names is None:
+        # Everything this registry can produce per chunk: the frame conditions
+        # plus the globals that read audio. The per-class globals are NOT here
+        # -- they have no per-chunk value to compute.
+        names = list(registry.frame_names) + _split_globals_by_stage(registry)[0]
+    required = set(names)
     if not required:
         return False
 
@@ -1219,7 +1299,29 @@ def extract_and_merge_frame_conditions(
 
     new = {}
     for name in missing:
-        new[name] = registry.frame_extractors[name].extract(chunk_audio_np, sr, n_frames)
+        ext, kind = _chunk_extractor(registry, name)
+        if kind == "frame":
+            arr = ext.extract(chunk_audio_np, sr, n_frames)
+            arr = np.asarray(arr, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[0] != int(n_frames):
+                raise RuntimeError(
+                    f"frame condition '{name}' produced {arr.shape} for "
+                    f"{cond_path.name}; expected ({n_frames}, dim).")
+        else:
+            arr = np.asarray(ext.encode_audio(chunk_audio_np, sr),
+                             dtype=np.float32).reshape(-1)
+            # A global embedding is one vector and nothing downstream can tell
+            # a degenerate one from a good one by looking at it, so the only
+            # cheap check worth making is that it is a number at all. A silent
+            # NaN here would reach the AdaLN vector and poison the whole batch.
+            if arr.size == 0:
+                raise RuntimeError(
+                    f"global condition '{name}' produced an empty embedding "
+                    f"for {cond_path.name}.")
+        if not np.isfinite(arr).all():
+            raise RuntimeError(
+                f"condition '{name}' contains NaN/Inf for {cond_path.name}.")
+        new[name] = arr
 
     final = {**existing, **new}   # keep others; force overwrites only `required`
     _atomic_save_npz(cond_path, final)
@@ -1227,65 +1329,210 @@ def extract_and_merge_frame_conditions(
 
 
 # ============================================================
-# GLOBAL CONDITIONS (optional, class-level sidecars)
+# PER-CLASS GLOBAL CONDITIONS (sidecars, written after the stream)
 # ============================================================
-def extract_global_conditions(
-    registry, out_root: Path, classes: List[str], image_root: Optional[str],
-    force: bool = False,
-):
-    """
-    OPTIONAL / forward-looking. The current training dataset derives global
-    conditions (text/image) at load time from the class name / image folder and
-    does NOT read these sidecars yet; this only pre-caches them.
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
-    text  -> global_conditions/text/<class>.npy   (CLAP embedding of class name)
-    image -> global_conditions/image/<class>.npy  (stacked CLIP embeddings)
+
+def write_text_label_vocab(registry, out_root: Path, vocab_path: Optional[str],
+                           force: bool = False) -> int:
+    """Encode the label vocabulary once and store it WITH the dataset.
+
+        global_conditions/text_vocab.npy    (n_phrases, dim) float32, L2-normed
+        global_conditions/text_vocab.json   the phrases, in row order
+
+    WHAT IT IS FOR. The stored 'text' condition is the CLAP embedding of a
+    chunk's own audio, and CLAP cannot be run backwards, so a panel has no words
+    to put next to a validation sample. With this table it can name the nearest
+    phrases instead -- a retrieval, not a translation, which is why the reader
+    is always shown the cosine too.
+
+    WHY IT LIVES IN THE DATASET rather than being rebuilt per run: encoding the
+    phrases needs CLAP, and doing it at every training start would put that
+    model back in the training process for a table that never changes. Written
+    once, next to the vectors it will be compared against, and in the same
+    space -- built by the run's own text encoder, so a dataset can never end up
+    with a vocabulary from a different checkpoint than its chunks.
+
+    Changing the vocabulary later costs ONE re-run of this function (a few
+    hundred short strings) and no audio is touched: the labels are recomputed
+    from the vectors already on disk.
+
+    `vocab_path` is an optional text file, one phrase per line, replacing the
+    built-in list. Returns how many phrases were written (0 = nothing to do).
     """
     import numpy as np
-    gnames = registry.global_names
-    if not gnames:
-        return
+    ext = getattr(registry, "global_extractors", {}).get("text")
+    if ext is None:
+        return 0
 
-    if "text" in gnames:
-        ext = registry.global_extractors["text"]
-        d = out_root / "global_conditions" / "text"
+    if vocab_path:
+        p = Path(vocab_path)
+        if not p.exists():
+            print(f"[global/text] --text_vocab {p} not found -> using the "
+                  f"built-in vocabulary")
+            phrases = None
+        else:
+            phrases = [ln.strip() for ln in
+                       p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            print(f"[global/text] vocabulary from {p}: {len(phrases)} phrases")
+    else:
+        phrases = None
+    if not phrases:
+        from conditions import TEXT_LABEL_VOCAB
+        phrases = list(TEXT_LABEL_VOCAB)
+
+    d = out_root / "global_conditions"
+    d.mkdir(parents=True, exist_ok=True)
+    npy, js = d / "text_vocab.npy", d / "text_vocab.json"
+    if npy.exists() and js.exists() and not force:
+        try:
+            old = json.loads(js.read_text(encoding="utf-8"))
+            if list(old.get("phrases", [])) == phrases:
+                print(f"[global/text] label vocabulary already current "
+                      f"({len(phrases)} phrases)")
+                return len(phrases)
+        except Exception:
+            pass          # unreadable -> rebuild
+
+    embs = np.asarray(ext.encode_batch(phrases), dtype=np.float32)
+    _atomic_save_npy(npy, embs)
+    _atomic_write_json(js, {"phrases": phrases,
+                            "model_name": getattr(ext, "model_name", None)})
+    print(f"[global/text] label vocabulary: {len(phrases)} phrases encoded "
+          f"-> {npy.name}")
+    return len(phrases)
+
+
+def extract_class_global_conditions(
+    registry, out_root: Path, classes: List[str], image_root: Optional[str],
+    force: bool = False,
+) -> dict:
+    """
+    Build the sidecar of every PER-CLASS global condition. Currently that is
+    "image": every picture of a class, encoded with CLIP, stacked into one bank.
+
+        global_conditions/image/<class>.npy    (n_images, dim) float32
+        global_conditions/image/<class>.json   the file names, same order
+
+    THE WHOLE BANK IS STORED, not a sample of it. The training draws a random
+    image of the sound's class at every epoch -- that is the augmentation the
+    condition exists for -- so capping the bank here would silently cap the
+    augmentation for every run that ever reads this dataset. (The training used
+    to encode at most 10 images per class on the fly, at startup, with CLIP
+    loaded in the training process; this replaces that entirely.)
+
+    The .json is not bookkeeping for its own sake: the validation panels have
+    to SHOW the image a generation was conditioned on, and an embedding cannot
+    be turned back into a picture. Same order as the rows, so index i in the
+    bank is file i in the list.
+
+    Returns {class: n_images} for what it wrote or found, so the caller can say
+    something true about coverage instead of guessing.
+
+    NOT here: "text". Its value is per CHUNK (the CLAP embedding of that chunk's
+    audio) and lives in the chunk's own .npz, written during the stream. It used
+    to be a per-class sidecar holding the embedding of the class NAME; that file
+    is no longer produced, and a leftover one from an older run is stale.
+    """
+    import numpy as np
+    _, class_globals = _split_globals_by_stage(registry)
+    if not class_globals:
+        return {}
+
+    written = {}
+    if "image" in class_globals:
+        if not image_root or not Path(image_root).exists():
+            print(f"[global/image] --image_root {image_root or '(unset)'} "
+                  f"missing/not found -> NOTHING WRITTEN. The image condition "
+                  f"will have no bank to read.")
+            return {}
+        ext = registry.global_extractors["image"]
+        d = out_root / "global_conditions" / "image"
         d.mkdir(parents=True, exist_ok=True)
-        prompts = [c.replace("_", " ") for c in classes]
-        embs = ext.encode_batch(prompts)
-        for c, e in zip(classes, embs):
+        missing_dir, empty_dir, refreshed = [], [], []
+        for c in classes:
             p = d / f"{sanitize_class_name(c)}.npy"
-            if p.exists() and not force:
+            jp = p.with_suffix(".json")
+            cls_dir = Path(image_root) / c      # raw name: matches the source folder
+            if not cls_dir.exists():
+                # An existing bank for a class whose folder is gone is kept: it
+                # is still the bank the dataset was built with, and refusing to
+                # report it would look like the condition had vanished.
+                if p.exists() and jp.exists():
+                    try:
+                        written[c] = int(np.load(str(p), mmap_mode="r").shape[0])
+                        continue
+                    except Exception:
+                        pass
+                missing_dir.append(c)
                 continue
-            _atomic_save_npy(p, np.asarray(e, dtype=np.float32))
+            imgs = sorted(q for q in cls_dir.rglob("*")
+                          if q.suffix.lower() in IMAGE_EXTS)
+            # A bank on disk is reused only while it still describes the FOLDER.
+            # Comparing the recorded file list with what is there now is one
+            # directory listing, and it is what makes "drop ten new pictures in
+            # and re-run" work: the old test (the file merely exists) meant a
+            # grown class was silently stuck with yesterday's bank until someone
+            # ran --force, which also recomputes every chunk condition in the
+            # dataset. A class whose folder is unchanged is still not re-encoded.
+            if p.exists() and jp.exists() and not force:
+                try:
+                    recorded = list(json.loads(
+                        jp.read_text(encoding="utf-8")).get("files", []))
+                    n_rows = int(np.load(str(p), mmap_mode="r").shape[0])
+                    if (len(recorded) == n_rows
+                            and recorded == [q.name for q in imgs]):
+                        written[c] = n_rows
+                        continue
+                    if imgs:
+                        refreshed.append(f"{c}({len(recorded)}->{len(imgs)})")
+                except Exception:
+                    pass          # unreadable -> fall through and rebuild
+            if not imgs:
+                empty_dir.append(c)
+                continue
+            stack, kept = [], []
+            for q in imgs:
+                try:
+                    stack.append(np.asarray(ext.encode_image(str(q)),
+                                            dtype=np.float32))
+                    kept.append(q.name)
+                except Exception as e:
+                    # One unreadable picture must not cost the whole class its
+                    # bank; say which, and carry on with the rest.
+                    print(f"  [global/image] {c}/{q.name}: "
+                          f"{type(e).__name__}: {e} -> skipped")
+            if not stack:
+                empty_dir.append(c)
+                continue
+            _atomic_save_npy(p, np.stack(stack, axis=0))
+            _atomic_write_json(jp, {"class": c, "files": kept})
+            written[c] = len(kept)
+
         if hasattr(ext, "unload"):
             ext.unload()
-        print(f"[global/text] cached {len(classes)} class embeddings")
-
-    if "image" in gnames:
-        if not image_root or not Path(image_root).exists():
-            print("[global/image] --image_root missing/not found -> skipped")
-        else:
-            ext = registry.global_extractors["image"]
-            d = out_root / "global_conditions" / "image"
-            d.mkdir(parents=True, exist_ok=True)
-            for c in classes:
-                p = d / f"{sanitize_class_name(c)}.npy"
-                if p.exists() and not force:
-                    continue
-                cls_dir = Path(image_root) / c            # raw name matches source folder
-                if not cls_dir.exists():
-                    continue
-                imgs = sorted(
-                    q for q in cls_dir.rglob("*")
-                    if q.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-                )
-                if not imgs:
-                    continue
-                stack = [np.asarray(ext.encode_image(str(q)), dtype=np.float32) for q in imgs]
-                _atomic_save_npy(p, np.stack(stack, axis=0))
-            if hasattr(ext, "unload"):
-                ext.unload()
-            print("[global/image] cached per-class image embeddings")
+        total = sum(written.values())
+        print(f"[global/image] {total} images over "
+              f"{len(written)}/{len(classes)} classes -> {d}")
+        if refreshed:
+            # Say it out loud: the bank changed, so the image condition of those
+            # classes is not the one an earlier checkpoint was trained with.
+            print(f"[global/image] re-encoded {len(refreshed)} class(es) whose "
+                  f"folder changed since the bank was written: "
+                  f"{refreshed[:8]}{' ...' if len(refreshed) > 8 else ''}")
+        # A class with no images is not fatal -- the training falls back to a
+        # null image for it -- but it IS the difference between conditioning
+        # and not conditioning those samples, so it is reported, not swallowed.
+        if missing_dir:
+            print(f"[global/image] WARNING: no folder under {image_root} for "
+                  f"{len(missing_dir)} class(es): "
+                  f"{missing_dir[:8]}{' ...' if len(missing_dir) > 8 else ''}")
+        if empty_dir:
+            print(f"[global/image] WARNING: folder present but no usable image "
+                  f"for {len(empty_dir)} class(es): "
+                  f"{empty_dir[:8]}{' ...' if len(empty_dir) > 8 else ''}")
+    return written
 
 
 # ============================================================
@@ -1531,20 +1778,33 @@ def _extractor_device_attr(ext) -> Optional[str]:
     return None
 
 
-def _split_extractors_by_device(registry):
-    """Partition the frame conditions into (gpu_capable, cpu_only) name lists.
-
-    GPU-capable = has a device knob (f0 via torchcrepe, rhythm via beat_this).
-    CPU-only = pure DSP (chroma, energy) or a backend with no device knob
-    exposed here. Driven by the extractor objects rather
-    than a hardcoded name list, so a condition added later lands on the right
-    side by itself."""
+def _all_chunk_extractors(registry) -> dict:
+    """{name: extractor} for everything computed per chunk: the frame
+    conditions and the globals that read audio. The per-class globals are left
+    out -- they never see a chunk, so nothing about devices or workers applies
+    to them."""
     if registry is None:
-        return [], []
+        return {}
+    out = dict(getattr(registry, "frame_extractors", {}))
+    chunk_globals, _ = _split_globals_by_stage(registry)
+    gexts = getattr(registry, "global_extractors", {})
+    out.update({n: gexts[n] for n in chunk_globals})
+    return out
+
+
+def _split_extractors_by_device(registry):
+    """Partition the PER-CHUNK conditions into (gpu_capable, cpu_only) names.
+
+    GPU-capable = has a device knob (f0 via torchcrepe, rhythm via beat_this,
+    text via the CLAP audio tower). CPU-only = pure DSP (chroma, energy) or a
+    backend with no device knob exposed here. Driven by the extractor objects
+    rather than a hardcoded name list, so a condition added later lands on the
+    right side by itself -- which is how the CLAP audio encoder ended up on the
+    GPU side without a line here mentioning it."""
     gpu, cpu = [], []
-    for name, ext in getattr(registry, "frame_extractors", {}).items():
+    for name, ext in _all_chunk_extractors(registry).items():
         (gpu if _extractor_device_attr(ext) else cpu).append(name)
-    return gpu, cpu
+    return sorted(gpu), sorted(cpu)
 
 
 def _set_extractor_device(registry, names, device: str):
@@ -1553,8 +1813,9 @@ def _set_extractor_device(registry, names, device: str):
     run and is deliberately NOT part of any output fingerprint."""
     if registry is None:
         return
+    exts = _all_chunk_extractors(registry)
     for name in names or ():
-        ext = registry.frame_extractors.get(name)
+        ext = exts.get(name)
         if ext is None:
             continue
         attr = _extractor_device_attr(ext)
@@ -1575,7 +1836,7 @@ def _force_cpu_extractors(registry, names=None):
     if registry is None:
         return
     if names is None:
-        names = list(getattr(registry, "frame_extractors", {}).keys())
+        names = list(_all_chunk_extractors(registry).keys())
     _set_extractor_device(registry, names, "cpu")
 
 
@@ -1620,7 +1881,7 @@ def _process_gpu_batch(dac_enc, batch, sr, n_frames: int,
                 continue
             audio = it["audio"]
             chunk_np = audio.numpy() if hasattr(audio, "numpy") else np.asarray(audio)
-            extract_and_merge_frame_conditions(
+            extract_and_merge_chunk_conditions(
                 registry, chunk_np, sr, n_frames, Path(cp),
                 force=force, names=gpu_names)
             n_cond += 1
@@ -1727,13 +1988,14 @@ class StreamingChunkDataset(IterableDataset):
                         wav_path = self.wav_root / rel_parent / f"{name}.wav"
                         cond_path = self.cond_root / rel_parent / f"{name}.npz"
 
-                        # CPU-side conditions, in the worker, aligned to the
-                        # fixed T. The GPU-side ones (f0 / rhythm) are NOT done
-                        # here: they belong to the main process, which is the
-                        # only one allowed to touch CUDA.
+                        # CPU-side per-chunk conditions, in the worker, aligned
+                        # to the fixed T. The GPU-side ones (f0 / rhythm, and
+                        # the CLAP embedding behind the 'text' global) are NOT
+                        # done here: they belong to the main process, which is
+                        # the only one allowed to touch CUDA.
                         if has_cpu_conditions:
                             chunk_np = chunk.squeeze(0).cpu().numpy()
-                            extract_and_merge_frame_conditions(
+                            extract_and_merge_chunk_conditions(
                                 self.registry, chunk_np, self.sr,
                                 self.n_frames_fixed, cond_path,
                                 force=self.force, names=self.cpu_cond_names)
@@ -2024,10 +2286,30 @@ def build_parser():
                         help="Comma-separated frame conditions to extract, e.g. "
                              "'f0' or 'f0,energy'. None = skip conditions.")
     parser.add_argument("--global", dest="global_conds", type=str, default=None,
-                        help="Comma-separated global conditions to pre-cache "
-                             "('text' and/or 'image'). Class-level sidecars.")
+                        help="Comma-separated global conditions to extract "
+                             "('text' and/or 'image'). Independent of "
+                             "--conditions: either flag can be used alone, "
+                             "both together, and each takes any subset. "
+                             "'text' is computed PER CHUNK (the CLAP embedding "
+                             "of that chunk's audio) and is stored in the same "
+                             ".npz as the frame conditions, so it is extracted "
+                             "and resumed exactly like f0. 'image' is computed "
+                             "PER CLASS from --image_root into "
+                             "global_conditions/image/<class>.npy.")
+    parser.add_argument("--text_vocab", type=str, default=None,
+                        help="Text file, one phrase per line, replacing the "
+                             "built-in label vocabulary (conditions.py "
+                             "TEXT_LABEL_VOCAB). It is encoded once into "
+                             "global_conditions/text_vocab.npy and is what the "
+                             "validation panels use to put WORDS next to a "
+                             "stored CLAP vector -- a nearest-phrase retrieval, "
+                             "shown with its cosine, not a translation. "
+                             "Changing it never re-touches the audio.")
     parser.add_argument("--image_root", type=str, default=None,
-                        help="image_root/<class>/*.jpg for --global image.")
+                        help="image_root/<class>/*.jpg for --global image. The "
+                             "class folder names must match the source audio's "
+                             "class folders. EVERY image of a class is encoded: "
+                             "the training draws one at random per epoch.")
 
     # class layout
     parser.add_argument("--single_class", action="store_true")
@@ -2274,6 +2556,7 @@ def main():
 
     registry = None
     gpu_cond_names, cpu_cond_names = [], []
+    chunk_cond_names, class_global_names = [], []
     if enabled_frame or enabled_global:
         from conditions import ConditionRegistry
         registry = ConditionRegistry(
@@ -2281,7 +2564,15 @@ def main():
             enabled_global=enabled_global if enabled_global else [],
         )
 
-        # ---- split the frame conditions by WHERE they can run ----
+        # ---- split by WHERE the value comes from (see the CONDITIONS header) --
+        # Per-chunk conditions go through the stream; per-class ones are built
+        # afterwards from their own assets. Selecting only frame conditions,
+        # only globals, or any mixture needs no branch: one of the two lists
+        # simply comes out empty.
+        chunk_globals, class_global_names = _split_globals_by_stage(registry)
+        chunk_cond_names = sorted(list(registry.frame_names) + chunk_globals)
+
+        # ---- split the per-chunk conditions by WHERE they can run ----
         # GPU-capable ones (f0, rhythm) move to the MAIN process, alongside the
         # DAC batch: the card stays owned by one process, so the reason workers
         # were barred from CUDA is satisfied by construction rather than by a
@@ -2299,7 +2590,15 @@ def main():
         else:
             # Everything on CPU: the extraction all happens worker-side, exactly
             # as before this split existed.
-            gpu_cond_names, cpu_cond_names = [], gpu_capable + cpu_only
+            gpu_cond_names, cpu_cond_names = [], sorted(gpu_capable + cpu_only)
+            # And PIN them, which this branch used to leave undone. The pinning
+            # below only ran with num_workers > 0, so "--cond_device cpu
+            # --num_workers 0" left every extractor at its own default. That was
+            # invisible while the only GPU-capable extractors defaulted to CPU
+            # anyway (CrepeF0Extractor does, in CONDITION_CONFIG) -- but the
+            # CLAP encoder defaults to CUDA, so it happily loaded onto the card
+            # in a run that had just been told not to use it.
+            _set_extractor_device(registry, cpu_cond_names, "cpu")
 
         if args.num_workers > 0:
             # The extractors that REMAIN in the workers must never touch CUDA:
@@ -2309,10 +2608,16 @@ def main():
             # put f0 straight back on CPU and undo the split above.
             _force_cpu_extractors(registry, cpu_cond_names)
 
-        if registry.frame_names:
-            print(f"[cond] frame conditions: "
+        if chunk_cond_names:
+            print(f"[cond] per-chunk conditions {chunk_cond_names}: "
                   f"GPU({cond_device})={gpu_cond_names or 'none'} in the main "
                   f"process | CPU={cpu_cond_names or 'none'} in the workers")
+        if class_global_names:
+            print(f"[cond] per-class conditions {class_global_names}: "
+                  f"one sidecar per class, after the stream")
+        if not chunk_cond_names and not class_global_names:
+            print("[cond] a registry was built but it holds no condition "
+                  "-> nothing to extract")
 
     # ---- scan ----
     print("Scanning source files ...")
@@ -2418,6 +2723,13 @@ def main():
     print(f"[latents] T (real DAC frames per chunk) = {n_frames_fixed}")
     if registry is not None and registry.frame_names:
         print(f"[conditions] frame-aligned to T={n_frames_fixed}")
+    if registry is not None and _split_globals_by_stage(registry)[0]:
+        # The per-chunk globals are one vector for the whole chunk, so T does
+        # not enter them -- but the chunk they summarise is the same one, and
+        # saying so here keeps the two lines from looking contradictory.
+        print(f"[conditions] per-chunk globals "
+              f"{_split_globals_by_stage(registry)[0]}: one vector per chunk "
+              f"(independent of T)")
 
     # ---- dataset_meta.json (written now that the real T is known) ----
     meta = _meta_dict(args, chunk_length, chunk_overlap, n_frames_fixed)
@@ -2592,16 +2904,23 @@ def main():
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ---- global conditions (class-level, after the stream) ----
-    if registry is not None and registry.global_names:
-        extract_global_conditions(
+    if class_global_names:
+        extract_class_global_conditions(
             registry, out_root, classes, args.image_root, force=args.force
         )
+    # The label vocabulary rides with the 'text' condition: it is what lets a
+    # panel put words next to a stored CLAP vector. Written after the stream so
+    # it is not paid for by a run that fails early.
+    if "text" in _split_globals_by_stage(registry)[0]:
+        write_text_label_vocab(registry, out_root,
+                               getattr(args, "text_vocab", None),
+                               force=args.force)
 
     print("\nDONE")
     print(f"  latents encoded this run: {n_lat}")
     if gpu_cond_names:
-        print(f"  GPU conditions {gpu_cond_names} extracted this run: {n_gcond} "
-              f"chunk(s)")
+        print(f"  GPU per-chunk conditions {gpu_cond_names} extracted this run: "
+              f"{n_gcond} chunk(s)")
     print("  CPU conditions / wav were written in-stream by the workers "
           "(counts not aggregated across processes).")
     print_chunk_counts(out_root, split_groups)

@@ -461,6 +461,36 @@ class ConditionedAudioDiT(nn.Module):
             out[name] = c
         return out
 
+    def _gather_global_conditions(
+        self,
+        global_conditions: Optional[Dict[str, torch.Tensor]],
+        B: int, device, dtype,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        The global counterpart of _gather_frame_conditions: return a dict with
+        EVERY expected global condition present, missing ones zero-filled.
+
+        Same reason as the frame version, and the same null: the CFG dropout at
+        training time replaces a dropped global with a ZERO VECTOR, so zeros --
+        pushed through the projection, its bias and the final LayerNorm -- are
+        what the model learned "no condition" to be. Leaving a name out of the
+        dict instead removed its projection from the sum altogether, a third
+        state that was never trained. That is what a partial dict looked like:
+        `sampling_cond.py --prompt ... --allow_null_global_conditions` (a text
+        vector, no image) built exactly one, as did any call that passed None or
+        {} while the model had global conditions.
+        """
+        out = {}
+        gc = global_conditions or {}
+        for name, cfg in self.global_cond_configs.items():
+            c = gc.get(name, None)
+            if c is None:
+                c = torch.zeros(B, int(cfg["dim"]), device=device, dtype=dtype)
+            else:
+                c = c.to(device=device, dtype=dtype)
+            out[name] = c
+        return out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -492,9 +522,21 @@ class ConditionedAudioDiT(nn.Module):
         x = self.input_proj(x)
 
         # ----- GLOBAL conditions: AdaLN vector c = t_emb + g_global -----
+        # Gathered, NOT tested for truthiness: a model WITH global conditions
+        # handed an empty or partial dict must still see the null it was trained
+        # against (zeros through the projection), exactly as the frame branch
+        # above zero-fills its missing slots. Skipping the encoder for an empty
+        # dict, as this used to, made "no global given" a different input from
+        # "global dropped by CFG" -- two nulls where the training had one.
+        # NB: float32, not x.dtype -- by this point x has been through
+        # input_proj, which under autocast returns fp16. The conditions arrive
+        # in fp32 and autocast casts them itself inside the projection; forcing
+        # fp16 here would only lose precision before it.
         c = self.t_embedder(t)                          # (B, hidden)
-        if self.has_global and global_conditions:
-            g = self.global_encoder(global_conditions)  # (B, hidden) or None
+        if self.has_global:
+            gc = self._gather_global_conditions(global_conditions, B,
+                                                x.device, torch.float32)
+            g = self.global_encoder(gc)                 # (B, hidden) or None
             if g is not None:
                 c = c + g
 

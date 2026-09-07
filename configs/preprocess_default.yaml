@@ -114,11 +114,38 @@ save_wav: "none"
 # the latents are NOT re-encoded, only the missing condition is extracted.
 conditions: null
 
-# Class-level global conditions to pre-cache: "text", "image", or "text,image".
+# Global conditions: "text", "image", or "text,image".
 # (This is the one key whose name differs from its flag: the CLI spells it
 #  --global, which Python cannot use as an attribute name.)
+#
+# INDEPENDENT of `conditions` above: either can be used alone, both together,
+# and each takes any subset. Adding one later is incremental in the same way --
+# no latent is re-encoded and no condition already on disk is dropped.
+#
+# The two are NOT written to the same place, because their values do not come
+# from the same thing:
+#   text  -> PER CHUNK, from that chunk's own audio (its CLAP embedding), so it
+#            lands in the SAME .npz as f0 and is extracted and resumed exactly
+#            like it. It is NOT the embedding of the class name.
+#            Also writes global_conditions/text_vocab.{npy,json}: the phrase
+#            list the validation panels use to put words next to a stored
+#            vector (a nearest-phrase retrieval, shown with its cosine -- CLAP
+#            cannot be run backwards).
+#   image -> PER CLASS, from image_root, into
+#            global_conditions/image/<class>.npy plus a .json naming the files
+#            in row order. EVERY picture of a class is encoded: the training
+#            draws one at random per epoch, so a cap here would silently cap
+#            that augmentation for every run that ever reads the dataset.
+#
+# COST: 'text' runs the CLAP audio encoder on EVERY chunk, so it wants the GPU
+# -- which it gets from `device` below (cond_device only needs setting if you
+# want the conditions on a different device from the DAC).
 global_conds: null
 image_root:   null        # image_root/<class>/*.jpg, for the image condition
+# Optional text file, one phrase per line, replacing the built-in label
+# vocabulary (conditions.py TEXT_LABEL_VOCAB, 52 phrases). Encoded once into
+# the dataset; editing it later re-labels every panel without re-touching audio.
+text_vocab:   null
 
 # Flatten every source into one class directory.
 single_class: false

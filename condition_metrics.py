@@ -301,7 +301,8 @@ def format_influence_panel(influence: dict, step: int, prefix: str = "EMA",
 
 def format_influence_matrix(entries: list, step: int, prefix: str = "EMA",
                             guidance: float = 1.0, n_samples: int = 0,
-                            extra: dict = None, extra_coverage: dict = None) -> str:
+                            extra: dict = None, extra_coverage: dict = None,
+                            always_given: set = None) -> str:
     """
     Render SEVERAL condition subsets as one panel: a compact Δ matrix on top,
     the full per-subset tables underneath.
@@ -335,6 +336,12 @@ def format_influence_matrix(entries: list, step: int, prefix: str = "EMA",
     A cell whose condition was not part of that row's subset is marked with a
     degree sign, so "conditioned on it" and "measured anyway" never get
     confused when reading the table.
+
+    `always_given`: conditions handed to the model in EVERY row, which the
+    subset labels therefore say nothing about -- the GLOBAL ones (text, image).
+    The subsets vary the frame conditions only, so without this a row labelled
+    "only_f0" would mark text and image as side effects when in fact both
+    conditioned that generation.
     """
     def fmt_delta(x):
         return f"{x:+.4f}" if isinstance(x, (int, float)) else "n/a"
@@ -356,15 +363,17 @@ def format_influence_matrix(entries: list, step: int, prefix: str = "EMA",
         lines.append("| Conditions given | "
                      + " | ".join(f"`{c}`/{m}" for c, m in cols) + " |")
         lines.append("|---|" + "---:|" * len(cols))
+        pinned = set(always_given or ())
         for label, infl, _cov in entries:
-            given = _subset_names_of(label, infl)
+            given = _subset_names_of(label, infl, always_given=pinned)
             cells = []
             for cname, metric in cols:
                 vals = infl.get(cname, {}).get(metric)
                 txt = fmt_delta(vals.get("delta")) if vals else "n/a"
                 # ° marks a condition that was NOT given for this row but was
                 # measured anyway -- a side effect, not an adherence.
-                if given is not None and cname not in given and txt != "n/a":
+                if (given is not None and cname not in given
+                        and cname not in pinned and txt != "n/a"):
                     txt += "°"
                 cells.append(txt)
             lines.append(f"| **{label}** | " + " | ".join(cells) + " |")
@@ -402,7 +411,7 @@ def format_influence_matrix(entries: list, step: int, prefix: str = "EMA",
     return "\n".join(lines)
 
 
-def _subset_names_of(label: str, influence: dict):
+def _subset_names_of(label: str, influence: dict, always_given: set = None):
     """
     The condition names a subset label says were GIVEN, or None when the label
     does not encode them (then no cell is marked as a side effect).
@@ -412,16 +421,22 @@ def _subset_names_of(label: str, influence: dict):
         "only_<name>"  -> that one
         "no_<name>"    -> everything except that one
         "a+b+c"        -> exactly those
+
+    `always_given` names the conditions handed to the model in every row (the
+    global ones): they are added back because the labels describe the FRAME
+    subsets only, and a "no_<name>" label must not subtract them from the set of
+    keys either.
     """
+    pinned = set(always_given or ())
     if label == "all":
         return None
     if label.startswith("only_"):
-        return {label[len("only_"):]}
+        return {label[len("only_"):]} | pinned
     if label.startswith("no_"):
-        return set(influence.keys()) - {label[len("no_"):]}
+        return (set(influence.keys()) | pinned) - {label[len("no_"):]}
     if "+" in label:
-        return set(label.split("+"))
-    return {label}
+        return set(label.split("+")) | pinned
+    return {label} | pinned
 
 def format_influence_legend() -> str:
     """One-off legend for the Condition_influence panel, logged ONCE to a

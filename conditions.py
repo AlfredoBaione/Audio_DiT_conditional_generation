@@ -38,7 +38,9 @@
 
 import torch
 import torch.nn as nn
+import torchaudio
 import numpy as np
+import inspect
 import random
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -98,6 +100,39 @@ class FrameConditionExtractor(ABC):
             x, axis=0, kind='linear', fill_value='extrapolate',
         )
         return f(np.linspace(0, 1, target_len))
+
+
+def _projection_dim_from_config(model_name: str) -> Optional[int]:
+    """The width of a HuggingFace checkpoint's projected embedding, read off its
+    CONFIG -- a small JSON -- without building the model.
+
+    WHY IT EXISTS. `dim` is asked for in places that never encode anything: the
+    training reads it to size the AdaLN input projection, and the probe-cache
+    fingerprint reads it through dir(). Answering by instantiating the model
+    put the CLAP text tower on the TRAINING GPU (measured: 0.56 GB) and left it
+    there for the whole run, to obtain an integer that is written in the config
+    file. Every caller that actually encodes still loads the weights the usual
+    way, so nothing else changes.
+
+    Returns None when the config does not declare it (the caller then falls back
+    to loading the model, which is the answer of last resort but always right).
+    """
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_name)
+        # Composite configs (ClapConfig, CLIPConfig) carry projection_dim at the
+        # top level AND on each tower; the single-tower configs carry only their
+        # own. Take the first that answers -- they agree, and this works for both.
+        for obj in (cfg,
+                    getattr(cfg, "text_config", None),
+                    getattr(cfg, "vision_config", None),
+                    getattr(cfg, "audio_config", None)):
+            d = getattr(obj, "projection_dim", None) if obj is not None else None
+            if isinstance(d, int) and d > 0:
+                return int(d)
+    except Exception:
+        return None
+    return None
 
 
 class GlobalConditionExtractor(ABC):
@@ -555,18 +590,44 @@ class CLAPTextCondition(GlobalConditionExtractor):
     explicit .text_embeds field, robust to signature changes of
     ClapModel.get_text_features across transformers versions.
 
-    Available models:
-        - 'laion/larger_clap_music'      (music-specialised) <- default
-        - 'laion/larger_clap_general'    (general audio)
-        - 'laion/clap-htsat-fused'       (smaller, general)
+    Available models, with what they scored here (6 Sept 2026, measured on 120
+    Museart clips, 40 per class, plus a sanity check on four unmistakable
+    synthetic sounds -- sine / white noise / silence / siren -- each against its
+    own description). "retrieval" is 3-way class accuracy from the audio
+    (chance 33.3%), "margin" the mean gap between the right description's score
+    and the best wrong one, "sep" the audio-audio cosine within a class minus
+    between classes:
+
+        - 'laion/clap-htsat-unfused'     sanity 4/4  83.3%  +0.192  +0.260  <- default
+        - 'laion/larger_clap_general'    sanity 4/4  80.0%  +0.121  +0.221
+        - 'laion/clap-htsat-fused'       sanity 4/4  75.0%  +0.079  +0.199
+        - 'laion/larger_clap_music'      sanity 1/4  BROKEN -- DO NOT USE
+
+    THE MUSIC-SPECIALISED CHECKPOINT IS BROKEN and was this file's default until
+    the day those numbers were measured. Both its towers emit near-constant
+    embeddings: its softmax over the four synthetic sounds is a flat 0.250 on
+    every cell, and audio-text cosines sit at ~0.01 whatever the pair. It is the
+    published checkpoint, not the code: the weights (projections included) load
+    correctly, the feature extractor is configured as the model expects
+    (enable_fusion=False, rand_trunc, repeatpad), and transformers 4.57.6 and
+    5.16.1 behave identically. Nothing here had ever run it -- enabled_global
+    was [] -- so no past result is affected, but it would have made both the
+    text condition and its influence metric silently meaningless.
+
+    A degenerate checkpoint fails SILENTLY: the embeddings look healthy (finite,
+    unit norm, right dtype and shape) and only their spread gives it away. Run
+    the synthetic sanity check before trusting any CLAP number from a checkpoint
+    that has not been measured here.
     """
 
-    def __init__(self, model_name: str = "laion/larger_clap_music"):
+    def __init__(self, model_name: str = "laion/clap-htsat-unfused"):
         self.model_name = model_name
         self._model = None
         self._processor = None
         self._dim = None
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        # The audio tower, built only if encode_audio is ever called (see below).
+        self._audio_embedder = None
 
     def _load(self):
         if self._model is not None:
@@ -589,6 +650,10 @@ class CLAPTextCondition(GlobalConditionExtractor):
     def name(self): return "text"
     @property
     def dim(self):
+        # From the CONFIG first: asking for the width must not put a second
+        # checkpoint on the GPU (see _projection_dim_from_config).
+        if self._dim is None:
+            self._dim = _projection_dim_from_config(self.model_name)
         if self._dim is None:
             self._load()
         return self._dim
@@ -615,8 +680,57 @@ class CLAPTextCondition(GlobalConditionExtractor):
         feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
         return feat.cpu().numpy().astype(np.float32)
 
+    # ---- AUDIO SIDE: what the preprocessing actually stores ---------------
+    #
+    # The condition is called "text" because that is the SLOT, and text is what
+    # it receives at inference. At TRAINING time the stored value is the CLAP
+    # embedding of the chunk's own AUDIO (the AudioLDM arrangement): CLAP's two
+    # towers share one space, so a vector from the audio encoder and one from
+    # the text encoder are interchangeable in that slot, and a model trained on
+    # the first accepts the second.
+    #
+    # WHY NOT THE CLASS NAME, which is what the preprocessing used to store:
+    # one embedding per class makes the text condition carry exactly one bit --
+    # the category -- and the image condition, drawn from that same class,
+    # carries the same one. Two conditions saying the identical thing cannot be
+    # told apart in an ablation. The per-chunk audio embedding makes text a
+    # signal that varies WITHIN a class and leaves image as the categorical one.
+    #
+    # TWO CAVEATS, both accepted deliberately when this was chosen:
+    #   * at training the condition is computed from the very audio the model
+    #     has to produce, so it contains the answer and the text-influence
+    #     metric is flattering by construction. Read it knowing that.
+    #   * the two towers share a space but do not sit exactly on top of each
+    #     other, so a text vector at inference is not drawn from quite the same
+    #     cloud as the audio vectors seen in training.
+    #
+    # The audio tower is a SECOND checkpoint load, so it is built lazily and
+    # only in the process that extracts: a run that merely reads back stored
+    # embeddings never pays for it.
+
+    def _audio_side(self):
+        if self._audio_embedder is None:
+            self._audio_embedder = ClapAudioEmbedder(model_name=self.model_name,
+                                                     device=self._device)
+        return self._audio_embedder
+
+    @torch.no_grad()
+    def encode_audio(self, wav_np: np.ndarray, sr: int) -> np.ndarray:
+        """(T,) waveform -> (dim,) L2-normalized embedding, in the SAME space as
+        encode_text.
+
+        The PRESENCE of this method is what marks a global condition as
+        computable per chunk (preprocess_stream._global_is_chunk_level), so it
+        rides the same extraction path as f0 instead of the per-class one. A
+        global condition without it is a per-class one, and the two need no
+        registry of names to tell apart."""
+        return self._audio_side().embed(wav_np, sr)
+
     def unload(self):
         """Free GPU memory after pre-computing the embeddings."""
+        if self._audio_embedder is not None:
+            self._audio_embedder.unload()
+            self._audio_embedder = None
         if self._model is not None:
             self._model.cpu()
             del self._model
@@ -643,12 +757,13 @@ class ClapAudioEmbedder:
     Lazily loaded; only instantiated when 'text' is an active global condition.
     """
 
-    def __init__(self, model_name: str = "laion/larger_clap_music",
+    def __init__(self, model_name: str = "laion/clap-htsat-unfused",
                  device: Optional[str] = None):
         self.model_name = model_name
         self._model = None
         self._processor = None
         self._dim = None
+        self._audio_kw = "audio"
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     def _load(self):
@@ -659,18 +774,45 @@ class ClapAudioEmbedder:
         self._processor = AutoProcessor.from_pretrained(self.model_name)
         self._model.eval().to(self._device)
         self._dim = int(self._model.config.projection_dim)
+        # The processor's audio keyword was renamed `audios` -> `audio`:
+        # transformers 5 REJECTS the old name, older 4.x releases do not know
+        # the new one. Decided ONCE from the signature rather than by calling
+        # and catching: the wrong-keyword error is a ValueError, and so is
+        # "your audio is at the wrong sampling rate", so a try/except around
+        # the call cannot tell the two apart and would report a real data
+        # problem as a version problem.
+        try:
+            params = inspect.signature(self._processor.__call__).parameters
+            self._audio_kw = "audio" if "audio" in params else "audios"
+        except (TypeError, ValueError):
+            self._audio_kw = "audio"
         print(f"[ClapAudioEmbedder] '{self.model_name}' audio encoder "
               f"loaded on {self._device} (dim={self._dim})")
 
     @torch.no_grad()
     def embed(self, wav_np: np.ndarray, sr: int) -> np.ndarray:
-        """(T,) waveform -> (dim,) L2-normalized audio embedding in CLAP space.
-        The processor resamples to CLAP's expected rate internally."""
+        """(T,) waveform at `sr` -> (dim,) L2-normalized audio embedding in CLAP
+        space.
+
+        RESAMPLES to CLAP's own rate first. The feature extractor does NOT do it
+        for you: handed 44100 Hz audio it raises ValueError and refuses, which
+        is exactly what this project would feed it -- every chunk here is at the
+        DAC's 44.1 kHz while CLAP wants 48 kHz. (This docstring used to claim
+        the processor resampled internally. It does not, and nothing had ever
+        called this method with real audio to find out.)"""
         self._load()
         if wav_np.ndim > 1:
             wav_np = wav_np.squeeze()
-        inputs = self._processor(audios=np.asarray(wav_np, dtype=np.float32),
-                                 sampling_rate=sr, return_tensors="pt")
+        wav_np = np.asarray(wav_np, dtype=np.float32)
+
+        want_sr = int(getattr(self._processor, "feature_extractor",
+                              self._processor).sampling_rate)
+        if int(sr) != want_sr:
+            wav_np = torchaudio.functional.resample(
+                torch.from_numpy(wav_np), int(sr), want_sr).numpy()
+
+        inputs = self._processor(sampling_rate=want_sr, return_tensors="pt",
+                                 **{self._audio_kw: wav_np})
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         out = self._model(**inputs)
         feat = out.audio_embeds                      # (1, dim)
@@ -687,11 +829,167 @@ class ClapAudioEmbedder:
 
 
 # ============================================================
+# TEXT LABEL VOCABULARY (reading a stored CLAP vector back as words)
+# ============================================================
+#
+# WHY THIS EXISTS. The 'text' condition of a validation sample is the CLAP
+# embedding of its own audio, and CLAP is a one-way street: there is no decoder,
+# so those numbers cannot be turned back into the sentence that would describe
+# them -- no sentence ever existed. A panel showing "validation sample #37"
+# conditioned on 512 anonymous numbers tells the reader nothing about WHAT it
+# was conditioned on.
+#
+# So the label is a RETRIEVAL, not a translation: of the phrases below, which
+# sit closest to that sample's vector? It is honest only if read that way --
+# "the nearest phrase I know" -- which is why the cosine is always shown beside
+# it. A low cosine means the vocabulary has nothing close, not that the audio
+# resembles the phrase shown.
+#
+# It costs nothing to recompute: the per-chunk vector is already on disk and the
+# phrase embeddings are cached in the dataset, so the label is one dot product.
+# That is deliberate -- edit this list, re-encode the phrases, and every label
+# changes without re-preprocessing a single chunk of audio.
+TEXT_LABEL_VOCAB = [
+    # instrumentation
+    "solo pipe organ", "a cappella choir", "harpsichord", "solo piano",
+    "string quartet", "solo violin", "solo cello", "acoustic guitar",
+    "electric guitar", "distorted electric guitar", "electric bass",
+    "drum kit", "hand percussion", "brass section", "solo trumpet",
+    "woodwinds", "synthesizer", "analog synthesizer bass", "orchestra",
+    # texture and register
+    "a single sustained note", "a dense polyphonic texture",
+    "a solo melodic line", "a low bass register", "a high bright register",
+    "sparse and quiet", "loud and dense",
+    # rhythm and motion
+    "a steady four on the floor beat", "a fast rhythmic pattern",
+    "a slow tempo", "no clear pulse", "a strong groove",
+    # space and production
+    "a large reverberant church", "a dry close recording",
+    "a live concert recording", "a lo-fi noisy recording",
+    # style
+    "baroque sacred music", "gregorian chant", "classical music",
+    "romantic orchestral music", "rock music", "heavy metal",
+    "electronic dance music", "ambient music", "experimental noise",
+    "jazz", "folk music", "film score",
+    # extended technique / non-musical
+    "a plucked pizzicato attack", "a bowed tremolo", "breathy air noise",
+    "silence", "white noise",
+]
+
+
+def nearest_phrases(vec, vocab_emb, phrases, k: int = 2):
+    """(dim,) stored vector + (n_phrases, dim) vocabulary -> [(phrase, cos), ...]
+
+    Both sides are L2-normalized, so the dot product IS the cosine. Returns the
+    k nearest, best first. Kept here rather than in the metrics module because
+    it is about what the text condition MEANS, not about scoring a model."""
+    v = np.asarray(vec, dtype=np.float32).reshape(-1)
+    M = np.asarray(vocab_emb, dtype=np.float32)
+    if v.size == 0 or M.size == 0 or M.shape[1] != v.shape[0]:
+        return []
+    sims = M @ v
+    order = np.argsort(-sims)[:max(1, int(k))]
+    return [(phrases[i], float(sims[i])) for i in order if i < len(phrases)]
+
+
+# ============================================================
+# WAV2CLIP AUDIO EMBEDDER (audio in CLIP's space, for IMAGE influence)
+# ============================================================
+
+class Wav2ClipAudioEmbedder:
+    """
+    Audio encoder distilled INTO CLIP's own embedding space (Wav2CLIP, Wu et
+    al. 2022). It is what makes an audio-vs-image number exist at all.
+
+    WHY IT IS NEEDED. CLIP embeds images and text in one space; CLAP embeds
+    audio and text in a DIFFERENT one. Between a CLIP image vector and a CLAP
+    audio vector there is no meaningful cosine -- they are coordinates in
+    unrelated spaces. Wav2CLIP is trained to place audio where CLIP would place
+    the matching image, so its output can be compared directly with the CLIP
+    image embeddings this project already stores.
+
+    HOW STRONG IS THE SIGNAL, measured here on 6 September 2026 over 36 Museart
+    clips and 36 of its images (12 + 12 per class): same-class audio-image
+    cosine +0.0748, cross-class +0.0629, i.e. a separation of only +0.0119, and
+    audio->class retrieval 41.7% against a 33.3% chance level. That is real but
+    SMALL, and the reason is a double domain mismatch: Wav2CLIP is distilled on
+    VGGSound (video frames of everyday sound events) while this corpus pairs
+    music with album covers and paintings.
+    READ THE INFLUENCE ROW ACCORDINGLY: it is a PAIRED delta -- the same image
+    scored against the conditioned and the null generation -- which is far more
+    sensitive than the cross-class retrieval above, so a consistent positive
+    delta still means something. An absolute cosine near 0.07 does not.
+
+    Kept deliberately separate from ImageCondition: that class encodes the
+    IMAGES (and is what the dataset's banks were built with), this one encodes
+    AUDIO into the same space, and only validation ever needs it.
+    """
+
+    SR = 16000          # Wav2CLIP's own rate; anything else must be resampled
+
+    def __init__(self, device: Optional[str] = None):
+        self._model = None
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _load(self):
+        if self._model is not None:
+            return
+        try:
+            import wav2clip
+        except ImportError as e:
+            raise ImportError(
+                "wav2clip is required to measure the IMAGE condition's "
+                "influence (audio<->image similarity). Install it with:\n"
+                "    pip install wav2clip\n"
+                "or switch the image influence off; nothing else needs it."
+            ) from e
+        self._model = wav2clip.get_model(device=self._device)
+        print(f"[Wav2ClipAudioEmbedder] loaded on {self._device} "
+              f"(audio -> CLIP space, dim=512)")
+
+    @torch.no_grad()
+    def embed(self, wav_np: np.ndarray, sr: int) -> np.ndarray:
+        """(T,) waveform at `sr` -> (512,) L2-normalized vector in CLIP space,
+        directly comparable with an ImageCondition embedding."""
+        import wav2clip
+        self._load()
+        wav_np = np.asarray(wav_np, dtype=np.float32)
+        if wav_np.ndim > 1:
+            wav_np = wav_np.squeeze()
+        if int(sr) != self.SR:
+            wav_np = torchaudio.functional.resample(
+                torch.from_numpy(wav_np), int(sr), self.SR).numpy()
+        emb = np.asarray(wav2clip.embed_audio(wav_np, self._model),
+                         dtype=np.float32).reshape(-1)
+        n = float(np.linalg.norm(emb))
+        return emb / n if n > 0 else emb
+
+    def unload(self):
+        if self._model is not None:
+            del self._model
+            self._model = None
+            if self._device == "cuda":
+                torch.cuda.empty_cache()
+
+
+# ============================================================
 # GLOBAL: IMAGE (CLIP)
 # ============================================================
 
 class ImageCondition(GlobalConditionExtractor):
-    """Encodes an image with CLIP."""
+    """
+    Encodes an image with CLIP.
+
+    Implementation: uses CLIPVisionModelWithProjection (not CLIPModel), for the
+    same reason CLAPTextCondition uses ClapTextModelWithProjection -- it is the
+    canonical API to extract the projected embedding, it exposes an explicit
+    .image_embeds field, and it is robust to the signature changes that
+    CLIPModel.get_image_features has gone through across transformers versions.
+    Under transformers 5.x that method no longer returns a tensor at all but a
+    BaseModelOutputWithPooling, which broke the previous implementation outright.
+    The two produce bit-identical vectors (verified: max abs diff 0.0), and this
+    one loads only the vision tower instead of the full dual-encoder.
+    """
 
     def __init__(self, model_name: str = "openai/clip-vit-base-patch32"):
         self.model_name = model_name
@@ -702,9 +1000,9 @@ class ImageCondition(GlobalConditionExtractor):
     def _load(self):
         if self._model is not None:
             return
-        from transformers import CLIPModel, CLIPProcessor
-        self._model = CLIPModel.from_pretrained(self.model_name)
-        self._processor = CLIPProcessor.from_pretrained(self.model_name)
+        from transformers import CLIPVisionModelWithProjection, AutoProcessor
+        self._model = CLIPVisionModelWithProjection.from_pretrained(self.model_name)
+        self._processor = AutoProcessor.from_pretrained(self.model_name)
         self._model.eval()
         self._dim = int(self._model.config.projection_dim)
         print(f"[ImageCondition] CLIP '{self.model_name}' loaded (dim={self._dim})")
@@ -713,6 +1011,10 @@ class ImageCondition(GlobalConditionExtractor):
     def name(self): return "image"
     @property
     def dim(self):
+        # Same as CLAPTextCondition.dim: the config knows the width, so reading
+        # it never builds the vision tower.
+        if self._dim is None:
+            self._dim = _projection_dim_from_config(self.model_name)
         if self._dim is None:
             self._load()
         return self._dim
@@ -723,7 +1025,8 @@ class ImageCondition(GlobalConditionExtractor):
         from PIL import Image
         img = Image.open(image_path).convert("RGB")
         inputs = self._processor(images=img, return_tensors="pt")
-        feat = self._model.get_image_features(**inputs)
+        out = self._model(**inputs)
+        feat = out.image_embeds          # (1, dim) -- already projected
         feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
         return feat.squeeze(0).cpu().numpy().astype(np.float32)
 
@@ -867,7 +1170,12 @@ CONDITION_CONFIG = {
     "global": {
         "text": {
             "class": CLAPTextCondition,
-            "kwargs": {"model_name": "laion/larger_clap_music"},
+            # NOT 'laion/larger_clap_music': that checkpoint is broken (flat
+            # 0.250 softmax over four unmistakable sounds). See the table in
+            # CLAPTextCondition's docstring for the measurements behind this
+            # choice. ClapAudioEmbedder reads this same value, so the influence
+            # metric always scores in the space the condition was built in.
+            "kwargs": {"model_name": "laion/clap-htsat-unfused"},
             "enabled": True,
         },
         "image": {
@@ -1079,10 +1387,21 @@ class GlobalConditionEncoder(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_size, eps=1e-6)
 
     def forward(self, conditions: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
-        embs = []
-        for name, enc in self.encoders.items():
-            if name in conditions:
-                embs.append(enc(conditions[name]))
+        """
+        conditions: {name: (B, dim)} — every expected name must be present
+                    (zeros for null conditions), exactly like
+                    FrameConditionEncoder. The caller (ConditionedAudioDiT)
+                    guarantees this via _gather_global_conditions.
+
+        The contract matters: a name simply MISSING from the dict used to be
+        left out of the sum, which is a third state the model never saw. The
+        null it is trained against is a ZERO VECTOR through the projection --
+        not the absence of that projection's bias and LayerNorm contribution --
+        so "give me only a prompt, no image" has to send zeros for the image,
+        not nothing.
+        """
+        embs = [enc(conditions[name]) for name, enc in self.encoders.items()
+                if name in conditions]
         if not embs:
             return None
         return self.final_norm(torch.stack(embs, dim=0).sum(dim=0))

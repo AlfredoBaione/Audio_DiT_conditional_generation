@@ -66,7 +66,10 @@ from audio_dataset_cond import ConditionedAudioDataset, load_source_split
 from network_cond import ConditionedAudioDiT, TOKEN_DIM
 from conditions import (
     ConditionRegistry,
-    ImageDatasetManager,
+    # CLAPTextCondition / ImageCondition are still needed HERE: --prompt and
+    # --image encode a free prompt or a chosen picture at inference time. What
+    # is gone is ImageDatasetManager -- the per-sample image now comes from the
+    # dataset's own CLIP bank, not from scanning the image folder again.
     CLAPTextCondition,
     ImageCondition,
     make_null_frame_conditions,
@@ -421,17 +424,10 @@ def main():
     # keep the naming map consistent with the mapping the dataset actually uses
     idx_to_label = {v: k for k, v in dataset_label_map.items()}
 
-    # image manager only if image conditioning is active (split-less: split=None)
-    image_manager = None
-    image_active = "image" in getattr(registry, "global_extractors", {})
-    if image_active and img_root is not None:
-        try:
-            image_manager = ImageDatasetManager(img_root, split=None)
-        except Exception:
-            print("[test_cond] image_root present but unreadable -> per-sample "
-                  "image embeddings will be zeros unless --image is provided.")
-            image_manager = None
-
+    # No image manager: the per-sample image embedding is read from the
+    # dataset's own global_conditions/image/ bank, written once by
+    # preprocess_stream.py --global image. The raw image folder is not opened
+    # here and CLIP is never loaded.
     test_dataset = ConditionedAudioDataset(
         files=test_files,
         label_to_idx=dataset_label_map,
@@ -442,7 +438,6 @@ def main():
         duration_s=cfg.model.duration_s,
         normalizer=normalizer,
         registry=registry,
-        image_manager=image_manager,
         preload_latents=False,
         strict_conditions=not args.allow_invalid_conditions,   # #12: strict by default
     )

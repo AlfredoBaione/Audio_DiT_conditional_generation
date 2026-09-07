@@ -55,6 +55,13 @@ mir_eval             # f0 fidelity: voicing + cents conversion (condition_metric
 # without resampy, enabling metrics.enabled=[... 'fad_vggish'] dies at startup.
 resampy              # required by torchvggish/vggish_input.py (FAD-VGGish)
 
+# Wav2CLIP: audio distilled INTO CLIP's embedding space. It is what makes the
+# IMAGE condition's influence row a number at all -- a CLIP image vector and a
+# CLAP audio vector live in unrelated spaces, so without it that row reads
+# "no audio->CLIP embedder". Only needed when 'image' is an active global
+# condition; nothing else in the pipeline imports it.
+wav2clip             # image influence — audio in CLIP space (conditions.py)
+
 # =============================================================================
 # NOT installable via this file (environment-specific):
 #   * manage_gpus  — IRCAM-internal GPU-lock package, used ONLY by

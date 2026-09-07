@@ -443,11 +443,11 @@ def main():
     # 'ema_ready' key -> assume ready (previous behaviour).
     if "ema_state_dict" in ckpt and ckpt.get("ema_ready", True):
         model.load_state_dict(ckpt["ema_state_dict"])
-        print("  → Usando EMA model")
+        print("  -> Usando EMA model")
     else:
         model.load_state_dict(ckpt["model_state_dict"])
         if "ema_state_dict" in ckpt:
-            print("  → EMA present but NOT trained yet (checkpoint predates "
+            print("  -> EMA present but NOT trained yet (checkpoint predates "
                   "training.ema_start): using the live model weights")
 
     # Normalizer (robust resolution: CLI > checkpoint config > standard paths)
@@ -507,6 +507,20 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
+    def _out_tag(fallback):
+        """What to call the output file. --label if given, else the --prompt it
+        was actually conditioned on, slugged. Without the prompt branch a
+        generation driven by "solo pipe organ" was written as gen_uncond_00.wav,
+        which names it after the one thing it is not."""
+        if args.label:
+            return args.label
+        if args.prompt:
+            slug = "".join(c if c.isalnum() else "_" for c in args.prompt)
+            slug = "_".join(p for p in slug.split("_") if p)[:48]
+            if slug:
+                return slug
+        return fallback
+
     # --- GENERATE ---
     if args.mode == "generate":
         # Generation length: default to the exact n_frames the model trained on
@@ -534,10 +548,19 @@ def main():
                 guidance=args.guidance, steps=args.steps,
                 frame_dims=frame_dims, global_configs=global_configs,
             )
-            z = normalizer.denormalize(gen.T)
-            z_q, _, _ = dac_m.quantizer.from_latents(z.unsqueeze(0).float())
-            wav = dac_m.decode(z_q).squeeze()
-            tag = args.label or "uncond"
+            # The DAC decode must run under no_grad. euler_sampling_cfg is
+            # decorated, so `gen` comes back detached, but the quantizer and the
+            # decoder below have parameters that require grad: outside this
+            # block they build a graph and the resulting waveform carries
+            # requires_grad=True, which makes the sf.write() call fail with
+            # "Can't call numpy() on Tensor that requires grad" -- i.e. generate
+            # mode never produced a file. edit_audio() decodes inside its own
+            # @torch.no_grad(), which is why that path was unaffected.
+            with torch.no_grad():
+                z = normalizer.denormalize(gen.T)
+                z_q, _, _ = dac_m.quantizer.from_latents(z.unsqueeze(0).float())
+                wav = dac_m.decode(z_q).squeeze()
+            tag = _out_tag("uncond")
             p = os.path.join(args.output, f"gen_{tag}_{i:02d}.wav")
             sf.write(p, wav.numpy(), DAC_SAMPLE_RATE)
             print(f"  {p}")
@@ -564,7 +587,7 @@ def main():
             steps=args.steps,
             frame_dims=frame_dims, global_configs=global_configs,
         )
-        tag = args.label or "edited"
+        tag = _out_tag("edited")
         p = os.path.join(args.output, f"edit_{tag}.wav")
         sf.write(p, wav.numpy(), DAC_SAMPLE_RATE)
         print(f"  {p}")

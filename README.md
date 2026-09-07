@@ -2,8 +2,8 @@
 
 Conditioned audio generation with **Rectified Flow** and a **Diffusion Transformer
 (DiT)** operating in **DAC (44.1 kHz) pre-quantizer latent space**, with
-classifier-free guidance. Frame-level conditions (f0, chroma, rhythm, energy,
-f0) are concatenated on the feature dimension (JASCO-style); global conditions
+classifier-free guidance. Frame-level conditions (f0, chroma, rhythm, energy)
+are concatenated on the feature dimension (JASCO-style); global conditions
 (CLAP-text, CLIP-image) are injected via AdaLN.
 
 The pipeline is: **stream-encode audio → latents (+ conditions) → train → sample/edit**.
@@ -29,9 +29,9 @@ it (there are still no split folders on disk).
 | `sampling_cond.py` | Generate / edit audio from a checkpoint with CFG. |
 | `extract_conditions.py` | Standalone tool to add a frame condition to an existing latents dataset. |
 | `metrics.py`, `condition_metrics.py` | FD-DAC/KL/FAD + per-condition fidelity (f0/energy correlation, chroma cosine, …). |
-| `probe_conditions.py` | Out-of-the-box probe sets for **every frame condition** (f0, energy, chroma, rhythm): elementary synthetic stimuli, targets extracted with the run's own extractor, cached behind a fingerprint, plus the comparison plots. One bank + one synthesizer per condition. |
+| `probe_conditions.py` | Out-of-the-box probe sets for **every condition** — frame (f0, energy, chroma, rhythm) *and* global (text, image): elementary synthetic stimuli, targets produced by the run's own extractor/encoder, cached behind a fingerprint, plus the comparison plots. One bank + one synthesizer per condition. |
 | `launch_training_cond.py` | IRCAM-only GPU-lock wrapper around `training_cond.py`. |
-| `cond_default.yaml` | Default configuration. |
+| `configs/cond_default.yaml` | Default training configuration. |
 
 ---
 
@@ -55,6 +55,17 @@ pip install -r requirements.txt
 
 ```bash
 pip install "beat_this @ git+https://github.com/CPJKU/beat_this.git"
+```
+
+`wav2clip` is what makes the **image** condition's influence row a number: CLIP
+embeds images, CLAP embeds audio, and the two spaces are unrelated, so an
+audio-vs-image cosine needs a model that puts audio *in CLIP's own space*.
+It is in `requirements.txt`; without it the run still trains on the image
+condition and the panel says `no audio->CLIP embedder` instead of inventing a
+zero.
+
+```bash
+pip install wav2clip
 ```
 
 ### 3. ffmpeg (only for `--acoustic_rules`)
@@ -101,9 +112,13 @@ Output (no split folders, mirrors the source class tree):
 ```
 OUT/
   latents/<class...>/*.npy            # (72, T) float32, pre-quant DAC
-  conditions/<class...>/*.npz         # only with --conditions
+  conditions/<class...>/*.npz         # per-CHUNK conditions: --conditions
+                                      #   and/or the per-chunk half of --global
   wav/<class...>/*.wav                # only with --save_wav (per split)
-  global_conditions/<text|image>/...  # only with --global
+  global_conditions/image/<class>.npy # per-CLASS conditions: --global image
+  global_conditions/image/<class>.json#   the image file names, in row order
+  global_conditions/text_vocab.npy    # --global text: the label vocabulary,
+  global_conditions/text_vocab.json   #   CLAP-encoded once (see §3, panels)
   dataset_meta.json                   # chunk + acoustic params (re-run safety)
   splits.json                         # source -> train/val/test, plus the
                                       #   per-split counts in BOTH units (see §2)
@@ -117,6 +132,51 @@ Useful flags: `--sr 44100` (required for the 44 kHz DAC), `--chunk_duration`,
 `--chunk_overlap`, `--global text,image` (+ `--image_root`), `--num_workers`
 (parallel CPU work; keep **0 on Windows**), `--batch_size` (DAC batch), `--force`,
 and `--config` to keep all of it in a YAML instead.
+
+**Conditions: `--conditions` and `--global` are independent and compose.** Either
+can be used alone, both together, and each takes any subset — `--conditions f0`,
+`--global text`, `--conditions f0,energy --global text,image`. Adding one later
+re-reads the audio but re-encodes no latent and drops no condition already on
+disk, so a dataset grows a condition at a time.
+
+What differs between the two is not how the model consumes them but **where the
+value comes from**, which is what decides where it is stored:
+
+| | computed from | written to | when |
+|---|---|---|---|
+| every `--conditions` name | that chunk's audio | the chunk's `.npz`, `(T, dim)` | in the stream |
+| `--global text` | that chunk's audio | the **same** `.npz`, `(dim,)` | in the stream |
+| `--global image` | `--image_root/<class>/*` | `global_conditions/image/<class>.npy` | after the stream |
+
+So `text` is extracted and resumed exactly like `f0`: it is the CLAP embedding
+of the chunk's own audio, which at inference is swapped for the CLAP embedding
+of a written prompt (the two towers share one space). It is *not* the embedding
+of the class name — that would make it carry the same single bit as `image`,
+and no ablation could then separate the two.
+
+`--global image` encodes **every** picture of a class, not a sample of them: the
+training draws one at random per epoch, so a cap here would silently cap that
+augmentation for every run that ever reads the dataset. The `.json` beside each
+bank lists the file names in row order, which is what lets a validation panel
+show the picture a generation was conditioned on.
+
+A bank is reused only while it still **describes its folder**: a re-run compares
+the recorded file list with what is on disk and re-encodes the classes whose
+pictures changed, saying which. So "drop ten new pictures into a class and
+re-run the preprocessing" works — you do not need `--force` (which would also
+recompute every chunk condition in the dataset). A class whose folder is
+unchanged is never re-encoded, and CLIP is not even loaded when none changed.
+Growing a bank changes the image condition of that class, so a checkpoint
+trained before the change was trained on a different bank.
+
+`--global text` also writes `global_conditions/text_vocab.{npy,json}`: the
+phrase list in `conditions.TEXT_LABEL_VOCAB`, CLAP-encoded once and stored WITH
+the dataset. The stored `text` condition is the embedding of a chunk's own
+audio, and CLAP has no decoder, so a panel has no sentence to show; the
+vocabulary lets it name the **nearest phrase** instead, always printed with its
+cosine because it is a retrieval, not a translation. Editing the list and
+re-running the preprocessing rewrites the labels without touching a single
+chunk of audio.
 
 `--save_wav` takes **which splits** to write: `none` (default), `all`, or a subset
 such as `val` / `val,test`. A bare `--save_wav` still means `all`. These WAVs are
@@ -266,6 +326,38 @@ Listing a metric is an explicit request: an unsupported name is a **hard error a
 startup**, not a silent skip. `fd_dac` and `kl_dac` share the generated
 mean/covariance, so asking for both costs essentially the same as asking for one.
 
+### Global-condition similarity (automatic, when a global is active)
+
+Two more scalar curves appear beside FD-DAC/KL/FAD whenever the run is
+conditioned on a global and that global can be scored — **how close the
+generation lands to the condition it was given**:
+
+| tag | space | how the generation gets there |
+|---|---|---|
+| `Validation/Metrics/Audio_text_similarity` | CLAP | CLAP's **audio** tower embeds the generation; the stored condition is already a CLAP vector |
+| `Validation/Metrics/Audio_image_similarity` | CLIP | **Wav2CLIP** embeds the generation into CLIP's space; the stored condition is the CLIP vector of the picture |
+
+They are cosines, and they are **scalars, not panel rows**, because they are
+what you watch across training the way you watch FD-DAC. Their sample count is
+its own knob:
+
+```yaml
+sampling:
+  n_similarity_samples: 128   # generations decoded + embedded for the two curves
+```
+
+It is deliberately larger than `n_influence_samples` (a mean of one scalar per
+sample converges fast, but each sample still costs a DAC decode plus an embedder
+forward) and smaller than `n_metrics_samples` (which estimates a covariance from
+latents alone and is far cheaper per sample). A global with no embedder installed
+logs **no curve at all**: an absent curve says "not measured", a curve pinned at
+zero would say "no similarity".
+
+The same two numbers also appear in the influence panel, but there as a **paired
+delta** against the null generation, on the influence set — which is the honest
+way to read them, since the absolute cosine of an audio-image pair is small even
+when the conditioning works (see the probes section).
+
 ### FAD-VGGish (optional, off by default)
 
 `fd_dac` and `kl_dac` score the **DAC latent space**. `fad_vggish` scores the
@@ -373,6 +465,16 @@ were extracted from. In a PURE-UNCONDITIONAL run nothing is dropped to obtain th
 generation, so it goes straight to `uncond generation/` and no per-sample block is
 created: the audio window is then exactly the two collected groups.
 
+The generation card is named after the frame condition that leads the block, so
+a run conditioned ONLY on globals — which has no frame condition to name it
+after, and no waveform to put beside it — names it plainly:
+`validation_XX/2_generation_validation_XX`. It is still a per-sample block with
+its own null twin in `uncond generation/`; only a run with **no** conditioning at
+all collapses the two into one card. When `text` is active, the block header
+carries the label of the sample (see the probe section), and every card of that
+sample — the conditions, the generation, the subset generations, the comparison
+images, the image card — sits under that one header.
+
 ### Condition subsets — the delta matrix
 
 `sampling.influence_subsets` turns the Condition_influence panel into a MATRIX:
@@ -395,6 +497,13 @@ row: the off-subset cells (marked `°`) are the side effects — give f0 alone a
 watch what happens to chroma. Each row other than `all` is a full extra
 generation pass, so **the metrics step grows linearly with the number of rows**.
 
+**The subsets vary the FRAME conditions only.** The globals are handed to the
+model in every row, so `text` and `image` appear as ordinary columns with a
+value per row — never marked `°` — and what they show is the *side effect*: what
+dropping chroma does to how well the generation still matches its prompt. A run
+with no frame condition therefore has no matrix (there is nothing to subset) and
+falls back to the single table.
+
 Each subset also gets its own audio card inside the sample's block
 (`validation_XX/2_gen_no_chroma_validation_XX`), so the whole combination
 ladder of one validation sample plays side by side.
@@ -408,12 +517,33 @@ real energy envelope jittery, a real beat grid may not exist on this material,
 so a middling score there does not separate a weak conditioning from an
 ambiguous target.
 
-| condition | stimuli |
-|---|---|
-| f0 | scale, arpeggio, octave leap, sustained note, rests |
-| energy | crescendo, diminuendo, four stabs, swell, plateau, staircases |
-| chroma | sustained triads, I-IV-V, single pitch class, clusters |
-| rhythm | click grids at fixed tempi, downbeat every N, accelerando |
+| condition | stimuli | the stimulus IS |
+|---|---|---|
+| f0 | scale, arpeggio, octave leap, sustained note, rests | a waveform |
+| energy | crescendo, diminuendo, four stabs, swell, plateau, staircases | a waveform |
+| chroma | sustained triads, I-IV-V, single pitch class, clusters | a waveform |
+| rhythm | click grids at fixed tempi, downbeat every N, accelerando | a waveform |
+| **text** | 16 instrument/style prompts ("solo pipe organ in a large reverberant church", "fast electronic dance beat…") | a **string**, CLAP-encoded |
+| **image** | 16 abstract figures — colour fields, stripes, checkerboard, rings, gradient, noise | a **.png**, CLIP-encoded |
+
+The two families differ only in medium. A frame target is a `(n_frames, dim)`
+curve **extracted** from a waveform; a global target is a `(dim,)` vector
+**encoded** from a string or a picture, by the run's own CLAP/CLIP — so the
+probe drives the model in exactly the space it was conditioned in. Nothing
+re-extracts a picture from audio, so a global probe has no "target vs
+re-extracted" plot: the image is shown as-is, the prompt names the panel, and
+the adherence is a cosine in the influence table.
+
+> **Read the abstract IMAGE bank knowing what it is.** What reaches the model is
+> not the picture but CLIP's *reading* of it, and a flat colour field has no
+> musical meaning for CLIP to read: its embedding lands far from the paintings
+> and album covers the training conditioned on. A weak image-probe row does
+> **not** by itself prove the image conditioning is broken — unlike the f0 bank,
+> where a rising scale is unambiguous and a failure is a failure. The validation
+> rows, on in-corpus images, carry that verdict. What the bank *does* establish
+> — and what the build prints as "bank spread" — is whether 16 distinct stimuli
+> produce 16 distinct embeddings, i.e. whether the slot can carry information at
+> all. The same report is printed for the text bank.
 
 A bank is built for **every condition active in the run** — there is nothing to
 turn on per condition. The single knob is **`sampling.n_influence_samples`**
@@ -431,19 +561,29 @@ read is about the curve you are looking at.
 > per-condition `n_f0_probe` / `n_energy_probe` / `n_chroma_probe` /
 > `n_rhythm_probe` (already inert before). A leftover in your config does nothing.
 
-All four banks live in ONE module, `probe_conditions.py`: one bank, one
+All six banks live in ONE module, `probe_conditions.py`: one bank, one
 synthesizer and one plot branch per condition, so every condition is set up,
-built, drawn and scored the same way. Adding a fifth means adding a bank and a
+built, drawn and scored the same way. Adding a seventh means adding a bank and a
 synthesizer, nothing else.
 
-Each condition gets the SAME two images, N of each, grouped **per sample** so the
-Images tab collapses into the same sections as the Audio tab instead of one flat
-wall:
+Each FRAME condition gets the SAME two images, N of each, grouped **per sample**
+so the Images tab collapses into the same sections as the Audio tab instead of
+one flat wall:
 
 ```
 validation_XX/<cond>_target_vs_gen   target vs generated, on a real val sample
 probe_XX/<cond>_target_vs_gen        the same, on the unambiguous probe stimulus
+validation_XX/image_condition        the picture that sample was conditioned on
+probe_XX/image_condition             the probe figure, in the same block
 ```
+
+The two global conditions occupy the same blocks by other means: the **image**
+is shown as a card (there is nothing to compare it against), and the **text**
+prompt names the block itself — `probe_03 [string quartet playing a slow
+sustained chord]`, and for a validation sample the category plus the nearest
+phrase to its stored CLAP vector, `validation_00 [Baroque sacred · "solo pipe
+organ" (+0.58)]`. That label is a retrieval over `text_vocab`, which is why the
+cosine is always beside it.
 
 drawn in the form that suits the shape — f0 on a log-Hz axis with a voicing
 ribbon, energy and rhythm as overlaid curves, chroma as paired heatmaps. Plus an
@@ -458,7 +598,15 @@ python probe_conditions.py f0     ./cache/f0_probe     --n_frames 431
 python probe_conditions.py energy ./cache/probe_energy --n_frames 431
 python probe_conditions.py chroma ./cache/probe_chroma --n_frames 431
 python probe_conditions.py rhythm ./cache/probe_rhythm --n_frames 431
+# the global banks: --n_frames does not apply (one embedding, no chunk geometry)
+python probe_conditions.py text   ./cache/probe_text
+python probe_conditions.py image  ./cache/probe_image
 ```
+
+Each prints its bank and, for the global ones, the **spread** — every stimulus's
+cosine to its nearest neighbour and the bank's mean pairwise cosine, with a
+warning on any pair above 0.95 ("these two stimuli drive the model with the same
+condition"). Read it before trusting a global probe row.
 
 > The rhythm bank is ordered by how reliably `beat_this` recovers the intended
 > tempo: 12 of the 16 grids come back at the right metrical level, the last four
@@ -483,6 +631,14 @@ conditioned from.
 > just its parameters, so adding sources to a dataset also invalidates it: the
 > normalizer is fitted on the train split. The cache guard stops the run until you
 > point to a clean cache directory.
+>
+> **Moving a dataset to another machine also invalidates its cache.** The
+> fingerprint hashes each latent's size *and mtime*, and a copy rewrites the
+> mtimes, so the guard fires with `[cache] STALE CACHE` even though the bytes are
+> identical. That is deliberate — mtime is what catches a source edited in place
+> — so on the destination machine point `paths.cache_dir` at a fresh directory
+> and let the normalizer refit (a few minutes; the FD-DAC reference rebuilds with
+> it). Copying the cache across is never worth it.
 
 Monitor: `tensorboard --logdir <runs_dir>`.
 
@@ -504,6 +660,13 @@ It maps directly onto the activation peak, so **if the metrics step OOMs, lower 
 (0 restores the reference sampler — same numbers, no code change); raise it only
 after checking `nvidia-smi` at a metrics step. Fusing needs a CFG to fuse, so the
 serial path runs anyway when guidance ≤ 1 or no condition is active.
+
+"Same numbers" includes the influence table: the fused sampler gets the null
+pass for free out of the CFG math, the serial one has to generate it, and it
+does so whenever anything can be scored against it — `metrics_uncond: false`
+switches off the uncond *distributional* metrics, never the Δ column. Setting
+`0` therefore costs one extra generation pass per metrics step (that is the
+price of not fusing), not a column of the panel.
 
 The value does **not** change which samples are generated (the noise is drawn per
 sample), so the metric values are the same for any setting. Batching does change
