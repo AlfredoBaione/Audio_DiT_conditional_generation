@@ -24,6 +24,31 @@
 #     output_proj). The concatenation widens input_proj from token_dim to
 #     token_dim + sum(out_dim); everything after input_proj is unchanged.
 #
+#     OPTIONAL PER-BLOCK RE-INJECTION (`frame_reinject_every`, default 0 = off,
+#     i.e. plain JASCO). With JASCO's input-only concatenation the frame
+#     conditions touch exactly ONE matrix -- input_proj -- and then have to
+#     survive the whole depth inside the residual stream, while a GLOBAL
+#     condition modulates every block through AdaLN. Music ControlNet (Wu et
+#     al., 2024) makes the opposite choice and keeps feeding the temporal
+#     control back into the trunk. This flag adds that path: the SAME
+#     `frame_proj` produced once by the encoder is re-added to the hidden state
+#     before selected blocks through a per-block, ZERO-INITIALISED projection
+#     (ControlNet's zero-conv / DiT's adaLN-Zero principle), so at init it
+#     contributes exactly 0: given the same shared weights the network computes
+#     the same function as the input-only one, and learns the extra path only if
+#     it pays. (The two are the same FUNCTION at init, not the same WEIGHTS: the
+#     extra modules also consume the RNG stream, so two separately seeded builds
+#     do not draw identical shared weights.)
+#
+#     The re-injected term is scaled by a PER-CONDITION GATE driven by the
+#     AdaLN vector c (identity-init). The projection alone is a function of the
+#     conditions only, so without the gate the term re-added at a given block
+#     is the same tensor at every denoising step, while every other path in the
+#     network -- the block's own shift/scale/gate, and the global conditions
+#     that ride inside c -- is free to weigh itself against t. The gate closes
+#     that gap, one scalar per frame condition, so f0 and chroma can follow
+#     different schedules in t instead of rising and falling together.
+#
 #   * GLOBAL conditions (text-CLAP, image-CLIP) are injected via AdaLN, exactly
 #     as the class label in the official DiT (c = t + y): encoded to
 #     hidden_size and ADDED to the timestep embedding to form the conditioning
@@ -282,9 +307,14 @@ class ConditionedAudioDiT(nn.Module):
     RoPE self-attention + SwiGLU FFN + AdaLN-Zero, no additive pos embedding.
     Conditioning added on top WITHOUT touching the block:
       - frame-level conditions -> concatenated on the feature dim at the input
-        (JASCO), then projected to hidden by a single input projection;
+        (JASCO), then projected to hidden by a single input projection, and
+        OPTIONALLY re-added before selected blocks (frame_reinject_every);
       - global conditions       -> added to the AdaLN conditioning vector c
         (official DiT class-label mechanism).
+
+    The DiTBlock itself is still untouched in both cases: the re-injection is a
+    residual add performed by this module BETWEEN blocks, so a block's forward
+    signature stays (x, c) exactly as in network.py.
 
     Configurations (same as AudioDiT):
         'S':  6 layers,  512 hidden,  8 heads   head_dim=64
@@ -306,8 +336,23 @@ class ConditionedAudioDiT(nn.Module):
         global_cond_configs: {name: {"dim": d}}, e.g.
                              {"text": {"dim": 512}, "image": {"dim": 512}}.
                              Empty/None -> timestep-only AdaLN (no global).
+        frame_reinject_every: stride of the per-block re-injection of the frame
+                             conditions. 0 (default) = OFF, plain JASCO
+                             input-only concatenation. 1 = re-inject before
+                             EVERY block, 2 = every other block, and so on.
+                             Block 0 is never re-injected: input_proj has just
+                             delivered the conditions to it, so an add there
+                             would be redundant. Ignored (with a printed note)
+                             when there are no frame conditions.
+                             The re-injected term is scaled per condition by a
+                             gate read off c (see frame_reinject_gate), so each
+                             condition can be weighted differently at different
+                             denoising steps.
 
-    CFG: passing null (zero) conditions yields the unconditional output.
+    CFG: passing null (zero) conditions yields the unconditional output. This
+    holds for the re-injection too -- it is a function of the same frame_proj,
+    so a null (zero) condition drives the re-injection path as well and the
+    unconditional branch stays a single, coherent input.
     """
 
     CONFIGS = {
@@ -328,6 +373,7 @@ class ConditionedAudioDiT(nn.Module):
         frame_cond_dims:     Optional[Dict[str, int]]  = None,
         frame_cond_out_dims: Optional[Dict[str, int]]  = None,
         global_cond_configs: Optional[Dict[str, dict]] = None,
+        frame_reinject_every: int = 0,
     ):
         super().__init__()
         cfg = self.CONFIGS[kind]
@@ -387,6 +433,95 @@ class ConditionedAudioDiT(nn.Module):
             for _ in range(n_layers)
         ])
 
+        # ----- Per-block re-injection of the frame conditions (optional) -----
+        # WHICH BLOCKS: strided over 1..n_layers-1. Index 0 is excluded on
+        # purpose -- input_proj feeds block 0 directly, so re-adding there would
+        # only duplicate what the concatenation already delivered.
+        #
+        # WHAT: one Linear(total_out_dim -> hidden) per selected block, applied
+        # to the SAME frame_proj the input concatenation uses (the encoder runs
+        # once per forward; only these projections are per-block). Each block
+        # therefore gets its own learned view of the conditions instead of
+        # sharing one.
+        #
+        # bias=False ON PURPOSE: a bias would add a constant vector to the
+        # residual stream at that depth REGARDLESS of the condition -- a plain
+        # learned offset that says nothing about f0/chroma/rhythm/energy, and
+        # that the block's own AdaLN shift already provides. Without it the
+        # re-injected term is strictly a function of the conditions.
+        #
+        # ZERO-INIT (see initialize_weights): at step 0 every re-injection
+        # contributes exactly 0, so a run with frame_reinject_every>0 starts
+        # from the same function as the input-only model and the extra path has
+        # to earn its weight. Same principle as adaLN-Zero and ControlNet's
+        # zero-convs; without it, N_layers random projections would inject noise
+        # into the trunk from the first step.
+        self.frame_reinject_every = int(frame_reinject_every or 0)
+        if self.frame_reinject_every < 0:
+            raise ValueError(
+                f"frame_reinject_every must be >= 0 (0 = off), got "
+                f"{frame_reinject_every}."
+            )
+        self.reinject_layers = []
+        if self.frame_reinject_every > 0 and self.has_frame:
+            self.reinject_layers = [
+                i for i in range(1, n_layers)
+                if i % self.frame_reinject_every == 0
+            ]
+        if self.reinject_layers:
+            self.frame_reinject = nn.ModuleDict({
+                str(i): nn.Linear(frame_extra, hidden_size, bias=False)
+                for i in self.reinject_layers
+            })
+
+            # PER-CONDITION GATE on the re-injected term, a function of c.
+            #
+            # WHY: frame_proj and the projection above are both functions of
+            # the CONDITIONS ALONE, so the term re-added at block i would be
+            # the same tensor at every denoising step -- identical where x is
+            # still almost pure noise and where it is almost data. Everything
+            # else in this network is free to weigh itself against t: each
+            # block's shift/scale/gate come out of adaLN_modulation(c), and the
+            # global conditions ride inside that same c. The re-injection was
+            # the only contribution in the model without that freedom.
+            #
+            # PER CONDITION, not one gate for the whole term: it emits one
+            # scalar per frame condition, and each scales its OWN slice of
+            # frame_proj -- the positional slots FrameConditionEncoder
+            # concatenated, in the same canonical order -- so f0 and chroma can
+            # follow different schedules in t instead of rising and falling
+            # together. With a single frame condition the two are identical.
+            #
+            # It reads c, NOT t alone: with global conditions active
+            # c = t_emb + g, so how much frame condition is injected also
+            # depends on text/image. That is deliberate (it is the DiT's own
+            # single-conditioning-vector design) and it is inert on a model
+            # with no global conditions, where c IS the timestep embedding.
+            #
+            # SiLU + Linear is the same shape as adaLN_modulation, so the gate
+            # is the block's own idiom applied to the one path that lacked it.
+            self.frame_reinject_gate = nn.ModuleDict({
+                str(i): nn.Sequential(
+                    nn.SiLU(),
+                    nn.Linear(hidden_size, len(self.frame_encoder.names)),
+                )
+                for i in self.reinject_layers
+            })
+
+            # Slot widths in canonical order, used to expand the per-condition
+            # scalars back to the frame_proj width. persistent=False: it is
+            # derived from frame_cond_out_dims, which the checkpoint already
+            # carries, so it must not become a state_dict entry of its own.
+            self.register_buffer(
+                "frame_slot_repeats",
+                torch.tensor(
+                    [self.frame_cond_out_dims[n]
+                     for n in self.frame_encoder.names],
+                    dtype=torch.long,
+                ),
+                persistent=False,
+            )
+
         # Final layer (AdaLN-Zero modulated by c)
         self.final_layer = FinalLayer(hidden_size, token_dim)
 
@@ -402,6 +537,31 @@ class ConditionedAudioDiT(nn.Module):
                  f"(+{frame_extra} input channels)" if self.has_frame else ""))
         print(f"  Global conditions (AdaLN): "
               f"{list(self.global_cond_configs.keys()) if self.has_global else 'NONE'}")
+
+        # Re-injection report. A setting that ends up doing NOTHING is printed
+        # as such rather than passing silently: asking for it and getting plain
+        # JASCO without being told is exactly the kind of run that gets
+        # misattributed later.
+        if self.reinject_layers:
+            n_re = len(self.reinject_layers)
+            n_fc = len(self.frame_encoder.names)
+            re_params = n_re * frame_extra * hidden_size
+            gate_params = n_re * (hidden_size + 1) * n_fc
+            print(f"  Frame re-injection: every {self.frame_reinject_every} "
+                  f"block(s) -> {n_re} of {n_layers} blocks "
+                  f"{self.reinject_layers} | zero-init, bias-free | "
+                  f"gate on c, {n_fc} per block, identity-init | "
+                  f"+{(re_params + gate_params)/1e6:.2f}M params")
+        elif self.frame_reinject_every > 0 and not self.has_frame:
+            print(f"  Frame re-injection: REQUESTED (every "
+                  f"{self.frame_reinject_every}) but INACTIVE -- this model has "
+                  f"no frame conditions to re-inject.")
+        elif self.frame_reinject_every > n_layers - 1 and self.has_frame:
+            print(f"  Frame re-injection: REQUESTED (every "
+                  f"{self.frame_reinject_every}) but INACTIVE -- the stride "
+                  f"exceeds the {n_layers - 1} eligible blocks (1..{n_layers-1}).")
+        else:
+            print(f"  Frame re-injection: OFF (input concat only, plain JASCO)")
 
     def initialize_weights(self):
         """
@@ -438,6 +598,32 @@ class ConditionedAudioDiT(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+
+        # Zero-out every per-block frame re-injection. MUST come after
+        # self.apply(_basic_init) above, which has just given these Linears a
+        # xavier_uniform_ init like every other one; this overrides it. The
+        # effect is the adaLN-Zero / ControlNet zero-conv one: at step 0 the
+        # re-injection adds exactly 0 to the residual stream, so the model is
+        # the input-only (JASCO) model, and training turns the extra path on
+        # gradually instead of starting from N random projections shouting into
+        # the trunk.
+        if self.reinject_layers:
+            for lin in self.frame_reinject.values():
+                nn.init.constant_(lin.weight, 0)
+
+            # The gate starts at the IDENTITY (weight 0, bias 1), NOT at zero.
+            # Zeroing it as well would leave the whole path dead on arrival:
+            # with the gate at 0 the projection above receives no gradient, and
+            # with the projection at 0 the gate receives none either, so
+            # neither could ever leave the origin. A gate of exactly 1 keeps
+            # the step-0 guarantee intact -- the zero-init projection still
+            # contributes exactly 0, so the model is still the input-only
+            # (JASCO) one -- while keeping the projection's gradient alive. The
+            # gate itself starts moving from step 1, once the projection is no
+            # longer zero.
+            for gate in self.frame_reinject_gate.values():
+                nn.init.constant_(gate[-1].weight, 0)
+                nn.init.constant_(gate[-1].bias, 1.0)
 
     def _gather_frame_conditions(
         self,
@@ -512,6 +698,7 @@ class ConditionedAudioDiT(nn.Module):
         B, T, _ = x.shape
 
         # ----- FRAME conditions: concat on the feature dim (JASCO) -----
+        frame_proj = None
         if self.has_frame:
             fc = self._gather_frame_conditions(frame_conditions, B, T, x.device, x.dtype)
             frame_proj = self.frame_encoder(fc)        # (B, T, sum(out_dim))
@@ -540,12 +727,104 @@ class ConditionedAudioDiT(nn.Module):
             if g is not None:
                 c = c + g
 
-        # DiT blocks (block is identical to the unconditional network.py)
-        for block in self.blocks:
+        # DiT blocks (block is identical to the unconditional network.py).
+        # When enabled, the frame conditions are re-added to the residual stream
+        # BEFORE the selected blocks, so that block reads them from its own
+        # input instead of relying on what survived from input_proj. The add is
+        # done here, outside the block: DiTBlock.forward is still (x, c).
+        #
+        # frame_proj is the tensor computed once above -- the same one the input
+        # concatenation used, nulls included -- so the conditioned and
+        # unconditional CFG branches stay exactly the two inputs the training
+        # saw. dtype: under autocast frame_proj is fp32 and x is fp16; the
+        # Linear returns fp16 and the add matches x. Outside autocast both are
+        # fp32.
+        reinject = self.frame_reinject if (self.reinject_layers and
+                                           frame_proj is not None) else None
+        for i, block in enumerate(self.blocks):
+            if reinject is not None and str(i) in reinject:
+                # One scalar per frame condition, expanded to the width of its
+                # own slice of frame_proj and broadcast over time: the gate
+                # schedules each condition along t, it does not weigh one frame
+                # against another. Under autocast the gate returns fp16 and
+                # frame_proj is fp32; the product promotes to fp32 and the
+                # re-injection Linear casts it back, exactly as before.
+                gate = self.frame_reinject_gate[str(i)](c)
+                gate = torch.repeat_interleave(
+                    gate, self.frame_slot_repeats, dim=-1).unsqueeze(1)
+                x = x + reinject[str(i)](frame_proj * gate)
             x = block(x, c)
 
         x = self.final_layer(x, c)
         return x
+
+
+# ============================================================
+# CHECKPOINT HELPERS
+# ============================================================
+def ckpt_frame_reinject_every(ckpt: dict) -> int:
+    """
+    Recover `frame_reinject_every` from a checkpoint, for the scripts that
+    rebuild the model from the checkpoint's own fields (sampling_cond.py,
+    test_cond.py). It is an ARCHITECTURE parameter -- it adds one tensor per
+    selected block to the state_dict -- so getting it wrong is a load failure,
+    not a subtly different sample.
+
+    Three sources, in order:
+      1. the top-level "frame_reinject_every" field written by
+         training_cond.build_ckpt_data;
+      2. the stored full config, config["model"]["frame_reinject_every"], as a
+         safety net for a checkpoint whose top-level field is missing;
+      3. 0 -- the correct answer for every checkpoint written before this
+         option existed, which is exactly what those runs were trained as.
+    """
+    v = ckpt.get("frame_reinject_every", None)
+    if v is None:
+        cfg = ckpt.get("config", None)
+        if isinstance(cfg, dict):
+            v = (cfg.get("model", None) or {}).get("frame_reinject_every", None)
+    return int(v or 0)
+
+
+def check_ckpt_reinject_gate(ckpt: dict, where: str = "this checkpoint") -> None:
+    """
+    Refuse, with an explanation, a checkpoint whose re-injection PREDATES the
+    per-condition gate.
+
+    `frame_reinject_every` alone no longer pins the state_dict down. A run
+    trained with re-injection before the gate existed has the per-block
+    projections and none of the `frame_reinject_gate.*` tensors, so every
+    architecture check passes -- same kind, same conditions, same stride -- and
+    the failure only surfaces two frames deeper, as a raw wall of
+    "Missing key(s) in state_dict: frame_reinject_gate.1.1.weight, ...", which
+    says nothing about what to do.
+
+    Called by every script that rebuilds a model from a checkpoint. Silent (the
+    normal case) for `frame_reinject_every == 0`, where neither the projections
+    nor the gates exist, and for any checkpoint written since the gate.
+    """
+    if ckpt_frame_reinject_every(ckpt) <= 0:
+        return
+    sd = ckpt.get("model_state_dict", None)
+    if not isinstance(sd, dict):
+        sd = ckpt.get("ema_state_dict", None)
+    if not isinstance(sd, dict) or not sd:
+        return                      # nothing to inspect; let the load speak
+    if any(k.startswith("frame_reinject_gate.") for k in sd):
+        return                      # written after the gate: nothing to say
+    raise RuntimeError(
+        f"{where} was trained with model.frame_reinject_every="
+        f"{ckpt_frame_reinject_every(ckpt)} BEFORE the per-condition gate on "
+        f"the re-injection existed, so it has the per-block projections but "
+        f"none of the `frame_reinject_gate.*` weights this code builds. It "
+        f"cannot be loaded or resumed as-is: the two are different "
+        f"architectures that happen to agree on every other field.\n"
+        f"  - to keep using that checkpoint, check out the code from before "
+        f"the gate (network_cond.py.pre-reinject-gate.bak);\n"
+        f"  - to use this code, start a NEW run -- a gate initialised to 1 "
+        f"makes step 0 identical to the ungated model, so nothing is lost "
+        f"except the steps already spent."
+    )
 
 
 # ============================================================
@@ -601,5 +880,111 @@ if __name__ == "__main__":
     out3 = model3(x, t, global_conditions={"text": torch.randn(B, 512)})
     print(f"  text only -> {out3.shape}")
     assert out3.shape == x.shape
+
+    # --- Per-block frame re-injection ---
+    print("\n=== Frame re-injection (every block) ===")
+    cond_kw = dict(kind='S',
+                   frame_cond_dims={"f0": 2, "chroma": 12},
+                   frame_cond_out_dims={"f0": 16, "chroma": 64},
+                   global_cond_configs={})
+    model4_off = ConditionedAudioDiT(**cond_kw, frame_reinject_every=0)
+    model4     = ConditionedAudioDiT(**cond_kw, frame_reinject_every=1)
+
+    # 6 blocks -> blocks 1..5 are re-injected, block 0 is not (input_proj).
+    assert model4_off.reinject_layers == []
+    assert model4.reinject_layers == [1, 2, 3, 4, 5], model4.reinject_layers
+
+    f0c = {"f0": torch.randn(B, N, 2), "chroma": torch.randn(B, N, 12)}
+    out4 = model4(x, t, frame_conditions=f0c)
+    print(f"  re-injected -> {out4.shape}")
+    assert out4.shape == x.shape
+
+    # A FRESHLY INITIALISED DiT IS THE CONSTANT-ZERO FUNCTION: adaLN-Zero makes
+    # every block the identity (gate=0) and the final layer is zeroed, so
+    # comparing two models at init compares 0 with 0 and would pass whatever the
+    # re-injection did. So first make the baseline a non-degenerate network
+    # (small random gates + a real final projection), THEN copy its weights into
+    # the re-injecting model so the two differ ONLY by the extra path.
+    with torch.no_grad():
+        for blk in model4_off.blocks:
+            nn.init.normal_(blk.adaLN_modulation[-1].weight, std=0.02)
+            nn.init.normal_(blk.adaLN_modulation[-1].bias,   std=0.02)
+        nn.init.normal_(model4_off.final_layer.linear.weight, std=0.02)
+        nn.init.normal_(model4_off.final_layer.adaLN_modulation[-1].weight, std=0.02)
+
+    missing, unexpected = model4.load_state_dict(model4_off.state_dict(),
+                                                 strict=False)
+    assert unexpected == [], unexpected
+    assert missing and all(k.startswith("frame_reinject.") or
+                           k.startswith("frame_reinject_gate.")
+                           for k in missing), missing
+    print(f"  shared weights copied; only {len(missing)} re-injection tensors "
+          f"are new (projections + per-condition gates)")
+
+    with torch.no_grad():
+        base = model4_off(x, t, frame_conditions=f0c)
+        assert base.abs().max().item() > 0, "baseline is still degenerate"
+        d = (model4(x, t, frame_conditions=f0c) - base).abs().max().item()
+    print(f"  zero-init check: max |reinject - baseline| = {d:.3e}")
+    assert d == 0.0, "re-injection is not zero at init"
+
+    # ...and once the projections are non-zero, it must actually change the
+    # output (i.e. the path is really wired into the trunk).
+    with torch.no_grad():
+        for lin in model4.frame_reinject.values():
+            nn.init.normal_(lin.weight, std=0.02)
+        d2 = (model4(x, t, frame_conditions=f0c) - base).abs().max().item()
+    print(f"  wired check:     max |reinject - baseline| = {d2:.3e}")
+    assert d2 > 0.0, "re-injection has no effect on the output"
+
+    # The re-injected term must depend on the CONDITIONS, not just on depth:
+    # two different f0 curves must give two different outputs through that path.
+    with torch.no_grad():
+        f0c_b = {"f0": torch.randn(B, N, 2), "chroma": torch.randn(B, N, 12)}
+        d3 = (model4(x, t, frame_conditions=f0c)
+              - model4(x, t, frame_conditions=f0c_b)).abs().max().item()
+    print(f"  sensitivity:     max |cond_A - cond_B| = {d3:.3e}")
+    assert d3 > 0.0
+
+    # Every re-injection projection must receive gradient from the loss.
+    model4.zero_grad(set_to_none=True)
+    model4(x, t, frame_conditions=f0c).pow(2).mean().backward()
+    for k, lin in model4.frame_reinject.items():
+        g = lin.weight.grad
+        assert g is not None and g.abs().sum().item() > 0, f"no grad on block {k}"
+    print(f"  grad check:      all {len(model4.frame_reinject)} projections "
+          f"receive gradient")
+
+    # --- Stride > 1, and the two inert configurations ---
+    print("\n=== Re-injection: stride 2 / inert cases ===")
+    model6 = ConditionedAudioDiT(
+        kind='S', frame_cond_dims={"f0": 2}, frame_cond_out_dims={"f0": 16},
+        global_cond_configs={}, frame_reinject_every=2,
+    )
+    assert model6.reinject_layers == [2, 4], model6.reinject_layers
+    assert model6(x, t, frame_conditions={"f0": torch.randn(B, N, 2)}).shape == x.shape
+
+    # Requested but no frame conditions -> inert, and says so.
+    model7 = ConditionedAudioDiT(
+        kind='S', frame_cond_dims={}, frame_cond_out_dims={},
+        global_cond_configs={"text": {"dim": 512}}, frame_reinject_every=1,
+    )
+    assert model7.reinject_layers == []
+    assert not hasattr(model7, "frame_reinject")
+
+    # Stride larger than the depth -> inert, and says so.
+    model8 = ConditionedAudioDiT(
+        kind='S', frame_cond_dims={"f0": 2}, frame_cond_out_dims={"f0": 16},
+        global_cond_configs={}, frame_reinject_every=99,
+    )
+    assert model8.reinject_layers == []
+
+    try:
+        ConditionedAudioDiT(kind='S', frame_cond_dims={"f0": 2},
+                            frame_cond_out_dims={"f0": 16},
+                            global_cond_configs={}, frame_reinject_every=-1)
+        raise AssertionError("negative stride should have raised")
+    except ValueError as e:
+        print(f"  negative stride rejected: {e}")
 
     print("\nTest passed!")

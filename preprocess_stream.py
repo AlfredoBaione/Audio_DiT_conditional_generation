@@ -178,6 +178,13 @@ if os.path.isdir(_IRCAM_LOCAL):
     os.environ["HOME"] = _IRCAM_LOCAL
     os.environ.setdefault("XDG_CACHE_HOME", _cache)
     os.environ.setdefault("HF_HOME", os.path.join(_cache, "huggingface"))
+    # TORCH_HOME is an ASSIGNMENT, not a setdefault: the IRCAM nodes already
+    # export it, pointing inside the SHARED conda env
+    # (.../envs/tf2.18/share/TORCH), which is read-only for us. torch.hub
+    # prefers TORCH_HOME over XDG_CACHE_HOME, so the first download on a
+    # machine with a cold cache (beat_this fetching its checkpoint) dies with
+    # PermissionError. Only overwriting the variable fixes it.
+    os.environ["TORCH_HOME"] = os.path.join(_cache, "torch")
 
 import re
 import json
@@ -190,7 +197,7 @@ import subprocess
 import tempfile
 import faulthandler
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -357,25 +364,384 @@ def sanitize_filename(name: str) -> str:
 
 
 # ============================================================
+# CLASS LABELS -- read from the directory tree, or from a CSV
+# ============================================================
+#
+# In this pipeline the class of a source is ONE thing: the leaf of the output
+# directory it is written into. The stratified split, `_class_of_file` in
+# audio_dataset_cond.py, the per-class image bank and the panel captions all
+# read it back off that folder name, and none of them knows how it was decided.
+#
+# So a CSV-labelled corpus needs no second mechanism: the CSV only has to DECIDE
+# THE OUTPUT FOLDER. With `label_source: csv` the label looked up for a file
+# becomes its `rel_parent`, and everything downstream keeps working untouched --
+# including corpora whose audio sits in ONE FLAT DIRECTORY, which is precisely
+# the layout that has no folder to read a class from. The raw audio is never
+# moved or copied: only the encoded output is grouped by class.
+#
+# WHAT DELIBERATELY DOES NOT CHANGE: `rel_posix`, and therefore `src_hash` and
+# every chunk file name, are still computed from the SOURCE path. Turning CSV
+# labelling on does not rename a single chunk, so the manifest, an interrupted
+# run's resume and the split's source groups are all unaffected by it.
+#
+# THE CSV CONTRACT IS FIXED, AND THERE ARE NO OPTIONS AROUND IT:
+#
+#     file,label
+#     violin_01.wav,violin
+#     ...
+#
+#   * a file column, named `file` or `filename` (case does not matter);
+#   * a label column, named `label` or `class`;
+#   * the file column holds the name, or the path relative to source_dir;
+#   * the label is the class, used VERBATIM as the output folder name;
+#   * every source file must have a row.
+#
+# Anything else is fixed IN THE CSV, not by a flag: a different column name, a
+# typo in a label, a file with no row. A CSV is a text file under your control,
+# and every option that "handles" one of those cases is a rule that will be
+# wrong on some other corpus, silently. The whole surface is therefore two
+# flags -- --label_source and --label_csv -- and a contract.
+
+LABEL_SOURCES = ("dir", "csv")
+
+# The column names this tool accepts, matched IGNORING CASE. Two spellings each,
+# because these are the two the world actually uses and they are mutually
+# exclusive in practice -- a CSV that carries both `label` and `class` is a CSV
+# whose author meant two different things, and guessing which is the class would
+# be exactly the kind of silent choice this file refuses to make. Finding both
+# is therefore an error, resolved by renaming or removing one column in the CSV.
+# This is a short CLOSED list, not an option: no flag chooses between them.
+CSV_FILE_COLS = ("file", "filename")
+CSV_LABEL_COLS = ("label", "class")
+
+# Characters that cannot appear in a directory name on Windows, plus the path
+# separators. A class label becomes a real folder VERBATIM (dir-mode labels are
+# folders already, so they are legal by construction); a CSV cell is arbitrary
+# text and has to be checked, because silently sanitizing it would break the
+# one invariant everything downstream relies on -- class name == folder name --
+# and would make `image_root/<class>` stop matching for exactly those classes.
+_LABEL_FORBIDDEN = set('/\\:*?"<>|') | {chr(c) for c in range(32)}
+
+_AMBIGUOUS = object()      # a lookup key that two rows claim with DIFFERENT labels
+
+
+def _validate_class_label(label: str, where: str) -> str:
+    """A CSV cell -> a label usable as a directory name, or a hard stop.
+
+    Not sanitized, CHECKED: see _LABEL_FORBIDDEN for why.
+
+    A label is also handed to a text encoder when the `text` condition is
+    active, so it is worth naming classes as plain words -- `violin`, not
+    `Sound_Violin`. Measured 9 Sept 2026 with laion/clap-htsat-unfused over four
+    instrument classes: mean cosine between DIFFERENT classes 0.883 when the
+    labels shared a `Sound_` prefix, 0.103 with bare nouns. That is the
+    difference between four conditioning vectors on top of each other and four
+    that can be told apart. Nothing here rewrites a name to fix that -- a name
+    rewritten at encode time would stop being the name the folder, the split and
+    the panels talk about, and any rule clever enough to do it is clever enough
+    to be wrong in silence.
+    """
+    s = str(label).strip()
+    if not s:
+        raise SystemExit(f"[labels] {where}: empty class label.")
+    bad = sorted(set(s) & _LABEL_FORBIDDEN)
+    if bad or s in (".", ".."):
+        raise SystemExit(
+            f"[labels] {where}: the label {s!r} cannot be a directory name "
+            f"(offending character(s): {bad or [s]}). The class name IS the "
+            f"output folder name here, so it is refused rather than silently "
+            f"rewritten -- a rewritten name would no longer match "
+            f"image_root/<class>. Fix it in the CSV.")
+    return s
+
+
+def _norm_rel_key(s) -> str:
+    """A CSV path cell -> the same shape as a scanned file's rel_posix."""
+    s = str(s).strip().strip('"').replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s.lstrip("/")
+
+
+def _index_put(d: dict, key: str, row: int, label_of) -> None:
+    """Insert key -> row, marking the key AMBIGUOUS if a previous row claimed it
+    with a DIFFERENT label. Two rows agreeing on the label are a duplicate, not
+    a conflict, and the first one is kept."""
+    if not key:
+        return
+    prev = d.get(key)
+    if prev is None:
+        d[key] = row
+    elif prev is _AMBIGUOUS:
+        return
+    elif label_of(prev) != label_of(row):
+        d[key] = _AMBIGUOUS
+
+
+class CsvLabelResolver:
+    """Answers "which class is this source file?" from a metadata CSV.
+
+    MATCHING, strongest first: the file's path relative to source_dir, then its
+    bare name, then those two again case-insensitively (a CSV and a filesystem
+    routinely disagree on case, and on Windows the disagreement is invisible).
+    The first index that HAS the key decides -- including deciding that it is
+    ambiguous: a weaker index must never rescue a key a stronger one has already
+    found to be claimed twice.
+
+    Ambiguity is a hard stop: two rows naming the same file with different
+    labels mean the CSV cannot answer the question, and picking one would put a
+    random half of those sources in the wrong class.
+
+    `used` records which ROWS actually matched something, so the caller can
+    report the rows that matched no file -- the usual sign that the CSV and the
+    audio folder are not of the same vintage.
+    """
+
+    def __init__(self, csv_path: Path, rows: List[Tuple[str, str]]):
+        self.csv_path = Path(csv_path)
+        self.rows = list(rows)              # [(rel_key, label), ...] in file order
+        self.used = set()
+
+        def label_of(i):
+            return self.rows[i][1]
+
+        self._by_rel = {}
+        self._by_name = {}
+        self._by_rel_lc = {}
+        self._by_name_lc = {}
+        for i, (rel, _lab) in enumerate(self.rows):
+            name = rel.rsplit("/", 1)[-1]
+            _index_put(self._by_rel, rel, i, label_of)
+            _index_put(self._by_name, name, i, label_of)
+            _index_put(self._by_rel_lc, rel.lower(), i, label_of)
+            _index_put(self._by_name_lc, name.lower(), i, label_of)
+
+    @property
+    def n_rows(self) -> int:
+        return len(self.rows)
+
+    @property
+    def labels(self) -> List[str]:
+        return sorted({lab for _, lab in self.rows})
+
+    def unmatched_rows(self) -> List[str]:
+        """The rel keys of the rows that never matched a file, in file order."""
+        return [rel for i, (rel, _) in enumerate(self.rows) if i not in self.used]
+
+    def lookup(self, rel_posix: str) -> Tuple[Optional[str], str]:
+        """-> (label, status), status in {"ok", "missing", "ambiguous"}."""
+        name = rel_posix.rsplit("/", 1)[-1]
+        for d, key in ((self._by_rel, rel_posix),
+                       (self._by_name, name),
+                       (self._by_rel_lc, rel_posix.lower()),
+                       (self._by_name_lc, name.lower())):
+            hit = d.get(key)
+            if hit is None:
+                continue
+            if hit is _AMBIGUOUS:
+                return None, "ambiguous"
+            self.used.add(hit)
+            return self.rows[hit][1], "ok"
+        return None, "missing"
+
+
+def _pick_csv_column(path, fields, accepted, what: str) -> str:
+    """The one column of `fields` whose name is in `accepted`, or a hard stop.
+
+    Case-insensitive, because a header is written by a human. Zero matches and
+    two matches are both errors, and both messages say what to change in the
+    CSV -- there is no flag to answer them with, on purpose.
+    """
+    hits = [f for f in fields if f.lower() in accepted]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise SystemExit(
+            f"[labels] {Path(path).name} has no {what} column. Accepted names "
+            f"(any case): {list(accepted)}. The file has "
+            f"{fields or 'no header'}. Rename the column in the CSV -- there is "
+            f"deliberately no flag for this.")
+    raise SystemExit(
+        f"[labels] {Path(path).name} has {len(hits)} columns that could be the "
+        f"{what} column: {hits}. Which one is the {what} cannot be guessed, and "
+        f"guessing would put a whole corpus in the wrong folders. Rename or "
+        f"remove one of them in the CSV.")
+
+
+def load_label_csv(csv_path: str) -> "CsvLabelResolver":
+    """Read the metadata CSV into a resolver, or stop with a message that says
+    what is wrong with the file. Columns: see CSV_FILE_COLS / CSV_LABEL_COLS."""
+    import csv as _csv
+    p = Path(csv_path)
+    if not p.exists():
+        raise SystemExit(f"[labels] --label_csv {p} does not exist.")
+
+    # utf-8-sig: a CSV exported from Excel starts with a BOM, which would
+    # otherwise become part of the FIRST column's name and make it unfindable.
+    with p.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = _csv.DictReader(fh)
+        fields = [(f or "").strip() for f in (reader.fieldnames or [])]
+        fcol = _pick_csv_column(p, fields, CSV_FILE_COLS, "file")
+        lcol = _pick_csv_column(p, fields, CSV_LABEL_COLS, "label")
+        rows, n_blank, n_seen = [], 0, 0
+        for raw in reader:
+            n_seen += 1
+            rel = _norm_rel_key(raw.get(fcol) or "")
+            lab = str(raw.get(lcol) or "").strip()
+            if not rel or not lab:
+                n_blank += 1
+                continue
+            rows.append((rel, _validate_class_label(lab, f"{p.name} row {n_seen}")))
+
+    if not rows:
+        raise SystemExit(
+            f"[labels] {p}: no usable row ({n_seen} read, {n_blank} with an "
+            f"empty cell).")
+    res = CsvLabelResolver(p, rows)
+    print(f"[labels] {p.name}: {len(rows)} row(s), {len(res.labels)} label(s)"
+          + (f", {n_blank} row(s) skipped for an empty cell" if n_blank else ""))
+    return res
+
+
+def build_label_resolver(args):
+    """The resolver this run labels with, or None for plain directory labelling.
+
+    Also the place where the mutually exclusive options are refused, BEFORE any
+    audio is touched: --single_class flattens every source into one class and a
+    CSV assigns one per file, so asking for both is not a preference to settle
+    silently.
+    """
+    src = str(getattr(args, "label_source", "dir") or "dir").strip().lower()
+    if src not in LABEL_SOURCES:
+        raise SystemExit(f"[labels] label_source must be one of "
+                         f"{list(LABEL_SOURCES)}, got {src!r}.")
+    if src == "dir":
+        if getattr(args, "label_csv", None):
+            print("[labels] label_csv is set but label_source is 'dir': the CSV "
+                  "is NOT read, classes come from the directory tree.")
+        return None
+    if not getattr(args, "label_csv", None):
+        raise SystemExit("[labels] --label_source csv needs --label_csv "
+                         "<metadata.csv>.")
+    if getattr(args, "single_class", False):
+        raise SystemExit(
+            "[labels] --single_class and --label_source csv contradict each "
+            "other: the first puts every source in ONE class, the second gives "
+            "each file the class its CSV row names. Choose one.")
+    return load_label_csv(args.label_csv)
+
+
+def print_class_histogram(files, max_shown: int = 24) -> None:
+    """How many SOURCE FILES each class holds, in one capped block.
+
+    Printed for both labelling modes because it is the cheapest possible check
+    that the labels are the ones expected -- a class that should not exist, or
+    one holding two files, shows up here and nowhere else until training starts.
+    """
+    if not files:
+        return
+    counts = {}
+    for _p, _rel_parent, leaf, _h, _rel in files:
+        counts[leaf] = counts.get(leaf, 0) + 1
+    order = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    body = ", ".join(f"{c} {n}" for c, n in order[:max_shown])
+    tail = ""
+    if len(order) > max_shown:
+        rest = sum(n for _c, n in order[max_shown:])
+        tail = (f", ... {len(order) - max_shown} more class(es), "
+                f"{rest} file(s)")
+    print(f"  classes: {body}{tail}")
+
+
+# ============================================================
+# LABEL PROVENANCE -- recorded next to the sources it labelled
+# ============================================================
+#
+# WHY IT IS RECORDED. The labelling mode decides which FOLDER every latent is
+# written into. Re-running the same output dir with the other mode does not
+# overwrite anything: it writes a second complete copy of the dataset under
+# different class folders, and the split, the manifest and the image banks then
+# describe a mixture of the two. Nothing downstream can detect that afterwards,
+# because by then a folder name is all there is. So the mode is stored WITH the
+# dataset and a change of it is refused, exactly as dataset_meta.json refuses a
+# change of chunk geometry.
+#
+# The CSV's own fields (path, columns, aliases) are reported as a WARNING and
+# not refused: adding rows to a CSV as a corpus grows is normal, and only the
+# mode change is guaranteed to relocate what already exists.
+
+def labels_provenance(args, resolver) -> dict:
+    prov = {"source": "csv" if resolver is not None else "dir"}
+    if resolver is not None:
+        prov.update({"csv": str(args.label_csv),
+                     "csv_name": resolver.csv_path.name})
+    elif getattr(args, "single_class", False):
+        prov["single_class"] = str(getattr(args, "class_name", None) or "")
+    return prov
+
+
+def load_labels_provenance(out_root: Path) -> dict:
+    p = out_root / MANIFEST_NAME
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8")).get("labels", {}) or {}
+    except Exception:
+        return {}
+
+
+def check_labels_provenance(out_root: Path, prov: dict) -> None:
+    old = load_labels_provenance(out_root)
+    if not old:
+        # Nothing recorded. A manifest that HAS sources but no labels block was
+        # written before this option existed, and back then the directory tree
+        # was the only way a class could be decided -- so "dir" here is a fact
+        # about the code's history, not a guess, and it lets an existing dataset
+        # be protected from a CSV re-run just like a new one. No manifest at all
+        # means nothing has been encoded yet: nothing to protect.
+        if not load_source_manifest(out_root):
+            return
+        old = {"source": "dir"}
+    if old.get("source") != prov.get("source"):
+        raise SystemExit(
+            f"[labels] {out_root} was built with label_source="
+            f"{old.get('source')!r} and this run uses {prov.get('source')!r}.\n"
+            f"The labelling mode decides the output FOLDER of every latent, so "
+            f"re-running with the other one does not overwrite the dataset -- "
+            f"it writes a SECOND copy under different class folders, and the "
+            f"split and the manifest then describe both at once. Use a FRESH "
+            f"output dir.")
+    differing = {k: (old.get(k), prov.get(k)) for k in ("csv_name",)
+                 if k in old and old.get(k) != prov.get(k)}
+    if differing:
+        print(f"[labels] WARNING: a different CSV from the one recorded for "
+              f"{out_root} (old vs new): {differing}. A source whose label "
+              f"changed keeps its OLD latents under the OLD class folder -- "
+              f"those become orphans (see --prune_orphans).")
+
+
+# ============================================================
 # FILE SCAN -> (path, rel_parent, leaf_class)
 # ============================================================
 def scan_audio_files(
     source_dir: str,
     single_class: bool = False,
     class_name: Optional[str] = None,
+    label_resolver=None,
 ) -> List[Tuple[Path, Path, str, str, str]]:
     """
     Walk source_dir and return [(path, rel_parent, leaf_class, src_hash, rel_posix),
     ...] in a deterministic order.
 
-    `rel_parent` is the source subdirectory of the file RELATIVE to source_dir.
-    Output mirrors it verbatim, so the encoded dataset reproduces THE SAME
-    directory tree as the raw dataset (e.g. SRC/rock/song.mp3 -> latents/rock/).
-    Directory names are preserved exactly (not sanitized) so they match the
-    source; only the per-chunk FILE names are sanitized.
+    `rel_parent` is the output subdirectory of the file. With directory
+    labelling it is the file's source subdirectory RELATIVE to source_dir, so
+    the encoded dataset reproduces THE SAME directory tree as the raw dataset
+    (e.g. SRC/rock/song.mp3 -> latents/rock/). Directory names are preserved
+    exactly (not sanitized) so they match the source; only the per-chunk FILE
+    names are sanitized.
 
     `leaf_class` is the last component of rel_parent -- the class label used for
-    the (per-class) global-condition sidecars.
+    the stratified split and for the (per-class) global-condition sidecars.
 
     `src_hash` is a short, deterministic hash of the file's path relative to
     source_dir (posix-normalized, so it is identical on Windows and Linux). It is
@@ -387,25 +753,90 @@ def scan_audio_files(
 
     With --single_class, every file is placed under one directory
     (class_name or the source basename).
+
+    With a `label_resolver` (--label_source csv) the CSV decides rel_parent
+    instead: the label of a file becomes its output folder, whatever the source
+    tree looks like. Nothing else changes -- src_hash and rel_posix are still
+    computed from the SOURCE path, so no chunk is renamed by switching mode.
+    A source file the CSV does not name is an ERROR: the CSV is under your
+    control, so a gap in it is a mistake to fix there and not a policy to
+    choose per run.
     """
     src = Path(source_dir)
     files = sorted(
         p for p in src.rglob("*")
         if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTS
     )
+
     out: List[Tuple[Path, Path, str, str, str]] = []
+    unlabelled: List[str] = []
+    ambiguous: List[str] = []
     for p in files:
-        if single_class:
+        rel_posix = p.relative_to(src).as_posix()
+        if label_resolver is not None:
+            label, status = label_resolver.lookup(rel_posix)
+            if status == "ambiguous":
+                ambiguous.append(rel_posix)
+                continue
+            if status == "missing":
+                unlabelled.append(rel_posix)
+                continue
+            rel_parent = Path(label)
+        elif single_class:
             rel_parent = Path(class_name or src.name)
         else:
             rp = p.parent.relative_to(src)
             # files sitting directly in source_dir have no class subfolder
             rel_parent = rp if str(rp) != "." else Path(class_name or src.name)
         leaf_class = rel_parent.name
-        rel_posix = p.relative_to(src).as_posix()
         src_hash = hashlib.sha1(rel_posix.encode("utf-8")).hexdigest()[:8]
         out.append((p, rel_parent, leaf_class, src_hash, rel_posix))
+
+    if label_resolver is not None:
+        _report_csv_labelling(label_resolver, len(files), len(out),
+                              unlabelled, ambiguous)
     return out
+
+
+def _report_csv_labelling(resolver, n_files: int, n_kept: int,
+                          unlabelled: List[str], ambiguous: List[str]) -> None:
+    """Say what the CSV actually covered, and stop on what it cannot answer.
+
+    This is the only moment where the CSV and the audio folder are both in hand.
+    A silent partial match here becomes, hours later, a dataset that is quietly
+    missing a class or has a class nobody expected -- so the counts are printed
+    every run, not only when something is wrong.
+    """
+    if ambiguous:
+        raise SystemExit(
+            f"[labels] {len(ambiguous)} source file(s) match SEVERAL rows of "
+            f"{resolver.csv_path.name} carrying DIFFERENT labels, so the CSV "
+            f"cannot say what class they are: "
+            f"{ambiguous[:8]}{' ...' if len(ambiguous) > 8 else ''}\n"
+            f"This happens when the file column holds bare names and the same "
+            f"name appears in two folders under different labels. Fix by "
+            f"putting the path relative to source_dir in the file column, or "
+            f"by removing the duplicate rows.")
+
+    if unlabelled:
+        raise SystemExit(
+            f"[labels] {len(unlabelled)} source file(s) have no row in "
+            f"{resolver.csv_path.name}: "
+            f"{unlabelled[:8]}{' ...' if len(unlabelled) > 8 else ''}\n"
+            f"Every source must be named by the CSV. Add the rows, or point "
+            f"--label_csv at a CSV that covers this source_dir.")
+
+    print(f"[labels] {n_kept}/{n_files} source file(s) labelled from "
+          f"{resolver.csv_path.name} ({resolver.n_rows} row(s))")
+    unmatched = resolver.unmatched_rows()
+    if unmatched:
+        # Not an error: one CSV can legitimately cover several folders (a train
+        # and a test directory preprocessed separately, say). It IS reported,
+        # because the same symptom appears when the CSV and the audio are of
+        # different vintages, and then it means files are missing.
+        print(f"[labels] {len(unmatched)}/{resolver.n_rows} CSV row(s) matched "
+              f"no file under this source_dir: "
+              f"{unmatched[:8]}{' ...' if len(unmatched) > 8 else ''}")
 
 
 # ============================================================
@@ -471,12 +902,20 @@ def audit_sources(prev: dict, files) -> Tuple[list, list]:
 
 
 def write_source_manifest(out_root: Path, prev: dict, produced: dict,
-                          removed: list, prune: bool):
+                          removed: list, prune: bool,
+                          labels: Optional[dict] = None):
     """Merge this run's observations into the manifest and persist it.
 
     `produced` is {rel_source: {"size","mtime_ns","chunks":[...]}} collected from
     the workers. Sources not seen in this run keep their previous entry, unless
     they were pruned.
+
+    `labels` is how this run decided the class of a source (see
+    labels_provenance). It is written alongside the sources rather than in
+    dataset_meta.json because it does not change a single audio byte -- it
+    changes which FOLDER the bytes land in, which is a property of what the
+    dataset was built FROM. A run that does not pass it keeps whatever was
+    already recorded instead of dropping it.
     """
     merged = dict(prev)
     if prune:
@@ -484,7 +923,11 @@ def write_source_manifest(out_root: Path, prev: dict, produced: dict,
             merged.pop(rel, None)
     merged.update(produced)
     p = out_root / MANIFEST_NAME
-    _atomic_write_json(p, {"sources": merged})
+    payload = {"sources": merged}
+    labels = labels or load_labels_provenance(out_root)
+    if labels:
+        payload["labels"] = labels
+    _atomic_write_json(p, payload)
     return len(merged)
 
 
@@ -808,7 +1251,7 @@ def print_chunk_counts(out_root: Path, groups: dict):
     res = record_chunk_counts(out_root, groups)
     if res is None:
         print("  samples per split: not counted "
-              f"(no {MANIFEST_NAME} yet -- nothing encoded)")
+              f"({MANIFEST_NAME} records no source yet -- nothing encoded)")
         return
     c = res["counts"]
     print(f"  samples (latent chunks) per split: train {c['train']} | "
@@ -1402,6 +1845,279 @@ def write_text_label_vocab(registry, out_root: Path, vocab_path: Optional[str],
     print(f"[global/text] label vocabulary: {len(phrases)} phrases encoded "
           f"-> {npy.name}")
     return len(phrases)
+
+
+TEXT_LABELS_JSONL = "text_labels.jsonl"
+TEXT_LABELS_COS = "text_labels_cos.npy"
+TEXT_LABELS_EMB = "text_labels_emb.npy"
+TEXT_LABELS_META = "text_labels.json"
+
+
+def _text_labels_fingerprint(phrases, model_name, n_terms) -> str:
+    """What the sidecar was built from. Any change here invalidates it."""
+    h = hashlib.sha1()
+    h.update(repr(list(phrases)).encode("utf-8"))
+    h.update(str(model_name).encode("utf-8"))
+    h.update(str(int(n_terms)).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def format_text_caption(class_name: str, phrases_cos, quote: bool = True) -> str:
+    """The one place the caption STRING is built, in its two forms.
+
+    quote=True (for a HUMAN):
+        `class · "phrase" (+0.31), "phrase" (+0.24)` -- the class first because
+        it is the only part that is true by construction, the phrases after it
+        with their cosine because they are a closed-vocabulary retrieval and
+        must never be read as a description.
+
+    quote=False (for the CLAP TEXT ENCODER):
+        `class, phrase, phrase` -- plain prose. The cosines and the quotes are
+        bookkeeping for a reader; handing them to a tokenizer would spend tokens
+        on punctuation and numbers that mean nothing in CLAP's space.
+    """
+    if not phrases_cos:
+        return str(class_name)
+    if not quote:
+        return ", ".join([str(class_name)] + [str(p) for p, _c in phrases_cos])
+    body = ", ".join(f"\"{p}\" ({c:+.2f})" for p, c in phrases_cos)
+    return f"{class_name} · {body}"
+
+
+def write_text_labels(out_root: Path, cond_root: Path, n_terms: int = 2,
+                      force: bool = False, text_extractor=None) -> int:
+    """Write, for EVERY chunk, the text that describes it: its class plus the
+    nearest phrases of the vocabulary to its stored CLAP vector.
+
+        global_conditions/text_labels.jsonl    one row per chunk, in a fixed
+                                               order: chunk, class, phrases
+                                               (with cosines), and the ready
+                                               made caption string
+        global_conditions/text_labels_cos.npy  (n_chunks, n_phrases) float16,
+                                               the FULL cosine table, rows in
+                                               the same order as the .jsonl
+        global_conditions/text_labels_emb.npy  (n_distinct_captions, dim)
+                                               float32, the CLAP TEXT embedding
+                                               of each DISTINCT caption
+        global_conditions/text_labels.json     what it was built from, plus the
+                                               distinct caption list
+
+    WHY THE CAPTION EMBEDDINGS. The validation can be asked to generate FROM the
+    description instead of from the chunk's own audio vector (see
+    sampling.validation_text_from_caption in the training config): the slot then
+    receives the CLAP TEXT embedding of the caption, which is what a prompt
+    would put there at inference, and the audio-text similarity becomes a real
+    audio-vs-text score instead of an audio-vs-audio one. Encoding those strings
+    needs the CLAP text tower, which the preprocessing already holds and the
+    training deliberately does not -- so they are computed here, once.
+
+    Only the DISTINCT captions are encoded, with an index per chunk: with
+    --text_labels_n 1 a four-class corpus has four of them, not one per chunk.
+
+    WHY IT EXISTS AT ALL. This description used to be computed inside the
+    training process, at panel-drawing time, for the handful of validation
+    samples that get a panel -- and it existed nowhere else. It is a property of
+    the DATASET, not of a run: computing it for every chunk costs one matrix
+    product against vectors that are already on disk, and it makes the text
+    condition inspectable, countable and reusable for anything else later. The
+    number of panels a machine can afford must not decide how much of the
+    dataset gets described.
+
+    WHY THE FULL COSINE TABLE TOO. `n_terms` is a presentation choice, and
+    storing only the top-N would freeze it: wanting three phrases instead of two
+    next month would mean recomputing from the .npz files. The table is
+    (n_chunks x n_phrases) float16 -- 20 MB for 50k chunks and 200 phrases --
+    and any N, any threshold, any other question can be re-derived from it.
+
+    NOT A DESCRIPTION, A RETRIEVAL. CLAP cannot be run backwards: these phrases
+    are the nearest entries of a closed list, and the cosine is stored beside
+    every one of them so the two are never confused. A phrase at +0.08 is the
+    least bad match in the list, not a statement about the audio.
+
+    `n_terms` counts the caption's terms INCLUDING the class: 1 = the class
+    alone, 2 = class + the nearest phrase, 3 = class + the two nearest.
+
+    Returns the number of chunks described (0 = nothing to do).
+    """
+    import numpy as np
+
+    d = out_root / "global_conditions"
+    vocab_npy, vocab_js = d / "text_vocab.npy", d / "text_vocab.json"
+    if not (vocab_npy.exists() and vocab_js.exists()):
+        print("[global/text] no text_vocab on disk -> no per-chunk labels "
+              "written (nothing to compare the vectors against).")
+        return 0
+    try:
+        meta = json.loads(vocab_js.read_text(encoding="utf-8"))
+        phrases = list(meta.get("phrases", []))
+        model_name = meta.get("model_name")
+        vocab = np.load(str(vocab_npy)).astype(np.float32)
+    except Exception as e:
+        print(f"[global/text] text_vocab unreadable ({type(e).__name__}: {e}) "
+              f"-> no per-chunk labels written.")
+        return 0
+    if not phrases or vocab.ndim != 2 or vocab.shape[0] != len(phrases):
+        print(f"[global/text] text_vocab is inconsistent "
+              f"({len(phrases)} phrases vs {getattr(vocab, 'shape', None)}) "
+              f"-> no per-chunk labels written.")
+        return 0
+
+    n_terms = max(1, int(n_terms))
+    k = min(max(0, n_terms - 1), len(phrases))     # phrases beside the class
+
+    # Every chunk that HAS a stored text vector, in a deterministic order.
+    files = sorted(p for p in cond_root.rglob("*.npz")) if cond_root.exists() else []
+    if not files:
+        print("[global/text] no per-chunk conditions on disk -> no labels.")
+        return 0
+
+    fp = _text_labels_fingerprint(phrases, model_name, n_terms)
+    jsonl_p, cos_p, meta_p = (d / TEXT_LABELS_JSONL, d / TEXT_LABELS_COS,
+                              d / TEXT_LABELS_META)
+    if not force and jsonl_p.exists() and cos_p.exists() and meta_p.exists():
+        try:
+            old = json.loads(meta_p.read_text(encoding="utf-8"))
+            # Compared against the number of .npz SCANNED, not the number of
+            # rows written: a chunk without a text vector produces no row, so
+            # comparing rows would make an incomplete dataset rebuild the
+            # sidecar on every single run.
+            if (old.get("fingerprint") == fp
+                    and int(old.get("n_npz", -1)) == len(files)):
+                print(f"[global/text] per-chunk labels already current "
+                      f"({old.get('n_chunks')} chunks, {n_terms} term(s))")
+                return int(old.get("n_chunks", 0))
+        except Exception:
+            pass          # unreadable -> rebuild
+
+    rows, cos_rows, n_missing = [], [], 0
+    for p in files:
+        rel = p.relative_to(cond_root).with_suffix("").as_posix()
+        try:
+            with np.load(str(p)) as z:
+                if "text" not in z.files:
+                    n_missing += 1
+                    continue
+                vec = np.asarray(z["text"], dtype=np.float32).reshape(-1)
+        except Exception as e:
+            print(f"  [global/text] {rel}: {type(e).__name__}: {e} -> skipped")
+            n_missing += 1
+            continue
+        if vec.shape[0] != vocab.shape[1] or not np.isfinite(vec).all():
+            n_missing += 1
+            continue
+        # Both sides are L2-normalized, so the dot product IS the cosine.
+        sims = vocab @ vec
+        cos_rows.append(sims.astype(np.float16))
+        top = np.argsort(-sims)[:k] if k else []
+        best = [[phrases[i], round(float(sims[i]), 4)] for i in top]
+        # The class is the parent directory of the chunk, exactly as
+        # audio_dataset_cond._class_of_file reads it back.
+        cls = Path(rel).parent.name or ""
+        rows.append({"chunk": rel, "class": cls, "phrases": best,
+                     "caption": format_text_caption(cls, best)})
+
+    if not rows:
+        print(f"[global/text] no chunk carries a 'text' vector "
+              f"({len(files)} .npz inspected) -> no labels written.")
+        return 0
+
+    # ---- the distinct captions, and their CLAP TEXT embedding --------------
+    # Distinct, because a caption is a function of the class and of a handful of
+    # phrases: with n_terms=1 a four-class corpus has exactly four of them. The
+    # per-chunk row keeps an index into this table rather than a copy of a
+    # 512-float vector.
+    # TWO STRINGS PER CAPTION, and the difference is ONLY punctuation. `caption`
+    # is what a human reads: `class · "phrase" (+0.31)`. `caption_text` is what
+    # the CLAP text encoder is given: `class, phrase` -- the quotes and the
+    # cosines are bookkeeping for a reader and would spend tokens on nothing.
+    # THE CLASS NAME ITSELF IS NEVER TOUCHED, in either. If it does not read as
+    # plain words, fix it where it is decided -- the CSV, or --label_aliases --
+    # rather than here: a class rewritten at encode time would no longer be the
+    # class the folder, the split and the panels talk about, and a rule clever
+    # enough to do it would also be clever enough to be wrong in silence.
+    # How well the resulting vectors separate is measured and printed below.
+    captions, captions_text, caption_id = [], [], {}
+    for r in rows:
+        c = r["caption"]
+        if c not in caption_id:
+            caption_id[c] = len(captions)
+            captions.append(c)
+            captions_text.append(
+                format_text_caption(r["class"], r["phrases"], quote=False))
+        r["caption_id"] = caption_id[c]
+    cap_emb = None
+    if text_extractor is not None:
+        try:
+            cap_emb = np.asarray(text_extractor.encode_batch(captions_text),
+                                 dtype=np.float32)
+            if cap_emb.ndim != 2 or cap_emb.shape[0] != len(captions):
+                raise ValueError(f"encode_batch returned {cap_emb.shape} for "
+                                 f"{len(captions)} caption(s)")
+        except Exception as e:
+            # The captions themselves are still worth writing: losing their
+            # embeddings costs the caption-conditioned validation, not the file.
+            print(f"[global/text] caption embeddings NOT written "
+                  f"({type(e).__name__}: {e}). The descriptions are still "
+                  f"stored; sampling.validation_text_from_caption will have "
+                  f"nothing to read.")
+            cap_emb = None
+
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = jsonl_p.with_suffix(".jsonl.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(str(tmp), str(jsonl_p))
+    _atomic_save_npy(cos_p, np.stack(cos_rows, axis=0))
+    if cap_emb is not None:
+        _atomic_save_npy(d / TEXT_LABELS_EMB, cap_emb)
+    else:
+        # A stale table from an earlier build would silently describe other
+        # captions, so it goes rather than being left behind.
+        try:
+            (d / TEXT_LABELS_EMB).unlink()
+        except FileNotFoundError:
+            pass
+    _atomic_write_json(meta_p, {
+        "fingerprint": fp, "n_chunks": len(rows), "n_npz": len(files),
+        "n_terms": n_terms,
+        "n_phrases": len(phrases), "model_name": model_name,
+        "phrases": phrases,
+        "captions": captions,
+        "captions_text": captions_text,
+        "caption_emb": bool(cap_emb is not None),
+        "cos_dtype": "float16",
+        "note": ("Row i of text_labels_cos.npy is line i of text_labels.jsonl. "
+                 "The phrases are a closed-vocabulary retrieval over the stored "
+                 "CLAP vector, not a description: read every one with its "
+                 "cosine. The class is exact, read off the chunk's folder."),
+    })
+
+    distinct = len({tuple(p for p, _c in r["phrases"]) for r in rows})
+    print(f"[global/text] per-chunk labels: {len(rows)} chunk(s), "
+          f"{n_terms} term(s) each, {distinct} distinct phrase combination(s) "
+          f"over {len(phrases)} phrases -> {jsonl_p.name}")
+    print(f"[global/text] {len(captions)} distinct caption(s)"
+          + (f", CLAP-text encoded -> {TEXT_LABELS_EMB}" if cap_emb is not None
+             else ", NOT encoded (no text extractor)"))
+    if cap_emb is not None:
+        # The spread of the conditioning vectors IS the signal the text slot can
+        # carry at validation. Two captions at 0.97 cannot be told apart by the
+        # model or by the similarity metric, so the number is printed rather
+        # than left to be discovered in a flat curve three hours later.
+        if len(captions) > 1:
+            M = cap_emb @ cap_emb.T
+            off = M[~np.eye(len(captions), dtype=bool)]
+            print(f"[global/text] caption embeddings: mean cosine between "
+                  f"DIFFERENT captions {float(off.mean()):+.3f} "
+                  f"(max {float(off.max()):+.3f}) -- the lower, the more the "
+                  f"text slot can distinguish them")
+        for _c, _t in list(zip(captions, captions_text))[:4]:
+            print(f"    {_c!r}  ->  encoded as {_t!r}")
+    if n_missing:
+        print(f"[global/text] {n_missing} chunk(s) had no usable 'text' vector "
+              f"and are absent from the sidecar.")
+    return len(rows)
 
 
 def extract_class_global_conditions(
@@ -2314,6 +3030,32 @@ def build_parser():
     # class layout
     parser.add_argument("--single_class", action="store_true")
     parser.add_argument("--class_name", type=str, default=None)
+    parser.add_argument("--label_source", type=str, default="dir",
+                        help="Where the CLASS of each source comes from: 'dir' "
+                             "(default) the source subdirectory, as before; "
+                             "'csv' a metadata file. The class is the output "
+                             "folder either way, so a CSV-labelled corpus can "
+                             "live in one flat directory and still be split, "
+                             "conditioned and reported per class. Recorded in "
+                             "source_manifest.json: changing it on an existing "
+                             "output dir is refused (it would relocate every "
+                             "latent instead of overwriting it).")
+    parser.add_argument("--label_csv", type=str, default=None,
+                        help="The metadata CSV for --label_source csv. One "
+                             "file column ('file' or 'filename') and one label "
+                             "column ('label' or 'class'), any case; every "
+                             "source must have a row. Rows are matched to files "
+                             "by path relative to source_dir, then by bare file "
+                             "name, then by either case-insensitively.")
+    parser.add_argument("--text_labels_n", type=int, default=2,
+                        help="How many TERMS the per-chunk text description "
+                             "holds, the class included: 1 = the class alone, "
+                             "2 = class + the nearest vocabulary phrase, 3 = "
+                             "class + the two nearest. Written for EVERY chunk "
+                             "into global_conditions/text_labels.jsonl (with "
+                             "--global text), together with the full cosine "
+                             "table, so another N can be re-derived later "
+                             "without re-reading a single .npz.")
 
     # misc
     parser.add_argument("--skip_dac", action="store_true",
@@ -2522,6 +3264,14 @@ def main():
     stratify = not args.no_stratify
     wav_splits = _parse_wav_splits(args.save_wav)
 
+    # ---- how sources are labelled (directory tree, or a metadata CSV) ----
+    # Resolved HERE, before any model is loaded and before --split_only takes
+    # its own path: the labels decide the output folders and the stratified
+    # split, so both branches below must see exactly the same ones.
+    label_resolver = build_label_resolver(args)
+    labels_prov = labels_provenance(args, label_resolver)
+    check_labels_provenance(out_root, labels_prov)
+
     # ---- split-only modes: decide the split and stop ----
     # Placed BEFORE the condition registry so neither mode loads CREPE/CLAP/DAC:
     # writing a split is a metadata operation and must stay one, otherwise
@@ -2533,12 +3283,19 @@ def main():
         else:
             print("Scanning source files ...")
             files = scan_audio_files(args.source_dir, args.single_class,
-                                     args.class_name)
+                                     args.class_name, label_resolver)
             if not files:
                 raise SystemExit(f"[ERROR] No audio files under {args.source_dir}")
             print(f"  {len(files)} files")
+            print_class_histogram(files)
             groups = resolve_splits(out_root, files, split_ratios,
                                     args.split_seed, stratify, args.resplit)
+            # Record HOW these classes were decided, even though this mode
+            # encodes nothing: the split is keyed by the output folder, so a
+            # later full run in the other labelling mode would silently be
+            # keyed differently. Existing source entries are preserved.
+            write_source_manifest(out_root, load_source_manifest(out_root),
+                                  {}, [], False, labels_prov)
         print(f"\nDONE (split only)\n  output: {out_root / SPLITS_NAME}")
         # The latents of a previous run are already on disk, so the samples per
         # split are countable here too -- and this is the cheap way to ask for
@@ -2621,12 +3378,14 @@ def main():
 
     # ---- scan ----
     print("Scanning source files ...")
-    files = scan_audio_files(args.source_dir, args.single_class, args.class_name)
+    files = scan_audio_files(args.source_dir, args.single_class, args.class_name,
+                             label_resolver)
     if not files:
         print(f"[ERROR] No audio files under {args.source_dir}")
         return
     classes = sorted({leaf for _, _, leaf, _, _ in files})
     print(f"  {len(files)} files, {len(classes)} classes")
+    print_class_histogram(files)
 
     # ---- split: load or create, ALWAYS (it is part of the dataset) ----
     # Resolved even when no wavs are requested: the split is what the training
@@ -2897,7 +3656,8 @@ def main():
         # actually handled). Written atomically via a temp file + replace.
         if produced or prev_manifest:
             n_src = write_source_manifest(out_root, prev_manifest, produced,
-                                          removed_srcs, args.prune_orphans)
+                                          removed_srcs, args.prune_orphans,
+                                          labels_prov)
             print(f"[manifest] {out_root / MANIFEST_NAME}: {n_src} source(s) "
                   f"({len(produced)} seen this run)")
         if tmp_dir:
@@ -2915,6 +3675,13 @@ def main():
         write_text_label_vocab(registry, out_root,
                                getattr(args, "text_vocab", None),
                                force=args.force)
+        # Then the per-chunk descriptions themselves. Reads back the vectors the
+        # stream just wrote, so it also covers a run that only CHANGED the
+        # vocabulary: no audio is touched and no model is loaded here.
+        write_text_labels(out_root, cond_root,
+                          n_terms=getattr(args, "text_labels_n", 2),
+                          force=args.force,
+                          text_extractor=registry.global_extractors.get("text"))
 
     print("\nDONE")
     print(f"  latents encoded this run: {n_lat}")

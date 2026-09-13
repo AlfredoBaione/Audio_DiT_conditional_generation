@@ -46,6 +46,12 @@ os.environ.setdefault("USE_TF", "0")   # transformers -> PyTorch backend (no TF)
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 # Use a machine-local cache for HuggingFace / DAC weights (avoids NFS issues).
 os.environ.setdefault("XDG_CACHE_HOME", "/data/anasynth_nonbp/baione/.cache")
+# TORCH_HOME is an ASSIGNMENT, and guarded to IRCAM: the nodes already export
+# it into the SHARED conda env (read-only for us), and torch.hub prefers it
+# over XDG_CACHE_HOME -- the first download on a machine with a cold cache
+# (beat_this fetching its checkpoint) would die with PermissionError.
+if os.path.isdir("/data/anasynth_nonbp/baione"):
+    os.environ["TORCH_HOME"] = "/data/anasynth_nonbp/baione/.cache/torch"
 
 import argparse
 import random
@@ -63,7 +69,9 @@ from audio_dataset_npy import (
     DAC_SAMPLE_RATE,
 )
 from audio_dataset_cond import ConditionedAudioDataset, load_source_split
-from network_cond import ConditionedAudioDiT, TOKEN_DIM
+from network_cond import (ConditionedAudioDiT, TOKEN_DIM,
+                          ckpt_frame_reinject_every,
+                          check_ckpt_reinject_gate)
 from conditions import (
     ConditionRegistry,
     # CLAPTextCondition / ImageCondition are still needed HERE: --prompt and
@@ -327,11 +335,20 @@ def main():
     print(f"[test_cond] Frame cond out dims:  {frame_cond_out_dims}")
     print(f"[test_cond] Global cond configs:  {global_configs}")
 
+    # Architecture parameter (it adds one tensor per selected block to the
+    # state_dict), so it has to be rebuilt exactly as trained. 0 for any
+    # checkpoint written before the option existed.
+    frame_reinject_every = ckpt_frame_reinject_every(ckpt)
+    check_ckpt_reinject_gate(ckpt, args.ckpt)
+    print(f"[test_cond] Frame re-injection:    "
+          f"{'every ' + str(frame_reinject_every) + ' block(s)' if frame_reinject_every > 0 else 'OFF'}")
+
     model = ConditionedAudioDiT(
         kind=model_kind,
         frame_cond_dims=frame_cond_dims,
         frame_cond_out_dims=frame_cond_out_dims,
         global_cond_configs=global_configs,
+        frame_reinject_every=frame_reinject_every,
     ).to(device)
 
     # Prefer the EMA weights, but ONLY if the shadow was being updated when the

@@ -39,6 +39,71 @@ model:
   duration_s: 5.0        # seconds of audio per chunk
   drop: 0.0              # dropout in the FFN of every DiT block (0 -> inert)
 
+  # ---------------------------------------------------------------
+  # PER-BLOCK RE-INJECTION of the frame conditions (f0/chroma/rhythm/energy).
+  #
+  #   0  -> OFF: the frame conditions are concatenated at the input and never
+  #         presented again (plain JASCO). This is the HISTORICAL behaviour, and
+  #         the only value that is bit-comparable with runs trained before the
+  #         re-injection existed.
+  #   1  -> re-inject before EVERY block   <- the value set below
+  #   2  -> before every other block, 4 -> every fourth, ...
+  #
+  # WHY IT EXISTS. With 0, a frame condition touches exactly ONE matrix
+  # (input_proj) and then has to survive the whole depth inside the residual
+  # stream, while a GLOBAL condition modulates all N blocks and the final layer
+  # through AdaLN -- 6 points of contact on 'S', 28 on 'XL'. Music ControlNet
+  # (Wu et al. 2024) makes the opposite choice and keeps feeding the temporal
+  # control back into the trunk. This is that path: the projected conditions are
+  # re-added to the hidden state before the selected blocks through a per-block
+  # zero-initialised, bias-free Linear. Zero-init means step 0 is EXACTLY the
+  # input-only model (verified in network_cond.py's __main__), so the extra path
+  # is learned only if it earns its weight.
+  #
+  # PER-CONDITION GATE. The re-injected term is scaled by a gate read off the
+  # AdaLN vector c -- one scalar PER FRAME CONDITION, per selected block:
+  #
+  #     h <- h + W_i . ( frame_proj * g_i )      g_i = W_g,i . SiLU(c)
+  #
+  # Without it the term re-added at a given block would be a function of the
+  # conditions alone, i.e. the SAME tensor at every denoising step, while every
+  # other path in the network -- each block's own shift/scale/gate, and the
+  # global conditions that ride inside c -- is free to weigh itself against t.
+  # So each condition can be pushed harder at high noise and eased off near the
+  # data, or the reverse; the gradient decides. Two consequences worth knowing:
+  #
+  #   * f0 and chroma get SEPARATE scalars, so they no longer necessarily rise
+  #     and fall together. (Before the gate the add operated on their
+  #     concatenation and could only be weighted as one block.)
+  #   * the gate reads c, so with conditioning.enabled_global non-empty the
+  #     amount of frame condition injected also depends on text/image. This is
+  #     deliberate -- it is the DiT's own single-conditioning-vector design --
+  #     and it is inert when there are no global conditions, where c IS the
+  #     timestep embedding.
+  #
+  # The gate is initialised to the IDENTITY (weight 0, bias 1), NOT to zero:
+  # zeroing both it and the projection would leave the path with no gradient on
+  # either side, permanently. Step 0 is still exactly the input-only model,
+  # because that guarantee comes from the zero-init projection.
+  #
+  # It is inert (and says so at build time) when conditioning.enabled_frame is
+  # empty.
+  #
+  # COST: one Linear(sum(out_dim) -> hidden) per selected block, plus a
+  # Linear(hidden -> n_conditions) for its gate. With f0 alone (out_dim 16) on
+  # 'XL' that is 27 x 16 x 1152 = 0.5M params for the projections and 31k for
+  # the gates, together ~0.05% of the model; with all four frame conditions
+  # (sum 128) the projections are 4.0M. On 'S' with f0 alone: 40 960 + 2 565
+  # = 0.04M, 0.14% of the model. Compute is one extra matmul per selected block.
+  #
+  # ARCHITECTURE PARAMETER: it changes the state_dict, so it lives here next to
+  # `kind` and is checked on --resume exactly like `kind`. A checkpoint trained
+  # with one value cannot be resumed with another. A checkpoint trained with
+  # re-injection BEFORE the gate existed is also refused, with an explanation
+  # (network_cond.check_ckpt_reinject_gate): same stride, different weights.
+  # ---------------------------------------------------------------
+  frame_reinject_every: 1
+
 
 # ============================================================
 # DATA
@@ -249,6 +314,29 @@ sampling:
   # pass. This knob only widens the sample the two SCALARS are averaged over.
   n_similarity_samples: 128
 
+  # ---- WHAT THE VALIDATION GENERATIONS ARE CONDITIONED ON (text slot) ----
+  # false (default): the text slot receives the CLAP AUDIO embedding of the
+  #   chunk, i.e. the same vector training uses. Audio_text_similarity is then
+  #   a cosine between the generation and the SOURCE AUDIO in CLAP's space --
+  #   a resemblance to the original, not an adherence to a text.
+  # true: the slot receives the CLAP TEXT embedding of that sample's written
+  #   description, the one preprocess_stream.py stored for every chunk
+  #   (--text_labels_n: the class, plus the nearest vocabulary phrases). This is
+  #   the vector a prompt would put there at inference, so the validation then
+  #   measures what you will actually do with the model:
+  #     * the generations are produced FROM the description;
+  #     * Audio_text_similarity becomes a true audio-vs-text cosine;
+  #     * the text influence row becomes "how much does the written description
+  #       move the output", scored exactly like a frame condition's.
+  # TRAINING IS UNTOUCHED either way, and so is the validation LOSS -- it keeps
+  # the training's own conditioning, otherwise the two curves would stop being
+  # comparable and would say nothing about overfitting. Only the generations the
+  # metrics and the panels are built from change.
+  # Needs a dataset preprocessed with --global text by a version that writes
+  # global_conditions/text_labels_emb.npy; without it the run says so and falls
+  # back to the chunk's own vector.
+  validation_text_from_caption: false
+
   # ---------------------------------------------------------------
   # CONDITION SUBSETS -- the delta MATRIX
   # ---------------------------------------------------------------
@@ -372,9 +460,43 @@ metrics:
   #   "cpu"  -> move ONLY this part to CPU
   # FD-DAC / KL are unaffected: they always run on the GPU (see metrics.py).
   # The device does NOT change the values, only speed -- "cpu" is purely an
-  # escape hatch for VRAM: at the metrics step the model and the DAC decoder are
-  # both resident, and CREPE-full on top can overflow a card with little margin.
+  # escape hatch for VRAM: at the metrics step the model and the generations are
+  # resident (plus the DAC decoder itself, if dac_device below is "cuda"), and
+  # CREPE-full on top can overflow a card with little margin.
   fidelity_device: "cuda"
+
+  # ---- DAC decoder: where the shared decoder lives for the whole run ----
+  #   "cpu"  -> DEFAULT and historical behaviour. Nothing changes.
+  #   "cuda" -> decode on the GPU (also "cuda:<n>")
+  #
+  # This is the one device knob that is NOT free, so read before flipping it.
+  # Measured on an RTX 5050 laptop, decoding one 5-second clip:
+  #
+  #     CPU  2538 ms          CUDA  194 ms          -> 13x
+  #
+  # At 128 samples that is 5.4 minutes of pure decoding per metrics step against
+  # 25 seconds. On a short local run the CPU decoder dominates the wall clock.
+  #
+  # What it costs on the GPU -- and the weights are the SMALL half:
+  #
+  #     weights      0.29 GB    resident for the whole run
+  #     activations  0.69 GB    peak, one 5-second clip at a time
+  #     peak         0.97 GB
+  #
+  # Nearly 1 GB, and it lands DURING the metrics step, on top of the model, the
+  # generations and the re-extraction above. Training an XL on a 24 GB card --
+  # weights, grads, Adam states and the EMA shadow all live -- that spike is
+  # what kills a run at hour 40, and a slow metrics step is far cheaper than
+  # losing days. So: leave it "cpu" on a shared/large-model machine, turn it
+  # "cuda" on a small local run where the wall clock is the binding constraint.
+  #
+  # UNLIKE fidelity_device and fad_device, this one DOES change the values very
+  # slightly (CPU and GPU floating point differ), so FD-DAC / FAD produced with
+  # a GPU decoder are not directly comparable with numbers produced by a CPU
+  # one. Comparable within an experiment -- all runs on the same device -- not
+  # across the switch. Asking for "cuda" without CUDA is a hard error at
+  # startup, not a silent fallback to CPU.
+  dac_device: "cpu"
 
   # ---- FAD-VGGish (inert unless 'fad_vggish' is in `enabled` above) ----
   # Device for the VGGish embedder. As with fidelity_device it does not change
@@ -452,6 +574,12 @@ conditioning:
 
   # Classifier-free guidance scale used when generating audio at validation
   # time (both for listening and for the metrics).
+  #
+  # NB: guidance is not the only lever on how strongly the frame conditions are
+  # followed. The other one is structural and lives in `model`:
+  # `model.frame_reinject_every` decides whether they are presented once at the
+  # input or re-injected in depth. Unlike this scale, it has to be chosen BEFORE
+  # the run.
   guidance_scale: 3.0
 
   # ---------------------------------------------------------------
@@ -465,7 +593,8 @@ conditioning:
   # Examples:
   #   enabled_frame:  ["f0"]                          # pitch only
   #   enabled_frame:  ["f0", "chroma"]                # pitch + harmony
-  #   enabled_frame:  ["f0", "chroma", "rhythm", "energy"]  # all four frame conds
+  #   enabled_frame:  ["f0", "chroma", "rhythm", "energy"]  # four frame conds
+  #   enabled_frame:  ["f0", "chord"]                 # pitch + crema's chords
   #   enabled_frame:  []                              # no frame conditioning
   #   enabled_global: []                              # no text/image AdaLN
   #

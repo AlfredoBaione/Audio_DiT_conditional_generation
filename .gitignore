@@ -61,3 +61,7 @@ Thumbs.db
 !requirements.lock.txt
 !configs/*.yaml
 !cond_default.yaml
+
+# ---- keep crema's chord weights: a model file, not data -- crema_chord.py and
+#      the `chord` condition cannot run without it (*.npz is ignored above) ----
+!crema_chord_weights.npz

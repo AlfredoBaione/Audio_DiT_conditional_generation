@@ -73,6 +73,13 @@ if os.path.isdir(_IRCAM_LOCAL):
     os.environ["HOME"] = _IRCAM_LOCAL
     os.environ.setdefault("XDG_CACHE_HOME", _cache)
     os.environ.setdefault("HF_HOME", os.path.join(_cache, "huggingface"))
+    # TORCH_HOME is an ASSIGNMENT, not a setdefault: the IRCAM nodes already
+    # export it, pointing inside the SHARED conda env
+    # (.../envs/tf2.18/share/TORCH), which is read-only for us. torch.hub
+    # prefers TORCH_HOME over XDG_CACHE_HOME, so the first download on a
+    # machine with a cold cache (beat_this fetching its checkpoint) dies with
+    # PermissionError. Only overwriting the variable fixes it.
+    os.environ["TORCH_HOME"] = os.path.join(_cache, "torch")
 
 
 import argparse

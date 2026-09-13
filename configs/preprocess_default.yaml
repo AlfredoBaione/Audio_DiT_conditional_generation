@@ -147,9 +147,57 @@ image_root:   null        # image_root/<class>/*.jpg, for the image condition
 # the dataset; editing it later re-labels every panel without re-touching audio.
 text_vocab:   null
 
+# How many TERMS the per-chunk text description carries, the class included:
+#   1 = the class alone        ("Sound_Violin")
+#   2 = class + nearest phrase ("Sound_Violin · \"a bowed tremolo\" (+0.31)")
+#   3 = class + the two nearest, and so on up to the vocabulary length.
+# With --global text this is written for EVERY chunk into
+#   global_conditions/text_labels.jsonl      one row per chunk
+#   global_conditions/text_labels_cos.npy    the FULL cosine table, same order
+#   global_conditions/text_labels.json       what it was built from
+# The .npy is why this number is not a commitment: another N is re-derived from
+# it without re-reading a single .npz. The training does NOT decide how many
+# phrases a panel shows -- it reads the caption the dataset carries.
+# The class is exact (the chunk's folder); the phrases are a closed-vocabulary
+# retrieval over the stored CLAP vector and are always shown with their cosine.
+text_labels_n: 2
+
 # Flatten every source into one class directory.
 single_class: false
 class_name:   null
+
+
+# ============================================================
+# WHERE THE CLASS OF A SOURCE COMES FROM
+# ============================================================
+# The class is the OUTPUT FOLDER a source is encoded into, and everything
+# downstream reads it back from there: the stratified split, `_class_of_file`
+# in the training dataset, the per-class image bank, the panel captions.
+#
+#   dir  (default)  the source's own subdirectory, as it has always been.
+#                   SRC/rock/song.mp3 -> latents/rock/
+#   csv             a metadata file says which class each source is, and THAT
+#                   becomes its output folder. For corpora that ship one flat
+#                   audio folder plus a CSV -- the layout that has no directory
+#                   to read a class from. The raw audio is never moved: only the
+#                   encoded output is grouped by class.
+#
+# The CSV has one file column (named `file` or `filename`) and one label column
+# (`label` or `class`), case-insensitive, and every source file must have a row.
+# Two candidates for the same role is an error, not a guess: rename one. Rows are matched by path relative to source_dir, then by
+# bare file name, then by either of those case-insensitively. A bare name
+# claimed by two rows with DIFFERENT labels is a hard stop, and so is a source
+# with no row: the CSV is a text file under your control, so those are mistakes
+# to fix there rather than policies to choose per run.
+#
+# The label is used VERBATIM as the folder name, and it is also what a text
+# encoder is handed when the `text` condition is active -- so name classes as
+# plain words (`violin`, not `Sound_Violin`). Measured with clap-htsat-unfused:
+# mean cosine between four classes sharing a `Sound_` prefix 0.883, between the
+# bare nouns 0.103.
+#
+label_source: "dir"          # "dir" | "csv"
+label_csv:    null           # the metadata file, for label_source: csv
 
 
 # ============================================================

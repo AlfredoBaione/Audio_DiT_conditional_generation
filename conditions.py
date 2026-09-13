@@ -20,6 +20,9 @@
 #     - chroma: chromagram CQT (12 pitch classes) -- harmony.
 #     - rhythm: per-frame beat + downbeat probability curves (2 channels)
 #               from beat_this (Music ControlNet-style rhythm control).
+#     - chord:  per-frame chord pitch classes (12) from crema's chord model
+#               (PyTorch port, crema_chord.py) -- harmony as a chord
+#               recognizer hears it, rather than raw pitch-class energy.
 #     [extensible: mfcc, spectral_centroid, ...]
 #
 #   GLOBAL (single vector per sample, injected via AdaLN as in the official
@@ -169,8 +172,14 @@ class ChromaExtractor(FrameConditionExtractor):
 
     def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
         import librosa
+        # tuning=0.0 -- chroma_cqt defaults to tuning=None, which makes librosa
+        # ESTIMATE the tuning of every chunk (estimate_tuning -> piptrack -> a
+        # numba gufunc that segfaults on the IRCAM nodes, in the worker and in
+        # the main process alike). 0.0 means A440, which is also what
+        # librosa.cqt itself defaults to -- so crema (crema_chord.py) never
+        # took that path and needs no change.
         chroma = librosa.feature.chroma_cqt(
-            y=audio, sr=sr,
+            y=audio, sr=sr, tuning=0.0,
             hop_length=DAC_HOP_LENGTH, n_chroma=12,
         ).T
         return self._resample_to_frames(chroma, n_frames).astype(np.float32)
@@ -569,6 +578,124 @@ class CrepeF0Extractor(FrameConditionExtractor):
         f = interp1d(np.linspace(0, 1, x.shape[0]), x, axis=0,
                      kind="nearest", fill_value="extrapolate")
         return f(np.linspace(0, 1, target_len))
+
+
+# ============================================================
+# FRAME-LEVEL: CHORD (crema's chord model, PyTorch port)
+# ============================================================
+
+class CremaChordExtractor(FrameConditionExtractor):
+    """
+    Harmony as a chord recognizer hears it: per frame, the probability that
+    each of the 12 pitch classes (C, C#, ..., B) belongs to the chord being
+    played -- crema's `chord_pitch` output. Output (n_frames, 12) in [0, 1],
+    the same shape as chroma.
+
+    Versus chroma: chroma measures how much ENERGY each pitch class has, so a
+    melody note, an overtone or a drum hit light it up as much as the chord
+    does. chord_pitch is the answer of a network trained to name chords
+    (McFee & Bello, ISMIR 2017): which notes make up the chord. A frame with
+    no chord (crema's N) is all near 0, which is also what the null condition
+    of CFG dropout means here.
+
+    Backbone: crema_chord.py, a PyTorch port of crema that loads its original
+    weights (crema_chord_weights.npz, next to it). Verified against the
+    original (Keras 2) on real chunks, whole tracks and edge cases: features
+    bit-identical, outputs within 3e-6. On a new machine:
+        python crema_chord.py --selftest
+
+    Pipeline:
+      1. crema's HCQT front-end on the chunk (44.1 kHz, 10.77 frames/s);
+      2. the network -> chord_pitch, (T_native, 12);
+      3. aligned to the DAC frames ON THE TIME AXIS: crema frame k is centred
+         on k*4096/44100 s, DAC frame j on j*512/44100 s (the convention the
+         chroma condition follows), linear interpolation, first and last crema
+         frame held at the ends. Not _resample_to_frames: that maps the first
+         and last frame onto the chunk's ends, and crema's last frame of a 5 s
+         chunk sits at 4.83 s, not 4.99 s -- an 8x slower rate makes that
+         stretch visible;
+      4. SILENCE GATE: DAC frames whose RMS is below `silence_db` (dBFS,
+         window of 4 DAC hops) are set to 0 = no chord;
+      5. clipped to [0, 1].
+
+    WHY THE GATE: crema reads every excerpt relative to its own loudest bin,
+    so it has no notion of absolute level -- measured: a C major triad gets
+    the same answer at -20 and at -90 dBFS -- and it "hears" a chord in
+    silence too: on the silent frames of real chunks (3.3% of the frames of
+    the instruments set) it put up to 0.3-0.9 on arbitrary pitch classes.
+    Zeros mean absence for every frame condition here (and are the null of
+    CFG dropout), so silence has to be zeros. -60 dBFS is the f0 extractor's
+    silence_db and the dataset's gate. The gate is on the extractor, not on
+    the port: crema_chord.py reproduces crema as it is.
+
+    CONTEXT, measured (3 tracks, 12.8k frames): crema reads whole tracks.
+    Given 5 s chunks, as here, it names the same chord as on the whole track
+    in 58% of the frames (cosine of the 12-d vectors 0.91). The cause is the
+    network's context -- fed full-track features but seeing 5 s it agrees 62%
+    of the time -- not the chunk's level normalization or its edges (about 2
+    points each). The training target and the adherence re-extraction (from a
+    5 s generation) both see 5 s, so they are consistent with each other.
+
+    Cost: CPU, in the preprocessing workers like chroma. The librosa HCQT is
+    ~80-150 ms per 5 s chunk (chroma_cqt ~100 ms), the network ~8 ms on one
+    thread. Deliberately NO device attribute: preprocess_stream moves
+    extractors that have one into the main process, next to the DAC, where
+    this CPU-bound work would run serially.
+    """
+
+    _models: dict = {}   # weights path -> crema_chord.CremaChord, per process
+
+    def __init__(self, silence_db: Optional[float] = -60.0,
+                 weights: Optional[str] = None):
+        from crema_chord import DEFAULT_WEIGHTS, file_sha1
+        # None disables the gate (crema's raw answer, silence included).
+        self.silence_db = None if silence_db is None else float(silence_db)
+        self._weights = str(weights or DEFAULT_WEIGHTS)
+        if not Path(self._weights).is_file():
+            raise FileNotFoundError(
+                f"CremaChordExtractor: weights not found at {self._weights}. "
+                f"crema_chord_weights.npz ships next to crema_chord.py -- copy "
+                f"it along with the code.")
+        # Content identity of the weights: the probe cache fingerprint reads
+        # public scalar attributes, and a path would differ between machines.
+        self.weights_sha1 = file_sha1(self._weights)
+
+    @property
+    def name(self) -> str:
+        return "chord"
+
+    @property
+    def dim(self) -> int:
+        return 12
+
+    def _get_model(self):
+        model = self._models.get(self._weights)
+        if model is None:
+            from crema_chord import CremaChord
+            model = CremaChord(self._weights, device="cpu")
+            self._models[self._weights] = model
+        return model
+
+    def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
+        from crema_chord import CREMA_FPS
+        y = np.asarray(audio, dtype=np.float32)
+        pitch = self._get_model().outputs(y, sr)["chord_pitch"]   # (T, 12)
+        if pitch.shape[0] == 0:          # shorter than one crema hop
+            return np.zeros((n_frames, self.dim), dtype=np.float32)
+        t_src = np.arange(pitch.shape[0]) / CREMA_FPS
+        t_dst = np.arange(n_frames) / DAC_FRAMES_PER_S
+        out = np.stack([np.interp(t_dst, t_src, pitch[:, c])
+                        for c in range(pitch.shape[1])], axis=1)
+        if self.silence_db is not None:
+            import librosa
+            hop = max(1, int(round(sr / DAC_FRAMES_PER_S)))   # one DAC frame
+            rms = librosa.feature.rms(y=y, frame_length=4 * hop,
+                                      hop_length=hop)[0]
+            rms_db = 20.0 * np.log10(rms + 1e-12)
+            silent = np.interp(t_dst, np.arange(rms.size) * hop / sr,
+                               rms_db) < self.silence_db
+            out[silent] = 0.0
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
 # ============================================================
@@ -1157,6 +1284,21 @@ CONDITION_CONFIG = {
                        "min_voiced_frames": 3, "voiced_floor": 0.05,
                        "device": "cpu", "batch_size": 512},
             "out_dim": 16,
+            "enabled": True,
+        },
+        "chord": {
+            # crema's chord model (PyTorch port, crema_chord.py): per frame,
+            # the probability that each pitch class belongs to the chord.
+            # raw_dim=12 like chroma, and chroma's projection width. It has no
+            # device knob, so it runs on CPU in the preprocessing workers, like
+            # chroma. Weights: crema_chord_weights.npz, next to crema_chord.py.
+            # LAST in this dict on purpose: the frame conditions are
+            # concatenated in this order, so appending keeps every existing
+            # run's layout. silence_db: frames quieter than this are "no
+            # chord" (crema itself hears chords in silence; None = off).
+            "class": CremaChordExtractor,
+            "kwargs": {"silence_db": -60.0},
+            "out_dim": 64,
             "enabled": True,
         },
         # Example for adding MFCC in the future:

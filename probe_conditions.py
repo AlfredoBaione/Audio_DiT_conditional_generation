@@ -1,6 +1,7 @@
 """
 probe_conditions.py -- out-of-the-box probe sets for EVERY condition:
-the frame ones (f0, energy, chroma, rhythm) and the global ones (text, image).
+the frame ones (f0, energy, chroma, rhythm, chord) and the global ones (text,
+image).
 
 One module, one shape: a bank of elementary stimuli per condition, one
 synthesizer per condition, one builder, one plotter. Adding a condition means
@@ -51,6 +52,22 @@ chunk geometry.)
 """
 
 import os
+
+# IRCAM: redirect the model caches (DAC, CREPE, beat_this, HuggingFace) onto
+# the machine-local disk instead of the NFS HOME, as preprocess_stream.py and
+# training_cond.py do -- this module also runs STANDALONE to build the probe
+# banks, and then nobody else has set them. TORCH_HOME is an assignment, not a
+# setdefault: the nodes export it into the shared, read-only conda env, and
+# torch.hub prefers it over XDG_CACHE_HOME. Guarded so the script stays
+# portable off-IRCAM.
+_IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
+if os.path.isdir(_IRCAM_LOCAL):
+    _cache = os.path.join(_IRCAM_LOCAL, ".cache")
+    os.environ["HOME"] = _IRCAM_LOCAL
+    os.environ.setdefault("XDG_CACHE_HOME", _cache)
+    os.environ.setdefault("HF_HOME", os.path.join(_cache, "huggingface"))
+    os.environ["TORCH_HOME"] = os.path.join(_cache, "torch")
+
 import json
 import hashlib
 import inspect
@@ -270,6 +287,14 @@ IMAGE_SHAPES = [
     ("noise_field",     {"kind": "noise",      "colors": [(0, 0, 0), (255, 255, 255)], "seed": 0}),
 ]
 
+# ---- CHORD --------------------------------------------------
+# The chord condition (crema's chord pitch classes) is probed with the chroma
+# bank above, rendered by the same synthesizer: its stimuli already ARE
+# sustained chords, and a triad is exactly what a chord recognizer is for. The
+# clusters and the whole-tone / quartal sets fall outside crema's vocabulary;
+# as with the rhythm grids, the target is whatever the run's own extractor
+# makes of them, so they still score a self-consistent goal.
+
 PROBE_BANKS = {
     "f0": PROBE_MELODIES,
     "energy": ENERGY_SHAPES,
@@ -277,6 +302,7 @@ PROBE_BANKS = {
     "rhythm": RHYTHM_GRIDS,
     "text": TEXT_PROMPTS,
     "image": IMAGE_SHAPES,
+    "chord": CHROMA_CHORDS,
 }
 
 # Which banks are GLOBAL conditions (one vector per sample, AdaLN) rather than
@@ -642,6 +668,7 @@ SYNTHESIZERS = {
     "rhythm": synthesize_rhythm,
     "text": synthesize_text,
     "image": synthesize_image,
+    "chord": synthesize_chroma,
 }
 
 
@@ -839,7 +866,7 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
                               verbose: bool = True) -> ConditionProbeSet:
     """
     Build (or load from cache) the out-of-the-box probe set for `condition`
-    ("f0" | "energy" | "chroma" | "rhythm" | "text" | "image").
+    ("f0" | "energy" | "chroma" | "rhythm" | "chord" | "text" | "image").
 
     `extractor` is the RUN'S extractor for that condition --
     registry.frame_extractors[condition] for a frame condition,
@@ -1157,7 +1184,8 @@ def plot_condition_comparison(condition, target, generated, kind="valid",
       chroma (T,12) -> two stacked heatmaps, target above generated, sharing the
                        colour scale. Twelve overlaid curves are unreadable; the
                        question here is whether the same pitch classes light up
-                       at the same times, which is a picture, not a plot.
+                       at the same times, which is a picture, not a plot. chord
+                       (T,12) takes the same branch.
     """
     if condition == "f0":
         # f0 has its own rendering and keeps it: a log-Hz axis (pitch is

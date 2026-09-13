@@ -28,7 +28,9 @@ import soundfile as sf
 from audio_dataset_npy import (
     LatentNormalizer, DAC_SAMPLE_RATE, DAC_FRAMES_PER_S,
 )
-from network_cond import ConditionedAudioDiT, TOKEN_DIM
+from network_cond import (ConditionedAudioDiT, TOKEN_DIM,
+                          ckpt_frame_reinject_every,
+                          check_ckpt_reinject_gate)
 from conditions import (
     ConditionRegistry,
     CLAPTextCondition, ImageCondition,
@@ -429,11 +431,19 @@ def main():
         )
         frame_cond_out_dims = _reg.frame_cond_out_dims
 
+    # Per-block frame re-injection: part of the architecture, so it must be
+    # rebuilt exactly as trained or the state_dict will not load. Read from the
+    # top-level field, falling back to the stored config, then to 0 -- which is
+    # what any checkpoint written before this option existed actually was.
+    frame_reinject_every = ckpt_frame_reinject_every(ckpt)
+    check_ckpt_reinject_gate(ckpt, args.checkpoint)
+
     model = ConditionedAudioDiT(
         kind=ckpt.get("model_kind", "L"),
         frame_cond_dims=frame_cond_dims,
         frame_cond_out_dims=frame_cond_out_dims,
         global_cond_configs=global_configs_ckpt,
+        frame_reinject_every=frame_reinject_every,
     ).to(device)
 
     # Prefer the EMA weights, but ONLY if the shadow was actually being updated
@@ -511,7 +521,12 @@ def main():
         """What to call the output file. --label if given, else the --prompt it
         was actually conditioned on, slugged. Without the prompt branch a
         generation driven by "solo pipe organ" was written as gen_uncond_00.wav,
-        which names it after the one thing it is not."""
+        which names it after the one thing it is not.
+
+        `fallback` is the caller's business: `generate` passes the names of the
+        conditions actually in play (see _active_cond_tag), `edit` passes
+        "edited". Nothing here decides that a generation is unconditioned.
+        """
         if args.label:
             return args.label
         if args.prompt:
@@ -520,6 +535,22 @@ def main():
             if slug:
                 return slug
         return fallback
+
+    def _active_cond_tag(frame_cond, global_cond):
+        """Fallback name for a generation with neither --label nor --prompt:
+        the conditions that actually drove it -- "f0", "f0_chroma", "image" --
+        and "uncond" ONLY when there are none at all.
+
+        This is the SAME bug the docstring above describes, one condition family
+        over, and it was left unfixed there: an f0 curve handed in with
+        --condition_npz / --condition_wav, or a picture handed in with --image,
+        drives the generation exactly as a prompt does, and writing the result as
+        gen_uncond_00.wav again names it after the one thing it is not. Safe by
+        construction: build_frame_cond returns None (not a dict of zeros) when no
+        source was given, so a genuinely null generation still reads "uncond".
+        """
+        active = sorted(frame_cond or {}) + sorted(global_cond or {})
+        return "_".join(active) if active else "uncond"
 
     # --- GENERATE ---
     if args.mode == "generate":
@@ -560,7 +591,7 @@ def main():
                 z = normalizer.denormalize(gen.T)
                 z_q, _, _ = dac_m.quantizer.from_latents(z.unsqueeze(0).float())
                 wav = dac_m.decode(z_q).squeeze()
-            tag = _out_tag("uncond")
+            tag = _out_tag(_active_cond_tag(frame_cond, gc))
             p = os.path.join(args.output, f"gen_{tag}_{i:02d}.wav")
             sf.write(p, wav.numpy(), DAC_SAMPLE_RATE)
             print(f"  {p}")

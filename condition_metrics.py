@@ -20,6 +20,8 @@
 #   - chroma : mean per-frame cosine similarity between target and generated
 #              chromagram (the melody/harmony adherence metric of MusicGen-Melody,
 #              Copet et al. 2023, arXiv:2306.05284).
+#   - chord  : the same per-frame cosine, on crema's 12-d chord-pitch vectors
+#              (CremaChordExtractor) instead of the chromagram.
 #   - rhythm : Pearson correlation of the beat and downbeat probability curves
 #              (robust, hyper-parameter free). A stricter beat F-measure
 #              (peak-picking + mir_eval.beat, in the spirit of Music ControlNet,
@@ -38,6 +40,7 @@ from conditions import (
     RhythmExtractor,
     EnergyExtractor,
     CrepeF0Extractor,
+    CremaChordExtractor,
     CONDITION_CONFIG,
     DAC_FRAMES_PER_S,
 )
@@ -124,6 +127,7 @@ FIDELITY_FNS = {
     "rhythm": rhythm_fidelity,
     "energy": energy_fidelity,
     "f0":     f0_fidelity,
+    "chord":  chroma_fidelity,   # same 12-d per-frame cosine, crema's vectors
 }
 
 
@@ -464,9 +468,10 @@ def format_influence_legend() -> str:
         "contour still correlates high.\n"
         "  - `energy/corr` and `rhythm/corr` — the same Pearson correlation, over "
         "all frames of the envelope / onset curve.\n"
-        "  - `chroma/cos` — mean cosine between the 12-d chroma vectors; "
+        "  - `chroma/cosine` — mean cosine between the 12-d chroma vectors; "
+        "`chord/cosine` — the same, on crema's 12-d chord-pitch vectors; "
         "`text/clap_cos` — CLAP audio-text cosine.\n"
-        "- Ranges: chroma cosine ∈ [0, 1]; rhythm / energy "
+        "- Ranges: chroma / chord cosine ∈ [0, 1]; rhythm / energy "
         "correlation and CLAP cosine ∈ [−1, 1]. Compare each row over time "
         "rather than across rows (different scales).\n"
         "- **valid/used** — how many generations the row is actually averaged "
@@ -487,6 +492,7 @@ _EXTRACTOR_FNS = {
     "rhythm": RhythmExtractor,
     "energy": EnergyExtractor,
     "f0":     CrepeF0Extractor,
+    "chord":  CremaChordExtractor,
 }
 
 
@@ -516,9 +522,10 @@ def sonify_energy(curve, sr, fps: float = DAC_FRAMES_PER_S,
 
 
 # SONIFY_FNS below maps name -> callable(array, sr, fps) -> waveform (float32).
-# All four frame conditions have one, so every condition a run is trained on can
-# be heard beside the generation it produced. A condition added later without a
-# sonifier is simply skipped by sonify_condition rather than failing.
+# Every frame condition has one (chord reuses chroma's pad: the same 12 pitch
+# classes), so every condition a run is trained on can be heard beside the
+# generation it produced. A condition added later without a sonifier is simply
+# skipped by sonify_condition rather than failing.
 def f0_norm_to_hz(arr: np.ndarray) -> np.ndarray:
     """
     INVERSE of the CrepeF0Extractor normalization: (T,) or (T,1) or (T,2) of
@@ -694,6 +701,7 @@ SONIFY_FNS = {
     "f0":     sonify_f0,
     "chroma": sonify_chroma,
     "rhythm": sonify_rhythm,
+    "chord":  sonify_chroma,
 }
 
 

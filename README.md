@@ -2,8 +2,10 @@
 
 Conditioned audio generation with **Rectified Flow** and a **Diffusion Transformer
 (DiT)** operating in **DAC (44.1 kHz) pre-quantizer latent space**, with
-classifier-free guidance. Frame-level conditions (f0, chroma, rhythm, energy)
-are concatenated on the feature dimension (JASCO-style); global conditions
+classifier-free guidance. Frame-level conditions (f0, chroma, rhythm, energy,
+chord) are concatenated on the feature dimension (JASCO-style) and can optionally be
+**re-injected in depth** (`model.frame_reinject_every`), scaled by a
+per-condition gate that depends on the denoising step; global conditions
 (CLAP-text, CLIP-image) are injected via AdaLN.
 
 The pipeline is: **stream-encode audio → latents (+ conditions) → train → sample/edit**.
@@ -20,7 +22,8 @@ it (there are still no split folders on disk).
 |------|------|
 | `preprocess_stream.py` | Streaming preprocessing: chunk → DAC-encode on the fly → save latents (+ optional per-split WAV / conditions). **Decides the train/val/test split** (`splits.json`). Incremental, acoustic rules, parallel workers, batched DAC. Driven by flags or `--config`. |
 | `configs/preprocess_default.yaml` | Preprocessing config: every long flag as a key. Precedence: defaults < file < CLI. |
-| `conditions.py` | Condition registry + extractors (f0/chroma/rhythm/energy, CLAP-text, CLIP-image) and the `FrameConditionEncoder`. |
+| `conditions.py` | Condition registry + extractors (f0/chroma/rhythm/energy/chord, CLAP-text, CLIP-image) and the `FrameConditionEncoder`. |
+| `crema_chord.py` + `crema_chord_weights.npz` | PyTorch port of crema's chord model, with its original weights: the backbone of the `chord` condition (see §1, *The `chord` condition*). |
 | `audio_dataset_npy.py` | Unconditional latent dataset **and** the split reader (`load_source_split`). `compute_split` is the old in-code split, kept for `--import_legacy_split` and the unconditional builder. |
 | `audio_dataset_cond.py` | Conditioned dataset + `build_conditioned_datasets` (reads the recorded split). |
 | `network_cond.py` | The `ConditionedAudioDiT` model. |
@@ -28,7 +31,7 @@ it (there are still no split folders on disk).
 | `test_cond.py` | Evaluate a checkpoint on the **recorded test set** (conditioned generation vs. real). |
 | `sampling_cond.py` | Generate / edit audio from a checkpoint with CFG. |
 | `extract_conditions.py` | Standalone tool to add a frame condition to an existing latents dataset. |
-| `metrics.py`, `condition_metrics.py` | FD-DAC/KL/FAD + per-condition fidelity (f0/energy correlation, chroma cosine, …). |
+| `metrics.py`, `condition_metrics.py` | FD-DAC/KL/FAD + per-condition fidelity (f0/energy correlation, chroma/chord cosine, …). |
 | `probe_conditions.py` | Out-of-the-box probe sets for **every condition** — frame (f0, energy, chroma, rhythm) *and* global (text, image): elementary synthetic stimuli, targets produced by the run's own extractor/encoder, cached behind a fingerprint, plus the comparison plots. One bank + one synthesizer per condition. |
 | `launch_training_cond.py` | IRCAM-only GPU-lock wrapper around `training_cond.py`. |
 | `configs/cond_default.yaml` | Default training configuration. |
@@ -119,19 +122,109 @@ OUT/
   global_conditions/image/<class>.json#   the image file names, in row order
   global_conditions/text_vocab.npy    # --global text: the label vocabulary,
   global_conditions/text_vocab.json   #   CLAP-encoded once (see §3, panels)
+  global_conditions/text_labels.jsonl # --global text: per-CHUNK description,
+  global_conditions/text_labels_cos.npy #  class + nearest phrases, plus the
+  global_conditions/text_labels.json  #   full cosine table (see below)
   dataset_meta.json                   # chunk + acoustic params (re-run safety)
   splits.json                         # source -> train/val/test, plus the
                                       #   per-split counts in BOTH units (see §2)
   source_manifest.json                # what each source was (size/mtime) and which
                                       #   chunks it produced -> detects sources
                                       #   edited in place (stale latents) and
-                                      #   deleted sources (orphan outputs)
+                                      #   deleted sources (orphan outputs);
+                                      #   also HOW the classes were decided
+                                      #   (--label_source, see below)
 ```
 
 Useful flags: `--sr 44100` (required for the 44 kHz DAC), `--chunk_duration`,
-`--chunk_overlap`, `--global text,image` (+ `--image_root`), `--num_workers`
-(parallel CPU work; keep **0 on Windows**), `--batch_size` (DAC batch), `--force`,
-and `--config` to keep all of it in a YAML instead.
+`--chunk_overlap`, `--global text,image` (+ `--image_root`), `--label_source`
+(where the class comes from, see below), `--num_workers` (parallel CPU work; keep
+**0 on Windows**), `--batch_size` (DAC batch), `--force`, and `--config` to keep
+all of it in a YAML instead.
+
+### Where the class of a source comes from — `--label_source`
+
+The class of a source is **the output folder it is encoded into**, and everything
+downstream reads it back from there: the stratified split (§2), `_class_of_file`
+in the training dataset, the per-class image bank, the panel captions. Nothing
+after the preprocessing knows how that folder name was decided.
+
+| `--label_source` | the class of a file is | for |
+|---|---|---|
+| `dir` (default) | its own subdirectory under `<SRC>` — `SRC/rock/x.mp3` → `latents/rock/` | corpora already laid out by class |
+| `csv` | what `--label_csv` says it is, and *that* becomes the output folder | corpora that ship one flat audio folder plus a metadata file |
+
+```bash
+python preprocess_stream.py <SRC> <OUT> --device cuda \
+    --label_source csv --label_csv metadata.csv
+```
+
+**Two flags, and a fixed contract for the CSV** — no options around it:
+
+```
+file,label
+violin_01.wav,violin
+drum_07.wav,drum
+```
+
+* one **file** column, named `file` or `filename`; one **label** column, named
+  `label` or `class`. Case does not matter, so `FileName,Class` reads as is;
+* the file column holds the name, or the path relative to `<SRC>`;
+* the label is the class, used **verbatim** as the folder name;
+* **every source file must have a row.**
+
+Two accepted spellings per column, not a flag: they are the two the world
+actually uses and they are mutually exclusive in practice. A CSV carrying *both*
+`label` and `class` is one whose author meant two different things, so that is
+an error too — rename or drop one column.
+
+Everything else is fixed *in the CSV*: a third column name, a typo in a label, a
+file with no row. A CSV is a text file under your control, and every flag that
+"handles" one of those cases is a rule that will be silently wrong on the next
+corpus.
+
+The raw audio is never moved or copied — only the encoded output is grouped by
+class. And **switching modes renames nothing**: `src_hash` and every chunk file
+name are computed from the *source* path, so the manifest, a resumed run and the
+split's source groups are unaffected by which mode is in use.
+
+Rows are matched to files by **path relative to `<SRC>`**, then by **bare file
+name**, then by either of those **case-insensitively** (a CSV and a filesystem
+routinely disagree on case, and on Windows the disagreement is invisible).
+
+Every run prints what the CSV covered, plus the class histogram — the cheapest
+check that the labels are the ones you expect:
+
+```
+[labels] metadata.csv: 2628 row(s), 4 label(s)
+[labels] 2628/2628 source file(s) labelled from metadata.csv (2628 row(s))
+  2628 files, 4 classes
+  classes: drum 700, guitar 700, violin 700, piano 528
+```
+
+Five things stop the run rather than being guessed:
+
+* **a column that cannot be identified**, or two candidates for the same role.
+* **a source file with no row.** The CSV must cover the corpus.
+* **an ambiguous file** — a bare name claimed by two rows with *different*
+  labels. Put the relative path in the `file` column, or drop the duplicate row.
+* **a label that cannot be a directory name** (`gui/tar`, `A:B`). The class name
+  *is* the folder name, so sanitizing it silently would break the
+  `image_root/<class>` match for exactly those classes.
+* **a change of mode on an existing `<OUT>`.** The mode is recorded in
+  `source_manifest.json`; re-running the other way does not overwrite the
+  dataset, it writes a *second* copy under different class folders. Use a fresh
+  output dir.
+
+> **Name classes as plain words.** A label is a folder name *and* a phrase handed
+> to a text encoder when the `text` condition is active, and the second job is
+> unforgiving. Measured 9 Sept 2026 with `laion/clap-htsat-unfused`, mean cosine
+> between four instrument classes: **0.883** named `Sound_Drum` … `Sound_Violin`
+> (max 0.975 — `Sound_Guitar` and `Sound_Piano` differ by 0.025), **0.375** as
+> hand-written phrases, **0.103** as the bare nouns `drum`, `guitar`, `piano`,
+> `violin`. The shared prefix is most of what the tokenizer sees. Nothing in the
+> code rewrites a name to fix this: a name rewritten at encode time would stop
+> being the name the folder, the split and the panels talk about.
 
 **Conditions: `--conditions` and `--global` are independent and compose.** Either
 can be used alone, both together, and each takes any subset — `--conditions f0`,
@@ -178,6 +271,73 @@ cosine because it is a retrieval, not a translation. Editing the list and
 re-running the preprocessing rewrites the labels without touching a single
 chunk of audio.
 
+### The per-chunk text description — `--text_labels_n`
+
+The stored `text` condition is a 512-d CLAP vector and CLAP has no decoder, so
+nothing about a chunk is readable from it directly. `--global text` therefore
+also writes, **for every chunk of the dataset**, the text that describes it:
+
+```
+global_conditions/text_labels.jsonl
+  {"chunk": "Sound_Violin/xxx__c0003", "class": "Sound_Violin",
+   "phrases": [["a bowed tremolo", 0.3112]],
+   "caption": "Sound_Violin · \"a bowed tremolo\" (+0.31)"}
+global_conditions/text_labels_cos.npy    (n_chunks, n_phrases) float16
+global_conditions/text_labels.json       fingerprint, phrase list, counts
+```
+
+`--text_labels_n` counts the caption's terms **including the class**: 1 = the
+class alone, 2 = class + the nearest phrase, 3 = class + the two nearest.
+
+Two properties are worth stating explicitly, because they are the reason the
+file exists at all rather than being computed on the fly:
+
+* **It covers the whole dataset, not the panels.** This description used to be
+  computed inside the training process, at panel-drawing time, for the ~16
+  validation samples that get a panel, and it existed nowhere else. How many
+  panels a machine can afford must not decide how much of the corpus is
+  described. It is a property of the dataset, so it lives with the dataset.
+* **The training does not decide how much of it to show.** It reads the caption
+  the dataset carries (`load_text_captions`), so the words under a panel are the
+  words on disk by construction. A dataset without the sidecar (built before it
+  existed) falls back to the old in-process retrieval, so older runs keep their
+  captions.
+
+The full cosine table is stored alongside — (n_chunks × n_phrases) float16, about
+20 MB for 50k chunks and 200 phrases — so `--text_labels_n` is not a commitment:
+a different N, a threshold, "every chunk scoring above 0.3 on *a dry close
+recording*", are all re-derived from the `.npy` without re-reading one `.npz`.
+Row *i* of the table is line *i* of the `.jsonl`.
+
+Alongside the descriptions, the CLAP **text** embedding of each DISTINCT caption
+is stored (`text_labels_emb.npy`) — four vectors for a four-class corpus at
+`--text_labels_n 1`, not one per chunk. That is what lets the validation
+generate FROM the description (`sampling.validation_text_from_caption`, §3)
+without CLAP ever entering the training process.
+
+The caption is encoded **verbatim**: the only difference between what you read
+and what CLAP is given is punctuation (`violin · "a bowed tremolo" (+0.31)` is
+encoded as `violin, a bowed tremolo` — quotes and cosines are bookkeeping for a
+reader). Both strings are stored, as `captions` and `captions_text`.
+
+Name classes as plain words — see the box under `--label_source`: the label is
+what the text encoder is handed, and `Sound_Guitar` vs `Sound_Piano` scores 0.975
+where `guitar` vs `piano` scores far lower.
+
+The mean cosine between the caption vectors is printed at the end of every run
+that writes them — a flat text curve three hours into a training should never be
+the first sign that the captions were inseparable.
+
+Rebuilt automatically whenever the vocabulary changes (the fingerprint covers
+the phrases, the CLAP checkpoint and N). **Changing the vocabulary therefore
+costs one cheap pass and no audio is touched**: the vectors are already on disk
+and no model is loaded for this step.
+
+Read the phrases for what they are: a **closed-vocabulary retrieval**, never a
+description. The class is exact — it is the chunk's folder — while a phrase at
++0.08 is merely the least bad match in the list, which is why the cosine is
+stored and printed next to every one of them.
+
 `--save_wav` takes **which splits** to write: `none` (default), `all`, or a subset
 such as `val` / `val,test`. A bare `--save_wav` still means `all`. These WAVs are
 the **real source audio** — they never pass through the DAC — which is what makes
@@ -223,6 +383,50 @@ python preprocess_stream.py <SRC> <OUT> --device cuda --acoustic_rules --conditi
 
 `extract_conditions.py` is a fallback for adding a condition when only the latents
 (and optionally WAVs) remain — it decodes the latent back to audio if no WAV is present.
+
+### The `chord` condition — crema, ported to PyTorch
+
+`chord` is harmony as a chord recognizer hears it: for every frame, the
+probability that each of the 12 pitch classes belongs to the chord being played
+— the `chord_pitch` output of [crema](https://github.com/bmcfee/crema) (McFee &
+Bello, ISMIR 2017). Same shape as `chroma`, `(n_frames, 12)` in `[0, 1]`, but
+where chroma measures how much *energy* each pitch class has (melody, overtones
+and drums included), `chord` says which notes make up the *chord*.
+
+crema's released model is a Keras 2.2.2 / TensorFlow file, and crema no longer
+runs as it is: it does not import under Keras 3 — every TensorFlow ≥ 2.16, so both
+the local env and IRCAM's tf2.18 (crema issue #41) — and its feature library,
+pumpp, fails with scikit-learn ≥ 1.6. `crema_chord.py` re-implements the network
+in PyTorch and loads the **original weights unchanged** from
+`crema_chord_weights.npz` (2.1 MB, next to it). Nothing is retrained.
+
+- **Verified** against the original (crema 0.2.0 under Keras 2), same process, on
+  real chunks of four instrument classes, whole tracks, generations of this
+  model and edge cases: features bit-identical, outputs within 3e-6, the same
+  arg-max chord on 100% of the frames. Check a new machine with
+  `python crema_chord.py --selftest`.
+- **Add it** like any frame condition, incrementally (same chunk/acoustic flags
+  as the dataset was built with):
+  ```bash
+  python preprocess_stream.py <SRC> <OUT> --device cuda --acoustic_rules --conditions chord
+  ```
+  then list `"chord"` in `conditioning.enabled_frame`. It runs on CPU in the
+  preprocessing workers, like chroma (~0.1 s per 5 s chunk).
+- **The weights file travels with the code.** Copy `crema_chord_weights.npz` to
+  IRCAM together with `crema_chord.py` (`.gitignore` keeps it despite `*.npz`).
+- **Read it knowing the context.** crema was built to read whole tracks. On 5 s
+  chunks it names the same chord as on the whole track in 58% of the frames
+  (cosine 0.91 between the 12-d vectors, measured on 3 tracks); the cause is the
+  network's context, not the cut of the audio. The training target and the
+  re-extraction from a 5 s generation both see 5 s, so `chord/cosine` compares
+  like with like.
+- **Silence is zeros.** crema has no notion of absolute level (a triad reads the
+  same at −20 and at −90 dBFS) and hears chords in silence too, so the extractor
+  zeroes the frames below `silence_db` (−60 dBFS, in `CONDITION_CONFIG`, as for
+  f0): silence means "no chord", as zeros mean absence for every condition.
+- `python crema_chord.py song.wav` prints a chord timeline of any file — a quick
+  look at what the condition is made of (frame-wise: crema's own HMM smoothing
+  is not applied).
 
 ---
 
@@ -302,6 +506,92 @@ python training_cond.py --config configs/cond_default.yaml \
 - CLI overrides use dotlist syntax (e.g. `model.kind=B training.lr=5e-5`).
 - Resume: `--resume runs/<prev>/checkpoints/checkpoint_step50000.pt`.
 
+### How strongly the frame conditions are followed
+
+Two levers, and only one of them can be changed after the fact.
+
+**`conditioning.guidance_scale`** (sampling time, free to change). The usual CFG
+extrapolation `v_u + w · (v_c − v_u)`. Costs nothing to retry on a trained
+checkpoint; above ~5 it buys adherence with artefacts.
+
+**`model.frame_reinject_every`** (architecture, must be chosen BEFORE the run).
+With the default `0`, a frame condition is concatenated at the input and never
+presented again: it touches exactly **one** matrix (`input_proj`) and then has to
+survive the whole depth inside the residual stream. A *global* condition, by
+contrast, modulates **every** block and the final layer through AdaLN — 6 points
+of contact on `S`, 28 on `XL`. That asymmetry is JASCO's design; Music ControlNet
+(Wu et al., 2024) makes the opposite choice and keeps feeding the temporal
+control back into the trunk.
+
+Setting it to `N > 0` adds that path: the projected conditions are re-added to
+the hidden state before every `N`-th block, through a per-block **zero-initialised,
+bias-free** `Linear(sum(out_dim) → hidden)`, scaled by a **per-condition gate**
+read off the AdaLN vector `c`:
+
+```
+h ← h + W_i · ( frame_proj ⊙ g_i )        g_i = W_g,i · SiLU(c)
+```
+
+Without the gate the term re-added at a given block is a function of the
+conditions alone — the *same tensor at every denoising step* — while every other
+path in the network is free to weigh itself against `t`: each block's own
+`shift`/`scale`/`gate` come out of `adaLN_modulation(c)`, and the global
+conditions ride inside that same `c`. The re-injection was the only contribution
+in the model without that freedom.
+
+```yaml
+model:
+  frame_reinject_every: 0   # 0 = off (JASCO) | 1 = every block | 2 = every other | ...
+```
+
+- **Each frame condition gets its own scalar** (f0, chroma, rhythm, energy), so
+  they no longer necessarily rise and fall together along `t`. The projection
+  still acts on their concatenation — what is per-condition is the *weight*, not
+  the mixing. Before the gate the add could only be weighted as one block. It is
+  inert, and says so at build time, when `conditioning.enabled_frame` is empty.
+- **The gate reads `c`, not `t` alone.** With `conditioning.enabled_global`
+  non-empty, `c = t_emb + g`, so how much frame condition is injected also
+  depends on text/image. Deliberate — it is the DiT's own
+  single-conditioning-vector design — and inert on a model with no global
+  conditions, where `c` **is** the timestep embedding.
+- **Block 0 is never re-injected**: `input_proj` has just delivered the
+  conditions to it.
+- **Zero-init** means step 0 is *exactly* the input-only model, so the extra path
+  is learned only if it earns its weight — the same principle as adaLN-Zero and
+  ControlNet's zero-convs. `python network_cond.py` asserts this, together with
+  the fact that the path then really changes the output and receives gradient.
+- **The gate starts at the identity** (weight 0, **bias 1**), not at zero.
+  Zeroing it as well would leave the path dead on arrival: with the gate at 0 the
+  projection receives no gradient, and with the projection at 0 the gate receives
+  none either, so neither could ever leave the origin. The step-0 guarantee is
+  unaffected — it comes from the zero-init *projection*. The order in which the
+  path wakes up is: step 0 the final layer, step 1 the projection, step 2 the
+  gate.
+- **Cost:** one `Linear` per selected block, plus a `Linear(hidden → n_conditions)`
+  for its gate. With f0 alone (`out_dim` 16) on `XL` that is 27 × 16 × 1152 =
+  0.5M params for the projections and 31k for the gates (~0.05% of the model);
+  with all four frame conditions (sum 128) the projections are 4.0M. On `S` with
+  f0 alone: 40 960 + 2 565 = 0.04M, 0.14% of the model.
+- **It changes the state_dict**, so it is checked on `--resume` exactly like
+  `model.kind`, and a checkpoint trained with one value cannot be resumed with
+  another. Trying it means a **new run**, not a resume. `sampling_cond.py` and
+  `test_cond.py` read the value back from the checkpoint automatically;
+  checkpoints written before this option existed read back as `0`, which is what
+  they were trained as. A checkpoint trained with re-injection *before the gate
+  existed* is refused with an explanation rather than a wall of missing keys
+  (`network_cond.check_ckpt_reinject_gate`): the stride matches, the weights do
+  not.
+- **`frame_reinject_every: 0` is bit-identical to the pre-re-injection code.**
+  Neither the projections nor the gates are built, the parameter count and the
+  initialisation from a given seed are unchanged, and an old checkpoint loads
+  with `strict=True`. That is the value to use for a run meant to be compared
+  with results produced before any of this existed.
+
+What it does **not** fix: a condition that carries no information on the data.
+On material where CREPE returns mostly unvoiced (musique concrète, heavily
+processed sound), the f0 curve is close to noise and no amount of re-injection or
+guidance recovers a control signal that is not in the `.npz` to begin with.
+
 ### Which metrics are computed
 
 `metrics.enabled` selects the distributional metrics, mirroring the unconditional
@@ -318,8 +608,61 @@ metrics:
                                   # on the GPU regardless. The device does not
                                   # change the values, only speed: "cpu" is an
                                   # escape hatch if the metrics step runs out of
-                                  # VRAM (there the model AND the DAC decoder are
-                                  # already resident).
+                                  # VRAM (there the model and the generations are
+                                  # resident, plus the DAC decoder itself when
+                                  # dac_device is "cuda").
+  dac_device: "cpu"               # "cpu" (default) | "cuda" — where the shared DAC
+                                  # decoder lives. See below: this is the one
+                                  # device knob that is not free.
+```
+
+#### `dac_device` — the one device knob that is not free
+
+The other two change speed only. This one trades **wall clock against VRAM**, and
+slightly changes the values, so it has its own section.
+
+Measured on an RTX 5050 laptop, decoding one 5-second clip:
+
+| | CPU | CUDA |
+|---|---|---|
+| per clip | 2538 ms | 194 ms (**13×**) |
+| 128 samples (one metrics step) | 5.4 min | 25 s |
+
+On a short local run the CPU decoder dominates the wall clock — it can be more
+of the run than the training itself. But on the GPU it costs, and **the weights
+are the small half**:
+
+```
+weights      0.29 GB   resident for the whole run
+activations  0.69 GB   peak, one 5-second clip at a time
+peak         0.97 GB
+```
+
+Nearly 1 GB, landing **during the metrics step**, on top of the model, the
+generations and the re-extraction above. Training an `XL` on a 24 GB card —
+weights, grads, Adam states and the EMA shadow all live — that spike is what
+kills a run at hour 40, and a slow metrics step is far cheaper than losing days.
+Hence the default is `cpu`, the historical behaviour: **no existing run changes
+unless you ask.**
+
+- **Leave it `cpu`** on a shared or large-model machine (the IRCAM servers).
+- **Turn it `cuda`** on a small local run where the wall clock is the binding
+  constraint.
+
+Two caveats. First, unlike `fidelity_device` / `fad_device`, this one **does
+change the values** very slightly — CPU and GPU floating point differ — so FD-DAC
+and FAD produced with a GPU decoder are not directly comparable with numbers
+produced by a CPU one. Comparable *within* an experiment (all runs on the same
+device), not across the switch. Second, asking for `"cuda"` without CUDA is a
+**hard error at startup**, not a silent fallback.
+
+The decoder is a load-once singleton, so the device is fixed before the first
+use and never changes mid-run; the startup line reports the device it actually
+landed on, read back from the model:
+
+```
+DAC decoder device: cuda  (~0.2 s per 5 s clip; ~1 GB peak at the metrics step)
+[DAC] Model loaded once (CUDA:0) and cached for the whole run.
 ```
 
 Listing a metric is an explicit request: an unsupported name is a **hard error at
@@ -357,6 +700,34 @@ The same two numbers also appear in the influence panel, but there as a **paired
 delta** against the null generation, on the influence set — which is the honest
 way to read them, since the absolute cosine of an audio-image pair is small even
 when the conditioning works (see the probes section).
+
+### Validating on the description instead of the source audio
+
+`sampling.validation_text_from_caption` (default `false`) changes **what the
+validation generations are conditioned on**, and nothing else.
+
+|  | text slot of a validation generation | `Audio_text_similarity` is then |
+|---|---|---|
+| `false` | the chunk's own CLAP **audio** embedding — what training uses | generation vs **source audio**, in CLAP space |
+| `true` | the CLAP **text** embedding of that sample's written description | generation vs **text**: a real adherence score |
+
+With `true`, the description is the one `preprocess_stream.py` stored for every
+chunk (`--text_labels_n`: the class, plus the nearest vocabulary phrases), so
+with `--text_labels_n 1` on a per-instrument dataset the validation generates
+from `"Sound_Violin"`, `"Sound_Piano"`, ... — i.e. it measures instrument
+controllability directly. The text influence row is then read like a frame
+condition's: the paired delta between the generation given the description and
+the null one.
+
+It is the vector a prompt puts in that slot at inference, so this makes the
+validation measure what the model will actually be asked to do. **Training is
+untouched, and so is the validation loss** — that keeps the training's own
+conditioning, otherwise the two loss curves stop being comparable and stop
+saying anything about overfitting. Only the generations behind the metrics and
+the panels change.
+
+Needs `global_conditions/text_labels_emb.npy` in the dataset (written by
+`--global text`). Without it the run says so and falls back.
 
 ### FAD-VGGish (optional, off by default)
 
@@ -422,7 +793,9 @@ listing it is a hard error at startup, not a silent skip.
 
 Disabling every condition turns this into a plain **unconditional** run: the model
 builds no conditioning modules (`input_proj`/AdaLN collapse to the unconditional
-DiT), no conditions are read from disk, and CFG never engages.
+DiT, and `model.frame_reinject_every` becomes inert — it says so at build time
+rather than passing silently), no conditions are read from disk, and CFG never
+engages.
 
 ```bash
 python training_cond.py --config configs/cond_default.yaml \
@@ -523,6 +896,7 @@ ambiguous target.
 | energy | crescendo, diminuendo, four stabs, swell, plateau, staircases | a waveform |
 | chroma | sustained triads, I-IV-V, single pitch class, clusters | a waveform |
 | rhythm | click grids at fixed tempi, downbeat every N, accelerando | a waveform |
+| chord | the chroma bank: its stimuli already are chords | a waveform |
 | **text** | 16 instrument/style prompts ("solo pipe organ in a large reverberant church", "fast electronic dance beat…") | a **string**, CLAP-encoded |
 | **image** | 16 abstract figures — colour fields, stripes, checkerboard, rings, gradient, noise | a **.png**, CLIP-encoded |
 
@@ -561,10 +935,10 @@ read is about the curve you are looking at.
 > per-condition `n_f0_probe` / `n_energy_probe` / `n_chroma_probe` /
 > `n_rhythm_probe` (already inert before). A leftover in your config does nothing.
 
-All six banks live in ONE module, `probe_conditions.py`: one bank, one
-synthesizer and one plot branch per condition, so every condition is set up,
-built, drawn and scored the same way. Adding a seventh means adding a bank and a
-synthesizer, nothing else.
+All the banks live in ONE module, `probe_conditions.py`: one bank, one
+synthesizer and one plot branch per condition (chord reuses chroma's bank and
+synthesizer), so every condition is set up, built, drawn and scored the same
+way. Adding one more means adding a bank and a synthesizer, nothing else.
 
 Each FRAME condition gets the SAME two images, N of each, grouped **per sample**
 so the Images tab collapses into the same sections as the Audio tab instead of
@@ -586,7 +960,7 @@ organ" (+0.58)]`. That label is a retrieval over `text_vocab`, which is why the
 cosine is always beside it.
 
 drawn in the form that suits the shape — f0 on a log-Hz axis with a voicing
-ribbon, energy and rhythm as overlaid curves, chroma as paired heatmaps. Plus an
+ribbon, energy and rhythm as overlaid curves, chroma and chord as paired heatmaps. Plus an
 audio block (`<cond>probe_XX_<name>/`) and a `<cond>_probe` row in the influence
 table. The `_valid_` images are FREE: the curves come from the re-extraction the
 influence table already runs.
@@ -598,6 +972,7 @@ python probe_conditions.py f0     ./cache/f0_probe     --n_frames 431
 python probe_conditions.py energy ./cache/probe_energy --n_frames 431
 python probe_conditions.py chroma ./cache/probe_chroma --n_frames 431
 python probe_conditions.py rhythm ./cache/probe_rhythm --n_frames 431
+python probe_conditions.py chord  ./cache/probe_chord  --n_frames 431
 # the global banks: --n_frames does not apply (one embedding, no chunk geometry)
 python probe_conditions.py text   ./cache/probe_text
 python probe_conditions.py image  ./cache/probe_image

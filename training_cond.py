@@ -56,8 +56,16 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 #    untouched and DAC uses the platform default cache location.
 _IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
 if os.path.isdir(_IRCAM_LOCAL):
+    _cache = os.path.join(_IRCAM_LOCAL, ".cache")
     os.environ["HOME"] = _IRCAM_LOCAL
-    os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_IRCAM_LOCAL, ".cache"))
+    os.environ.setdefault("XDG_CACHE_HOME", _cache)
+    # TORCH_HOME is an ASSIGNMENT, not a setdefault: the IRCAM nodes already
+    # export it, pointing inside the SHARED conda env
+    # (.../envs/tf2.18/share/TORCH), which is read-only for us. torch.hub
+    # prefers TORCH_HOME over XDG_CACHE_HOME, so the first download on a
+    # machine with a cold cache (beat_this fetching its checkpoint) dies with
+    # PermissionError. Only overwriting the variable fixes it.
+    os.environ["TORCH_HOME"] = os.path.join(_cache, "torch")
 
 import copy
 import sys
@@ -99,7 +107,7 @@ from tqdm import tqdm
 from audio_dataset_npy import (
     DAC_LATENT_DIM, DAC_SAMPLE_RATE, frames_per_chunk,
 )
-from network_cond import ConditionedAudioDiT, TOKEN_DIM
+from network_cond import ConditionedAudioDiT, TOKEN_DIM, check_ckpt_reinject_gate
 from audio_dataset_cond import (
     build_conditioned_datasets, collate_conditioned,
 )
@@ -126,7 +134,64 @@ from metrics import (
 # their own DAC every call; at frequent metrics steps that is wasteful and a
 # source of fragmentation. Mirror the unconditional repo: load it ONCE on CPU
 # and cache it for the whole run.
-_DAC_MODEL = None
+_DAC_MODEL  = None
+_DAC_DEVICE = "cpu"
+
+
+def set_dac_device(device: str):
+    """
+    Choose where the shared DAC decoder lives, from `metrics.dac_device`.
+
+    WHY THE KNOB. The decoder is 76.7M params and decoding one 5-second clip
+    costs, measured on an RTX 5050 laptop:
+
+        CPU   2538 ms        CUDA   194 ms        (13x)
+
+    At 128 samples that is 5.4 minutes of pure decoding per metrics step versus
+    25 seconds, which on a short run dominates the wall clock. But the choice is
+    NOT free on VRAM, and the number that matters is not the weights:
+
+        weights      0.29 GB   (resident for the whole run)
+        activations  0.69 GB   (peak, one 5-second clip at a time)
+        peak         0.97 GB
+
+    Nearly 1 GB, and it lands DURING the metrics step, when the model, the
+    generations and the CREPE / beat_this / CLAP re-extraction are already
+    resident. On a 24 GB card training an XL -- weights, grads, Adam states and
+    the EMA shadow all live -- that spike is exactly the thing that kills a run
+    at hour 40, and a slow metrics step is cheaper than losing days. Hence the
+    DEFAULT IS "cpu": the historical behaviour, unchanged, for every run that
+    does not ask otherwise. Turn it to "cuda" per machine, deliberately.
+
+    NB: the values are not bit-identical across devices, so FD-DAC / FAD
+    computed with a GPU decoder are not directly comparable with numbers
+    produced by a CPU one. Comparable within an experiment (all runs on the same
+    device), not across the switch.
+
+    Must be called BEFORE the first get_dac(): the singleton is built once and
+    is not moved afterwards, so a late call would silently do nothing.
+    """
+    global _DAC_DEVICE
+    dev = str(device).strip().lower()
+    if dev not in ("cpu", "cuda") and not dev.startswith("cuda:"):
+        raise ValueError(
+            f"metrics.dac_device must be 'cpu', 'cuda' or 'cuda:<n>', got "
+            f"{device!r}."
+        )
+    if dev.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"metrics.dac_device={device!r} but CUDA is not available. Set it to "
+            f"'cpu' (the default) to decode on the CPU."
+        )
+    if _DAC_MODEL is not None and dev != _DAC_DEVICE:
+        # Loud, not silent: a caller that asks for a device after the decoder
+        # exists would otherwise believe it got one and measure on the other.
+        raise RuntimeError(
+            f"set_dac_device({device!r}) called after the DAC was already loaded "
+            f"on {_DAC_DEVICE!r}. The device must be chosen before the first "
+            f"get_dac()."
+        )
+    _DAC_DEVICE = dev
 
 
 def get_dac():
@@ -134,9 +199,14 @@ def get_dac():
     if _DAC_MODEL is None:
         import dac
         _DAC_MODEL = dac.DAC.load(dac.utils.download(model_type="44khz"))
-        _DAC_MODEL.to("cpu")
+        _DAC_MODEL.to(_DAC_DEVICE)
         _DAC_MODEL.eval()
-        print("[DAC] Model loaded once (CPU) and cached for the whole run.")
+        # The device is READ BACK from the model, not repeated as a literal:
+        # this line used to say "CPU" as text, so changing where the decoder
+        # lives would have left the log confidently reporting the old device.
+        dev = next(_DAC_MODEL.parameters()).device
+        print(f"[DAC] Model loaded once ({str(dev).upper()}) and cached for "
+              f"the whole run.")
     return _DAC_MODEL
 
 
@@ -367,6 +437,7 @@ def load_config():
             cfg = OmegaConf.merge(cfg, ckpt_cfg)
             print("[RESUME] Config restored from checkpoint "
                   f"(model.kind={cfg.model.kind}, "
+                  f"frame_reinject_every={cfg.model.get('frame_reinject_every', 0)}, "
                   f"enabled_frame={cfg.conditioning.enabled_frame}, "
                   f"enabled_global={cfg.conditioning.enabled_global}, "
                   f"train_batch_size={cfg.data.train_batch_size}).")
@@ -400,6 +471,42 @@ def load_config():
                 f"spelling and the dotted path (e.g. 'data.num_val_batches', not "
                 f"'data_num_val_batches'). Nothing was run.")
         OmegaConf.set_struct(cfg, False)
+
+    # CFG DROPOUT BUCKETS: the three group probabilities must leave room for the
+    # "keep both" case. They partition [0, 1) into disjoint ranges (see
+    # apply_cfg_dropout), so if they sum to 1.0 or more the leftover mass is
+    # zero and EVERY sample has something dropped: the model never sees full
+    # conditioning and quietly trains towards the unconditional one, with no
+    # error and nothing odd in the loss curve. The YAML has always said "must be
+    # < 1.0"; nothing enforced it. Checked HERE, before the dataset, the model
+    # and the GPU, so a bad config costs a second instead of a night.
+    _p_all = float(cfg.conditioning.p_drop_all)
+    _p_frm = float(cfg.conditioning.p_drop_frame)
+    _p_gbl = float(cfg.conditioning.p_drop_global)
+    _p_each = float(cfg.conditioning.get("p_drop_each_frame", 0.0))
+    for _name, _val in (("p_drop_all", _p_all), ("p_drop_frame", _p_frm),
+                        ("p_drop_global", _p_gbl),
+                        ("p_drop_each_frame", _p_each)):
+        if not 0.0 <= _val <= 1.0:
+            raise SystemExit(
+                f"[config] conditioning.{_name} = {_val} is outside [0, 1]. "
+                f"These are probabilities. Nothing was run.")
+    _p_sum = _p_all + _p_frm + _p_gbl
+    if _p_sum >= 1.0:
+        raise SystemExit(
+            f"[config] conditioning.p_drop_all + p_drop_frame + p_drop_global "
+            f"= {_p_all} + {_p_frm} + {_p_gbl} = {_p_sum:.3f}, which leaves "
+            f"NOTHING for the 'keep everything' case: every training sample "
+            f"would have some condition dropped and the model would never see "
+            f"full conditioning. Their sum must stay below 1.0 (the default "
+            f"0.10 + 0.05 + 0.05 = 0.20 leaves 80%). Nothing was run.")
+    if _p_all <= 0.0 and (_p_frm <= 0.0 or _p_gbl <= 0.0):
+        print(f"[config] WARNING: p_drop_all={_p_all}, p_drop_frame={_p_frm}, "
+              f"p_drop_global={_p_gbl}. Classifier-free guidance needs a NULL "
+              f"branch to extrapolate from, and the influence panel needs it as "
+              f"its baseline: with no dropout on a branch, guidance_scale and "
+              f"the delta column on that branch are meaningless.")
+    del _p_all, _p_frm, _p_gbl, _p_each, _p_sum
 
     # CLI --resume prevails over YAML
     if args.resume is not None:
@@ -1561,7 +1668,101 @@ def load_text_label_vocab(latent_root):
         return None, None
 
 
-def describe_validation_sample(val_dataset, ds_idx, phrases, vocab_emb, k=2):
+def load_text_captions(latent_root):
+    """-> {chunk key: caption} from the dataset's text_labels.jsonl, or {}.
+
+    The captions are written by preprocess_stream.py for EVERY chunk, so the
+    panel does not decide how a sample is described -- it reads what the dataset
+    says. That is the point of the file: the number of panels a machine can
+    afford must not decide how much of the corpus gets described, and the words
+    under a panel must be the same words the dataset records.
+
+    Missing is NORMAL (a dataset built before the sidecar existed, or one
+    without --global text) and the caller then falls back to computing the
+    retrieval itself, as it always did.
+    """
+    try:
+        p = Path(latent_root).parent / "global_conditions" / "text_labels.jsonl"
+        if not p.exists():
+            return {}
+        out = {}
+        with open(p, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                if r.get("chunk"):
+                    out[r["chunk"]] = r.get("caption") or r.get("class") or ""
+        return out
+    except Exception as e:
+        print(f"[metrics] text_labels.jsonl unreadable "
+              f"({type(e).__name__}: {e})")
+        return {}
+
+
+def load_caption_conditions(latent_root):
+    """-> ({chunk key: row index}, (n_captions, dim) float32), or ({}, None).
+
+    The CLAP TEXT embedding of each DISTINCT caption, written by
+    preprocess_stream.py. It is what lets the validation generate FROM the
+    description -- the vector a prompt would put in the text slot at inference --
+    without CLAP ever being loaded in the training process, which is exactly the
+    arrangement the dataset-side rewrite of 6 Sept was for.
+
+    Distinct captions, not one row per chunk: with --text_labels_n 1 a four-class
+    corpus has four of them.
+    """
+    try:
+        d = Path(latent_root).parent / "global_conditions"
+        meta_p, emb_p = d / "text_labels.json", d / "text_labels_emb.npy"
+        jsonl_p = d / "text_labels.jsonl"
+        if not (meta_p.exists() and emb_p.exists() and jsonl_p.exists()):
+            return {}, None
+        meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        emb = np.load(str(emb_p)).astype(np.float32)
+        n_cap = len(meta.get("captions", []))
+        if emb.ndim != 2 or emb.shape[0] != n_cap or n_cap == 0:
+            print(f"[metrics] text_labels_emb.npy does not match the caption "
+                  f"list ({emb.shape} vs {n_cap}) -> ignored")
+            return {}, None
+        ids = {}
+        with open(jsonl_p, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                cid = r.get("caption_id")
+                if r.get("chunk") and cid is not None and 0 <= cid < n_cap:
+                    ids[r["chunk"]] = int(cid)
+        return ids, emb
+    except Exception as e:
+        print(f"[metrics] caption embeddings unreadable "
+              f"({type(e).__name__}: {e})")
+        return {}, None
+
+
+def _chunk_key_of(val_dataset, cond_path):
+    """The key text_labels.jsonl is indexed by: the chunk's path relative to
+    conditions/, without the extension. None when it cannot be formed.
+
+    NB the sidecar is keyed by PREPROCESSING chunk, which is the unit the CLAP
+    vector belongs to. When the model's n_frames is shorter than a stored chunk,
+    several training samples come out of that chunk -- and share its caption,
+    correctly: they were conditioned on the very same vector.
+    """
+    try:
+        if cond_path is None:
+            return None
+        root = Path(val_dataset.latent_root).parent / "conditions"
+        return Path(cond_path).relative_to(root).with_suffix("").as_posix()
+    except Exception:
+        return None
+
+
+def describe_validation_sample(val_dataset, ds_idx, captions=None,
+                               phrases=None, vocab_emb=None, k=1):
     """One human-readable line for a validation sample: its CATEGORY, then the
     nearest phrases to its stored text vector, each with its cosine.
 
@@ -1570,14 +1771,30 @@ def describe_validation_sample(val_dataset, ds_idx, phrases, vocab_emb, k=2):
     cosine precisely so the two are not confused: a phrase at 0.12 is the least
     bad match in the list, not a description.
 
-    Returns "" when there is nothing to say (no vocabulary, no text condition),
-    so every caller can drop it into a string unconditionally.
+    TWO SOURCES, IN ORDER. `captions` is what preprocess_stream.py wrote for
+    every chunk of the dataset (text_labels.jsonl); when it has this sample, its
+    string is returned VERBATIM, so a panel says exactly what the dataset
+    records and how many phrases it holds was decided once, at preprocessing.
+    `phrases`/`vocab_emb` are the fallback that computes the same retrieval here
+    -- the path every dataset used before that file existed, kept so older runs
+    do not lose their captions. The two agree by construction; the fallback is
+    the slower one, because it opens the chunk's .npz.
+
+    Returns "" when there is nothing to say (no captions, no vocabulary, no text
+    condition), so every caller can drop it into a string unconditionally.
     """
     try:
         if not (0 <= ds_idx < len(val_dataset.samples)):
             return ""
         npy_path, cond_path, _start, _lab, class_name = \
             val_dataset.samples[ds_idx]
+        # The dataset's own answer, when it has one. Nothing is
+        # recomputed here, so the words under a panel are the words
+        # on disk, by construction rather than by coincidence.
+        if captions:
+            key = _chunk_key_of(val_dataset, cond_path)
+            if key is not None and key in captions:
+                return captions[key]
         if not phrases or vocab_emb is None or cond_path is None:
             return str(class_name)
         with np.load(str(cond_path)) as z:
@@ -1644,11 +1861,17 @@ def validation_panel_suffixes(val_dataset, sampling_cfg, frame_dims,
         panel_pos = list(range(n))
         indices = torch.linspace(0, total - 1, n).long().tolist()
 
-    phrases, vocab = load_text_label_vocab(val_dataset.latent_root)
+    # How many phrases a caption carries is decided ONCE, in the preprocessing
+    # (--text_labels_n), and travels with the dataset. The vocabulary is loaded
+    # only as a fallback, for datasets written before the sidecar existed.
+    captions = load_text_captions(val_dataset.latent_root)
+    phrases, vocab = ((None, None) if captions
+                      else load_text_label_vocab(val_dataset.latent_root))
     out = {}
     for k, p in enumerate(panel_pos):
         idx = indices[p] if p < len(indices) else indices[-1]
-        desc = describe_validation_sample(val_dataset, idx, phrases, vocab, k=1)
+        desc = describe_validation_sample(val_dataset, idx, captions,
+                                          phrases, vocab)
         out[k] = f" [{desc}]" if desc else ""
     cache[key] = out
     return out
@@ -1723,6 +1946,46 @@ def evaluate_and_log_metrics(
     # space as its stored condition. text -> CLAP's audio tower, image ->
     # Wav2CLIP. A global with no embedder is still USED to condition; it simply
     # gets no influence row, which is honest rather than a fabricated zero.
+    # ---- validation conditioned on the DESCRIPTION, not on the chunk ------
+    # With sampling.validation_text_from_caption the text slot of a validation
+    # generation receives the CLAP TEXT embedding of that sample's description
+    # (its class, plus the nearest phrases -- see --text_labels_n), instead of
+    # the CLAP AUDIO embedding of the chunk it was extracted from. TRAINING is
+    # untouched, and so is the validation LOSS: only the generations the metrics
+    # and the panels are built from change, which is what makes the audio-text
+    # similarity an audio-vs-TEXT number and the text influence a measure of how
+    # much a written description moves the output.
+    _cap_ids, _cap_emb = ({}, None)
+    if (sampling_cfg is not None
+            and bool(sampling_cfg.get("validation_text_from_caption", False))
+            and "text" in (global_configs or {})):
+        _cap_ids, _cap_emb = load_caption_conditions(val_dataset.latent_root)
+        if _cap_emb is None:
+            print("    [metrics] validation_text_from_caption is on but this "
+                  "dataset carries no caption embeddings -- re-run the "
+                  "preprocessing with --global text. Falling back to the "
+                  "chunk's own CLAP vector.")
+        else:
+            print(f"    [metrics] validation text conditioned on the DESCRIPTION "
+                  f"({_cap_emb.shape[0]} distinct caption(s))")
+
+    def _text_vec_for(idx, text_emb):
+        """The vector the text slot is GIVEN for validation sample `idx`.
+
+        Returned to BOTH the conditioning and the scoring target, which is why
+        one substitution here is the whole change: the similarity and the
+        influence delta measure whatever conditioned the generation."""
+        if _cap_emb is None:
+            return text_emb
+        try:
+            key = _chunk_key_of(val_dataset, val_dataset.samples[idx][1])
+            cid = _cap_ids.get(key)
+            if cid is None:
+                return text_emb
+            return torch.from_numpy(_cap_emb[cid].copy())
+        except Exception:
+            return text_emb
+
     gsim_names = sorted(c for c in (global_configs or {})
                         if (global_embedders or {}).get(c) is not None)
     text_active  = "text" in gsim_names
@@ -1795,6 +2058,7 @@ def evaluate_and_log_metrics(
             gen_rng.manual_seed(int(metrics_seed))
         for j, idx in enumerate(indices):
             frames_real, frame_cond_real, _lab, text_emb, image_emb = val_dataset[idx]
+            text_emb = _text_vec_for(idx, text_emb)
             if conditioned:
                 fc = {k: v.unsqueeze(0).to(device).float()
                       for k, v in frame_cond_real.items()
@@ -1845,6 +2109,7 @@ def evaluate_and_log_metrics(
             fcs, gcs = [], []
             for j, idx in enumerate(group, start=start):
                 frames_real, frame_cond_real, _lab, text_emb, image_emb = val_dataset[idx]
+                text_emb = _text_vec_for(idx, text_emb)
                 fcs.append(frame_cond_real)
                 gcs.append((text_emb, image_emb))
                 targets.append({k: v.cpu().numpy() for k, v in frame_cond_real.items()})
@@ -2783,6 +3048,12 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
         "val_loss":             val_loss,
         "best_val_loss":        best_val_loss,
         "model_kind":           cfg.model.kind,
+        # Architecture parameter, top-level like model_kind for the same reason:
+        # sampling_cond.py / test_cond.py rebuild the model from these fields,
+        # not from `config`, and they must rebuild the SAME state_dict layout.
+        # Absent in checkpoints written before this option existed -> those
+        # readers default it to 0, which is what those runs actually were.
+        "frame_reinject_every": int(cfg.model.get("frame_reinject_every", 0)),
         "config":               OmegaConf.to_container(cfg, resolve=True),
         "label_map":            label_map,
         "frame_cond_dims":      frame_cond_dims,
@@ -2810,6 +3081,12 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
 if __name__ == "__main__":
     cfg, run_name = load_config()
     print(f"[RUN NAME] {run_name}")
+
+    # Where the shared DAC decoder will live. Decided HERE, before anything can
+    # call get_dac(), because the decoder is a load-once singleton and is never
+    # moved afterwards. .get() keeps a config written before this option existed
+    # on the historical behaviour (CPU). See set_dac_device for the measurements.
+    set_dac_device(cfg.metrics.get("dac_device", "cpu"))
 
     # ======================
     # RUN DIRECTORY (self-contained) + CACHE DIRECTORY (shared)
@@ -3403,14 +3680,20 @@ if __name__ == "__main__":
     # resume (restored in load_config), so the model is rebuilt with the correct
     # architecture and conditioning layout automatically - no need to re-pass
     # them on the command line.
+    # frame_reinject_every: architecture parameter (it changes the state_dict),
+    # defaulted to 0 with .get() so a YAML written before this option existed
+    # keeps building exactly the model it used to.
+    FRAME_REINJECT_EVERY = int(cfg.model.get("frame_reinject_every", 0))
     print(f"[MODEL] Building ConditionedAudioDiT-{cfg.model.kind} "
-          f"| frame={list(FRAME_COND_DIMS)} | global={list(GLOBAL_CONFIGS)}")
+          f"| frame={list(FRAME_COND_DIMS)} | global={list(GLOBAL_CONFIGS)} "
+          f"| frame_reinject_every={FRAME_REINJECT_EVERY}")
     model = ConditionedAudioDiT(
         kind=cfg.model.kind,
         drop=cfg.model.get("drop", 0.0),
         frame_cond_dims=FRAME_COND_DIMS,
         frame_cond_out_dims=FRAME_COND_OUT_DIMS,
         global_cond_configs=GLOBAL_CONFIGS,
+        frame_reinject_every=FRAME_REINJECT_EVERY,
     ).to(device)
     # EMA is optional, controlled by cfg.training.use_ema. When disabled,
     # validation/audio/metrics use the live model directly (no shadow copy).
@@ -3510,6 +3793,35 @@ if __name__ == "__main__":
                 f"checkpoint; if you passed model.kind on the command line, "
                 f"remove it or set it to '{ckpt_kind}'.)"
             )
+        # Same class of mismatch as `kind`: the re-injection adds one tensor per
+        # selected block to the state_dict, so a checkpoint trained without it
+        # simply has no weights to put there (and one trained WITH it has
+        # weights with nowhere to go). Caught here with an explanation instead
+        # of as a wall of "Missing key(s) in state_dict: frame_reinject.1...".
+        # Checkpoints written before this option existed have no such key ->
+        # default 0, which is exactly what they were trained as.
+        ckpt_reinject = int(ckpt.get("frame_reinject_every", 0))
+        if ckpt_reinject != FRAME_REINJECT_EVERY:
+            raise RuntimeError(
+                f"Checkpoint was trained with model.frame_reinject_every="
+                f"{ckpt_reinject} but the model was built with "
+                f"{FRAME_REINJECT_EVERY}. They must match to resume: the "
+                f"per-block frame re-injection changes the weights themselves, "
+                f"not just a training setting. (Normally the value is restored "
+                f"automatically from the checkpoint config; if you passed "
+                f"model.frame_reinject_every on the command line, remove it or "
+                f"set it to {ckpt_reinject}. To START a NEW run with a "
+                f"different value, do not use --resume: this is a different "
+                f"architecture and needs its own run.)"
+            )
+        # ...and the same check one level finer: `frame_reinject_every`
+        # matching is no longer enough to pin the state_dict down, because a
+        # run trained with re-injection BEFORE the per-condition gate existed
+        # has the projections and none of the gate tensors. That passes every
+        # test above and then dies inside load_state_dict as a raw wall of
+        # missing keys, so it is named here instead.
+        check_ckpt_reinject_gate(ckpt, cfg.paths.resume_from)
+
         ckpt_frame_dims = ckpt.get("frame_cond_dims", None)
         if ckpt_frame_dims is not None and dict(ckpt_frame_dims) != dict(FRAME_COND_DIMS):
             raise RuntimeError(
@@ -3597,6 +3909,10 @@ if __name__ == "__main__":
               f"{fd_dac_ref_stats['n_total']} reference frames")
     else:
         print("Metrics: distributional metrics DISABLED (metrics.enabled: [])")
+    print(f"DAC decoder device: {_DAC_DEVICE}"
+          + ("  (~2.5 s per 5 s clip; 'cuda' is ~13x faster but adds a ~1 GB "
+             "peak at the metrics step)" if _DAC_DEVICE == "cpu" else
+             "  (~0.2 s per 5 s clip; ~1 GB peak at the metrics step)"))
     # .get: a config written before per-condition dropout existed stays valid
     # and keeps its exact previous behaviour (0.0 disables stage 2).
     P_DROP_EACH_FRAME = float(cfg.conditioning.get("p_drop_each_frame", 0.0))
@@ -3606,6 +3922,9 @@ if __name__ == "__main__":
           f"each_frame={P_DROP_EACH_FRAME}"
           + ("  (partial subsets ON)" if P_DROP_EACH_FRAME > 0 else ""))
     print(f"CFG guidance scale (validation): {cfg.conditioning.guidance_scale}")
+    _reinj_txt = (f"every {FRAME_REINJECT_EVERY} block(s)"
+                  if FRAME_REINJECT_EVERY > 0 else "OFF (input concat only)")
+    print(f"Frame re-injection (per block): {_reinj_txt}")
     print(f"DATASET_ROOT:   {cfg.paths.dataset_root}")
     print(f"WAV_ROOT:       {cfg.paths.wav_root}")
     print(f"CONDITION_ROOT: {cfg.paths.condition_root}")
