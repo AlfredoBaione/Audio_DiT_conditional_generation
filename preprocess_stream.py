@@ -1613,7 +1613,7 @@ class DACEncoder:
 # A global condition is per-chunk exactly when its extractor exposes
 # encode_audio(); nothing here holds a list of names, so a condition added to
 # conditions.py later lands on the correct side by itself. It is also what lets
-# the two kinds compose freely: --conditions and --global only SELECT names,
+# the two kinds compose freely: --conditions and --global_conds only SELECT
 # and each name then flows down whichever path its extractor implies. Asking
 # for frame conditions alone, globals alone, or any subset of both is therefore
 # not a special case anywhere below -- it is the same code with a shorter list.
@@ -1850,6 +1850,8 @@ def write_text_label_vocab(registry, out_root: Path, vocab_path: Optional[str],
 TEXT_LABELS_JSONL = "text_labels.jsonl"
 TEXT_LABELS_COS = "text_labels_cos.npy"
 TEXT_LABELS_EMB = "text_labels_emb.npy"
+TEXT_LABELS_TOK = "text_labels_tok.npy"
+TEXT_LABELS_TOKLEN = "text_labels_tok_len.npy"
 TEXT_LABELS_META = "text_labels.json"
 
 
@@ -1981,11 +1983,32 @@ def write_text_labels(out_root: Path, cond_root: Path, n_terms: int = 2,
             # rows written: a chunk without a text vector produces no row, so
             # comparing rows would make an incomplete dataset rebuild the
             # sidecar on every single run.
+            # The fingerprint says the INPUTS are unchanged. It says nothing
+            # about the OUTPUTS, and this function has grown new ones: a sidecar
+            # written before the caption embeddings, or before the token
+            # sequences, has a matching fingerprint and is still missing the
+            # files a run needs. Without this the only way to get them would be
+            # a global --force (which re-encodes every latent) or an unrelated
+            # change to n_terms, and the user would be told "already current"
+            # by a function that had just decided not to produce what they came
+            # for.
+            wants = []
+            if text_extractor is not None:
+                wants.append(d / TEXT_LABELS_EMB)
+                if hasattr(text_extractor, "encode_tokens"):
+                    wants += [d / TEXT_LABELS_TOK, d / TEXT_LABELS_TOKLEN]
+            absent = [p.name for p in wants if not p.exists()]
             if (old.get("fingerprint") == fp
-                    and int(old.get("n_npz", -1)) == len(files)):
+                    and int(old.get("n_npz", -1)) == len(files)
+                    and not absent):
                 print(f"[global/text] per-chunk labels already current "
                       f"({old.get('n_chunks')} chunks, {n_terms} term(s))")
                 return int(old.get("n_chunks", 0))
+            if absent and old.get("fingerprint") == fp:
+                print(f"[global/text] labels are current but {', '.join(absent)} "
+                      f"{'is' if len(absent) == 1 else 'are'} missing -> "
+                      f"rewriting the sidecar (no audio is read, no latent is "
+                      f"re-encoded)")
         except Exception:
             pass          # unreadable -> rebuild
 
@@ -2036,15 +2059,26 @@ def write_text_labels(out_root: Path, cond_root: Path, n_terms: int = 2,
     # class the folder, the split and the panels talk about, and a rule clever
     # enough to do it would also be clever enough to be wrong in silence.
     # How well the resulting vectors separate is measured and printed below.
+    # DISTINCT ON THE ENCODED STRING, not on the human one. The two differ by
+    # the cosines: `drum · "electronic dance music" (+0.54)` and the same phrase
+    # at (+0.53) are two different HUMAN captions and one single input to CLAP,
+    # so keying the table on the human string stored the identical vector twice
+    # -- and, since the token sequences arrived, the identical (L, 768) matrix
+    # twice as well. Measured 14 Sept 2026 on 20 chunks: 15 rows keyed the old
+    # way, 6 keyed this way, and the embeddings of the collapsed rows were
+    # bit-identical. The per-chunk `caption` in the .jsonl is untouched, so a
+    # panel still prints that chunk's own cosines.
     captions, captions_text, caption_id = [], [], {}
     for r in rows:
-        c = r["caption"]
-        if c not in caption_id:
-            caption_id[c] = len(captions)
-            captions.append(c)
-            captions_text.append(
-                format_text_caption(r["class"], r["phrases"], quote=False))
-        r["caption_id"] = caption_id[c]
+        enc = format_text_caption(r["class"], r["phrases"], quote=False)
+        if enc not in caption_id:
+            caption_id[enc] = len(captions_text)
+            captions_text.append(enc)
+            # The human string of the FIRST chunk that produced this encoding,
+            # kept parallel to captions_text so every reader that checks one
+            # length against the other keeps working.
+            captions.append(r["caption"])
+        r["caption_id"] = caption_id[enc]
     cap_emb = None
     if text_extractor is not None:
         try:
@@ -2062,6 +2096,33 @@ def write_text_labels(out_root: Path, cond_root: Path, n_terms: int = 2,
                   f"nothing to read.")
             cap_emb = None
 
+    # ---- the same captions as TOKEN SEQUENCES, for the cross-attention -----
+    # A second encoding of the SAME strings, and the two are not redundant: the
+    # pooled vector above is one point of the shared audio-text space and is
+    # what the AdaLN slot takes, while these are the text tower's per-token
+    # states and are what a cross-attention can actually attend over. One
+    # vector cannot be attended to -- an attention with a single key is a
+    # learned bias -- so the model needs both or neither.
+    #
+    # Distinct captions again, padded to the longest, with the true lengths
+    # beside them: a token of padding that reaches K and V is a token the model
+    # reads as a word. float16 like the cosine table, and for the same reason --
+    # these are inputs to a Linear, not accumulators, and the file is small
+    # enough to keep in full rather than storing a per-chunk copy.
+    cap_tok = cap_len = None
+    if text_extractor is not None and hasattr(text_extractor, "encode_tokens"):
+        try:
+            cap_tok, cap_len = text_extractor.encode_tokens(captions_text)
+            if cap_tok.ndim != 3 or cap_tok.shape[0] != len(captions):
+                raise ValueError(f"encode_tokens returned {cap_tok.shape} for "
+                                 f"{len(captions)} caption(s)")
+        except Exception as e:
+            print(f"[global/text] caption TOKEN sequences NOT written "
+                  f"({type(e).__name__}: {e}). A run with "
+                  f"model.text_cross_every > 0 will refuse to start on this "
+                  f"dataset; everything else is unaffected.")
+            cap_tok = cap_len = None
+
     d.mkdir(parents=True, exist_ok=True)
     tmp = jsonl_p.with_suffix(".jsonl.tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
@@ -2078,6 +2139,18 @@ def write_text_labels(out_root: Path, cond_root: Path, n_terms: int = 2,
             (d / TEXT_LABELS_EMB).unlink()
         except FileNotFoundError:
             pass
+    if cap_tok is not None:
+        _atomic_save_npy(d / TEXT_LABELS_TOK, cap_tok.astype(np.float16))
+        _atomic_save_npy(d / TEXT_LABELS_TOKLEN, cap_len.astype(np.int32))
+    else:
+        # Same rule, and it matters more here: a stale token table would feed
+        # the cross-attention the words of a vocabulary that no longer exists,
+        # and nothing downstream could tell.
+        for stale in (TEXT_LABELS_TOK, TEXT_LABELS_TOKLEN):
+            try:
+                (d / stale).unlink()
+            except FileNotFoundError:
+                pass
     _atomic_write_json(meta_p, {
         "fingerprint": fp, "n_chunks": len(rows), "n_npz": len(files),
         "n_terms": n_terms,
@@ -2086,6 +2159,9 @@ def write_text_labels(out_root: Path, cond_root: Path, n_terms: int = 2,
         "captions": captions,
         "captions_text": captions_text,
         "caption_emb": bool(cap_emb is not None),
+        "caption_tokens": bool(cap_tok is not None),
+        "caption_tok_dim": int(cap_tok.shape[2]) if cap_tok is not None else 0,
+        "caption_tok_max_len": int(cap_tok.shape[1]) if cap_tok is not None else 0,
         "cos_dtype": "float16",
         "note": ("Row i of text_labels_cos.npy is line i of text_labels.jsonl. "
                  "The phrases are a closed-vocabulary retrieval over the stored "
@@ -2100,6 +2176,12 @@ def write_text_labels(out_root: Path, cond_root: Path, n_terms: int = 2,
     print(f"[global/text] {len(captions)} distinct caption(s)"
           + (f", CLAP-text encoded -> {TEXT_LABELS_EMB}" if cap_emb is not None
              else ", NOT encoded (no text extractor)"))
+    if cap_tok is not None:
+        print(f"[global/text] caption token sequences: "
+              f"{cap_tok.shape[0]} x {cap_tok.shape[1]} token(s) x "
+              f"{cap_tok.shape[2]} -> {TEXT_LABELS_TOK} "
+              f"(lengths {cap_len.min()}..{cap_len.max()}, float16). "
+              f"This is what model.text_cross_every reads.")
     if cap_emb is not None:
         # The spread of the conditioning vectors IS the signal the text slot can
         # carry at validation. Two captions at 0.97 cannot be told apart by the
@@ -3001,7 +3083,14 @@ def build_parser():
     parser.add_argument("--conditions", type=str, default=None,
                         help="Comma-separated frame conditions to extract, e.g. "
                              "'f0' or 'f0,energy'. None = skip conditions.")
-    parser.add_argument("--global", dest="global_conds", type=str, default=None,
+    # TWO SPELLINGS, one dest. `--global_conds` is the primary one because it
+    # matches the YAML key, which is the rule every other option in this parser
+    # follows: a config file key IS the long flag without its dashes, and one
+    # option that broke the rule was one option you had to remember. `--global`
+    # stays as an alias -- it is in commands that are already written down, and
+    # silently removing it would turn them into "unrecognized arguments".
+    parser.add_argument("--global_conds", "--global", dest="global_conds",
+                        type=str, default=None,
                         help="Comma-separated global conditions to extract "
                              "('text' and/or 'image'). Independent of "
                              "--conditions: either flag can be used alone, "
@@ -3022,7 +3111,7 @@ def build_parser():
                              "shown with its cosine, not a translation. "
                              "Changing it never re-touches the audio.")
     parser.add_argument("--image_root", type=str, default=None,
-                        help="image_root/<class>/*.jpg for --global image. The "
+                        help="image_root/<class>/*.jpg for --global_conds image. The "
                              "class folder names must match the source audio's "
                              "class folders. EVERY image of a class is encoded: "
                              "the training draws one at random per epoch.")
@@ -3053,7 +3142,7 @@ def build_parser():
                              "2 = class + the nearest vocabulary phrase, 3 = "
                              "class + the two nearest. Written for EVERY chunk "
                              "into global_conditions/text_labels.jsonl (with "
-                             "--global text), together with the full cosine "
+                             "--global_conds text), together with the full cosine "
                              "table, so another N can be re-derived later "
                              "without re-reading a single .npz.")
 

@@ -30,6 +30,7 @@ from audio_dataset_npy import (
 )
 from network_cond import (ConditionedAudioDiT, TOKEN_DIM,
                           ckpt_frame_reinject_every,
+                          ckpt_text_cross_every, ckpt_text_ctx_dim,
                           check_ckpt_reinject_gate)
 from conditions import (
     ConditionRegistry,
@@ -49,11 +50,17 @@ def euler_sampling_cfg(
     guidance=3.0, steps=50,
     frame_dims=None, global_configs=None,
     x_start=None, t_start=0.0,
-    use_amp=True,
+    use_amp=True, text_ctx=None,
 ):
     """
     Euler sampling con CFG.
     x_start + t_start: for editing (partial corruption).
+
+    `text_ctx` is {"tokens": (1, L, d), "mask": (1, L)} -- the PROMPT as a
+    token sequence, for a model with a cross-attention. The null branch always
+    passes None, which the model resolves to its learned null token: the same
+    value the training dropout showed it, and therefore the only one guidance
+    can meaningfully extrapolate away from.
     """
     model.eval()
 
@@ -66,6 +73,11 @@ def euler_sampling_cfg(
     null_fc = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
     null_gc = make_null_global_conditions(1, global_configs or {}, device)
 
+    ctx = ctx_mask = None
+    if getattr(model, "text_cross_layers", None) and text_ctx is not None:
+        ctx = text_ctx["tokens"].to(device)
+        ctx_mask = text_ctx["mask"].to(device)
+
     # Clamp into [T_MIN, T_MAX]: a t_start above T_MAX would make dt negative and
     # walk the integration backwards. The edit path already short-circuits
     # strength=0, so this is a guard for any other caller.
@@ -77,17 +89,21 @@ def euler_sampling_cfg(
         t = torch.ones(1, device=device) * tv
 
         with torch.amp.autocast('cuda', enabled=use_amp):
-            has_cond = (frame_cond is not None) or (global_cond is not None)
+            has_cond = ((frame_cond is not None) or (global_cond is not None)
+                        or (ctx is not None))
             if guidance > 1.0 and has_cond:
                 fc = frame_cond if frame_cond else null_fc
                 gc = global_cond if global_cond else null_gc
-                v_c = model(x, t, frame_conditions=fc, global_conditions=gc)
-                v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc)
+                v_c = model(x, t, frame_conditions=fc, global_conditions=gc,
+                            text_context=ctx, text_context_mask=ctx_mask)
+                v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc,
+                            text_context=None)
                 v = v_u + guidance * (v_c - v_u)
             else:
                 v = model(x, t,
                           frame_conditions=frame_cond or null_fc,
-                          global_conditions=global_cond or null_gc)
+                          global_conditions=global_cond or null_gc,
+                          text_context=ctx, text_context_mask=ctx_mask)
         x = x + v.float() * dt
 
     return x[0].cpu()
@@ -99,7 +115,7 @@ def edit_audio(
     frame_cond_builder=None, global_cond=None,
     edit_strength=0.3, guidance=3.0, steps=50,
     frame_dims=None, global_configs=None,
-    use_amp=True,
+    use_amp=True, text_ctx=None,
 ):
     """
     Editing: real audio -> partial corruption -> reconstruction.
@@ -174,7 +190,7 @@ def edit_audio(
             guidance=guidance, steps=steps,
             frame_dims=frame_dims, global_configs=global_configs,
             x_start=x_corrupted, t_start=t_start,
-            use_amp=use_amp,
+            use_amp=use_amp, text_ctx=text_ctx,
         )
 
     # Decode (72-dim latents -> quantizer.from_latents -> 1024-dim z -> waveform)
@@ -189,7 +205,7 @@ def edit_audio(
 
 
 def build_global_cond(
-    label_name, ckpt, device, image_path=None, prompt=None,
+    label_name, ckpt, device, image_path=None, prompt=None, ctx_out=None,
 ) -> Dict[str, torch.Tensor]:
     """
     Builds the global_cond dictionary for a class or for a free-form prompt.
@@ -202,11 +218,16 @@ def build_global_cond(
         image_path: optional path to a conditioning image
         prompt:     free-form text for CLAP. If passed, it OVERRIDES label_name
                     as the source of the text embedding (e.g. "slow piano in C minor").
+        ctx_out:    optional dict, filled with {"text": {"tokens", "mask"}} --
+                    the same prompt as a token sequence, for a checkpoint with
+                    a cross-attention. An out-parameter rather than a second
+                    return value so every existing caller keeps working.
 
     For the model the "class" is no longer a direct input: all the semantic
     signal flows through CLAP-text and/or CLIP-image.
     """
     gc = {}
+    ctx_out = {} if ctx_out is None else ctx_out
     global_configs = ckpt.get("global_configs", {})
 
     # Text (CLAP): free-form prompt if passed, otherwise derived from the label
@@ -222,8 +243,20 @@ def build_global_cond(
             text_enc = CLAPTextCondition()
             emb = text_enc.encode_text(text_input)
             gc["text"] = torch.from_numpy(emb).unsqueeze(0).to(device)
+            # The SAME prompt as a token sequence, for a checkpoint whose
+            # blocks have a cross-attention. Built here, beside the pooled
+            # vector, because the two are two views of one condition: encoding
+            # them in different places is how they end up describing different
+            # prompts. Costs one extra forward of the text tower, which is
+            # already loaded.
+            tok, tlen = text_enc.encode_tokens([text_input])
+            m = torch.zeros(1, tok.shape[1], dtype=torch.bool)
+            m[0, :int(tlen[0])] = True
+            ctx_out["text"] = {"tokens": torch.from_numpy(tok).to(device),
+                               "mask": m.to(device)}
             text_enc.unload()
-            print(f"  [CLAP-text] prompt: {text_input!r}")
+            print(f"  [CLAP-text] prompt: {text_input!r} "
+                  f"({int(tlen[0])} token(s))")
 
     # Image (CLIP): se passata
     if "image" in global_configs and image_path:
@@ -438,12 +471,20 @@ def main():
     frame_reinject_every = ckpt_frame_reinject_every(ckpt)
     check_ckpt_reinject_gate(ckpt, args.checkpoint)
 
+    # The cross-attention, same contract: read the stride off the checkpoint
+    # and the CONTEXT WIDTH off the weights themselves, which is the only
+    # source that cannot disagree with the tensors being loaded.
+    text_cross_every = ckpt_text_cross_every(ckpt)
+    text_ctx_dim = ckpt_text_ctx_dim(ckpt)
+
     model = ConditionedAudioDiT(
         kind=ckpt.get("model_kind", "L"),
         frame_cond_dims=frame_cond_dims,
         frame_cond_out_dims=frame_cond_out_dims,
         global_cond_configs=global_configs_ckpt,
         frame_reinject_every=frame_reinject_every,
+        text_cross_every=text_cross_every,
+        text_ctx_dim=text_ctx_dim,
     ).to(device)
 
     # Prefer the EMA weights, but ONLY if the shadow was actually being updated
@@ -467,10 +508,12 @@ def main():
     normalizer.load(norm_path)
 
     # Global conditions
+    text_ctx_out = {}
     gc = build_global_cond(
         args.label, ckpt, device,
-        image_path=args.image, prompt=args.prompt,
+        image_path=args.image, prompt=args.prompt, ctx_out=text_ctx_out,
     )
+    prompt_ctx = text_ctx_out.get("text")
 
     frame_dims = frame_cond_dims
     global_configs = global_configs_ckpt
@@ -578,6 +621,7 @@ def main():
                 global_cond=gc if gc else None,
                 guidance=args.guidance, steps=args.steps,
                 frame_dims=frame_dims, global_configs=global_configs,
+                text_ctx=prompt_ctx,
             )
             # The DAC decode must run under no_grad. euler_sampling_cfg is
             # decorated, so `gen` comes back detached, but the quantizer and the
@@ -617,6 +661,7 @@ def main():
             edit_strength=args.strength, guidance=args.guidance,
             steps=args.steps,
             frame_dims=frame_dims, global_configs=global_configs,
+            text_ctx=prompt_ctx,
         )
         tag = _out_tag("edited")
         p = os.path.join(args.output, f"edit_{tag}.wav")

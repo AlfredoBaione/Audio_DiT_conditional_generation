@@ -23,6 +23,14 @@
 #   --guidance overrides cfg.conditioning.guidance_scale
 #   --seed     reproducible generation (seeds python/numpy/torch and the
 #              per-generation noise via a dedicated Generator)
+#   --metrics_samples N | all
+#              ALSO compute the metrics on the test set -- FD-DAC, KL (both
+#              directions), FAD-VGGish (those listed in metrics.enabled) and
+#              the condition-influence table -- over N test samples spread
+#              over the whole split, or over every one of them with 'all'.
+#              Off by default. See run_test_metrics for what is computed and
+#              how; --n_samples then only says how many of those generations
+#              are also saved as WAV / logged as audio to listen to.
 #
 # Frame-level conditions (pitch, chroma) are always taken from the test
 # sample they belong to (no global override makes physical sense for
@@ -35,11 +43,22 @@
 #   python test_cond.py --ckpt path/to/ckpt.pt --n_samples 16 --steps 100 \
 #       --prompt "slow piano in C minor"
 #   python test_cond.py --ckpt path/to/ckpt.pt --image path/to/cover.jpg
+#   python test_cond.py --ckpt path/to/ckpt.pt --metrics_samples all
+#   python test_cond.py --ckpt path/to/ckpt.pt --metrics_samples 256 \
+#       metrics.fad_reference=decoded
+# On an IRCAM GPU server, through the test's own GPU-lock wrapper (same
+# arguments, passed through unchanged):
+#   python launch_test_cond.py --ckpt path/to/ckpt.pt --metrics_samples all
 #
 # Outputs:
 #   - WAV files in runs/<run_name>/test_outputs/
 #   - TensorBoard logs in runs/<run_name>/test_logs/
 #     (visible alongside the training logs of the same run)
+#   - with --metrics_samples: the numbers also in
+#     runs/<run_name>/test_outputs/metrics_<checkpoint>_<N|all>.json, and on
+#     TensorBoard as Test/Metrics/* scalars + the Test/Condition_influence
+#     table, at the checkpoint's training step (so several checkpoints of one
+#     run line up as a curve)
 
 import os
 os.environ.setdefault("USE_TF", "0")   # transformers -> PyTorch backend (no TF)
@@ -71,6 +90,7 @@ from audio_dataset_npy import (
 from audio_dataset_cond import ConditionedAudioDataset, load_source_split
 from network_cond import (ConditionedAudioDiT, TOKEN_DIM,
                           ckpt_frame_reinject_every,
+                          ckpt_text_cross_every, ckpt_text_ctx_dim,
                           check_ckpt_reinject_gate)
 from conditions import (
     ConditionRegistry,
@@ -150,6 +170,15 @@ def load_config():
                              "test set (zero-fill them). Off by default so the "
                              "evaluation cannot silently score NULL-conditioned "
                              "generations as if they were conditioned (report #12).")
+    parser.add_argument("--metrics_samples", type=str, default=None,
+                        metavar="N|all",
+                        help="Also compute the metrics on the TEST set: FD-DAC, "
+                             "KL, FAD-VGGish (those in metrics.enabled) and the "
+                             "condition-influence table, over N test samples "
+                             "spread over the whole split, or 'all' of them. "
+                             "Off by default (generation for listening only). "
+                             "--n_samples then says how many of the scored "
+                             "generations are also saved / logged as audio.")
     args, unknown = parser.parse_known_args()
 
     # ---- Base config from the external YAML (now OPTIONAL) ----
@@ -234,7 +263,8 @@ def load_config():
 @torch.no_grad()
 def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
                       frame_cond, global_cond, guidance,
-                      frame_dims, global_configs, gen_rng=None):
+                      frame_dims, global_configs, gen_rng=None,
+                      text_ctx=None):
     """
     Euler integrator with classifier-free guidance.
     Both `frame_cond` and `global_cond` are expected as batch=1 dicts on device.
@@ -254,7 +284,12 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
     # NB: test the CONTENT, not `is not None`: with every condition disabled the
     # caller passes empty dicts ({}), which are "no conditioning" -- treating them
     # as present would engage CFG and burn two IDENTICAL forwards per step.
-    has_cond = bool(frame_cond) or bool(global_cond)
+    ctx = ctx_mask = None
+    if getattr(model, "text_cross_layers", None) and text_ctx is not None:
+        ctx = text_ctx["tokens"].to(device)
+        ctx_mask = text_ctx["mask"].to(device)
+
+    has_cond = bool(frame_cond) or bool(global_cond) or (ctx is not None)
     use_cfg = (guidance > 1.0) and has_cond
 
     for i in range(steps):
@@ -264,16 +299,458 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
             if use_cfg:
                 fc = frame_cond if frame_cond else null_fc
                 gc = global_cond if global_cond else null_gc
-                v_c = model(x, t, frame_conditions=fc,      global_conditions=gc)
-                v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc)
+                v_c = model(x, t, frame_conditions=fc,      global_conditions=gc,
+                            text_context=ctx, text_context_mask=ctx_mask)
+                v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc,
+                            text_context=None)
                 v = v_u + guidance * (v_c - v_u)
             else:
                 v = model(x, t,
                           frame_conditions=frame_cond or null_fc,
-                          global_conditions=global_cond or null_gc)
+                          global_conditions=global_cond or null_gc,
+                          text_context=ctx, text_context_mask=ctx_mask)
         x = x + v.float() * dt
 
     return x[0].cpu()
+
+
+# ============================================================
+# TEST-SET METRICS  (--metrics_samples)
+# ============================================================
+def parse_metrics_samples(value):
+    """--metrics_samples -> None (off), 'all', or a positive int."""
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if v == "all":
+        return "all"
+    try:
+        n = int(v)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        raise SystemExit(f"[test_cond] --metrics_samples must be a positive "
+                         f"number or 'all', got {value!r}.")
+    return n
+
+
+@torch.no_grad()
+def run_test_metrics(tc, model, normalizer, test_dataset, cfg, args, device,
+                     frame_dims, global_configs, registry, writer, output_dir,
+                     idx_to_label, n_metrics, ckpt_step, weights):
+    """
+    Generate the scored test samples ONCE and compute on them every metric the
+    training computes on the validation set -- the same definitions, on the
+    held-out split:
+
+      FD-DAC, KL (both directions)  latent-only, against the REAL TEST latents,
+                                    all of them (the validation reference is
+                                    the whole val split in the same way);
+      FAD-VGGish                    decode + VGGish, against the real TEST audio:
+                                    metrics.fad_reference 'wav' -> the test wavs
+                                    on disk, 'decoded' -> the test latents
+                                    through DAC;
+      condition influence           each sample is generated WITH its conditions
+                                    and WITHOUT, from the same noise (the fused
+                                    CFG sampler hands the second one over nearly
+                                    for free); each condition is re-extracted
+                                    from both and Δ = with-cond - without, paired
+                                    sample by sample, scored with
+                                    metrics.influence_family.
+
+    Everything that decides HOW -- which metrics (metrics.enabled), whether the
+    no-condition generations are also scored distributionally
+    (sampling.metrics_uncond), the noise seed (metrics.seed, or --seed), the
+    influence family and threshold, guidance, Euler steps, how the text slot is
+    filled (conditioning.text_source + sampling.validation_text_from_caption)
+    -- comes from the checkpoint's config, and CLI dotlist overrides still win.
+    A test number is therefore the twin of the validation curve of the run.
+
+    The references are computed here, on the test split, every time: they are
+    cheap next to the generation, and nothing is written into the shared
+    cache_dir, whose files are tied to the training's own splits.
+
+    STREAMED: each generation is decoded ONCE and serves all the metrics that
+    need audio (re-extraction, CLAP/Wav2CLIP, VGGish); the waveform is then
+    dropped. Only the latents (for FD-DAC/KL, ~0.12 MB each) and the listening
+    clips stay. Memory is flat in the number of samples; the cost is time, and
+    the time is the generation.
+    """
+    import json
+    import time
+    from tqdm import tqdm
+    from condition_metrics import (ConditionFidelityEvaluator, pair_influence,
+                                   pair_scalar, format_influence_panel,
+                                   format_influence_legend)
+    from metrics import (precompute_latent_reference, compute_dac_metrics,
+                         precompute_audio_reference, compute_audio_mu_sigma,
+                         compute_mu_sigma, compute_fad, COND_METRICS)
+
+    frame_dims = frame_dims or {}
+    global_configs = global_configs or {}
+    mcfg = cfg.get("metrics", None) or {}
+    enabled = list(mcfg.get("enabled", list(COND_METRICS)) or [])
+    _unknown = [m for m in enabled if m not in COND_METRICS]
+    if _unknown:
+        raise SystemExit(f"[test_cond] metrics.enabled contains {_unknown}; "
+                         f"available here: {list(COND_METRICS)}.")
+
+    total = len(test_dataset)
+    n_scored = total if n_metrics == "all" else min(int(n_metrics), total)
+    # Spread over the WHOLE split (same rule as the listening path): a prefix
+    # would describe the first classes/sources of the list, not the test set.
+    indices = (list(range(total)) if n_scored == total else
+               torch.linspace(0, total - 1, n_scored).long().tolist())
+    n_listen = min(int(args.n_samples), n_scored)
+    listen_pos = sorted(set(
+        torch.linspace(0, n_scored - 1, n_listen).long().tolist())) if n_listen else []
+
+    n_frames = test_dataset.n_frames
+    steps = int(cfg.sampling.euler_steps)
+    t_min, t_max = float(cfg.sampling.t_min), float(cfg.sampling.t_max)
+    guidance = float(cfg.conditioning.guidance_scale)
+    use_amp = bool(cfg.training.use_amp)
+    spf = int(cfg.sampling.get("metrics_samples_per_forward", 1))
+    compute_uncond = bool(cfg.sampling.get("metrics_uncond", False))
+    seed = args.seed if args.seed is not None else mcfg.get("seed", 0)
+    family = str(mcfg.get("influence_family", "influence_metrics"))
+    mir_threshold = float(mcfg.get("mir_threshold", 0.5))
+    any_cond = bool(frame_dims) or bool(global_configs)
+    # Fused: B samples per forward, batch 3B, with-cond AND without from one x0.
+    # The serial path (spf=0, or no CFG to fuse) makes the "without" with a
+    # second generator on the same seed, as the training does.
+    paired = spf >= 1 and guidance > 1.0 and any_cond
+    group = max(1, spf) if paired else 1
+
+    def _dev(key, fallback="cuda"):
+        d = str(mcfg.get(key, fallback))
+        return "cpu" if d.startswith("cuda") and not torch.cuda.is_available() else d
+    fid_device, fad_device = _dev("fidelity_device"), _dev("fad_device")
+
+    def decode(frames):
+        """(n_frames, 72) normalized latent -> 1-D waveform on CPU. The test's
+        own decoder, for the generations AND a 'decoded' FAD reference alike."""
+        z = normalizer.denormalize(frames.T)
+        return decode_latents(z, device=device).reshape(-1).float().cpu()
+
+    print(f"\n[test_cond] === TEST-SET METRICS on {n_scored}/{total} samples "
+          f"({weights} weights, step {ckpt_step}) ===")
+    print(f"[test_cond] metrics: {enabled or '(no distributional metric)'} | "
+          f"influence: {family if frame_dims else '-'}"
+          f"{' + ' + '/'.join(sorted(global_configs)) if global_configs else ''}"
+          f" | guidance={guidance} | {steps} Euler steps | seed={seed} | "
+          f"{'fused, ' + str(group) + ' sample(s) per forward' if paired else 'serial sampler'}")
+
+    # ---------------- references: the TEST split ----------------
+    lat_root = Path(cfg.paths.dataset_root)
+    dac_ref = None
+    if "fd_dac" in enabled or "kl_dac" in enabled:
+        dac_ref = precompute_latent_reference(
+            tc.MetricsAdapter(test_dataset), cache_path=None, device=device)
+
+    fad_emb = fad_ref = None
+    fad_mode = str(mcfg.get("fad_reference", "wav"))
+    if "fad_vggish" in enabled:
+        from metrics import VGGishEmbedder
+        fad_emb = VGGishEmbedder(device=fad_device)
+        # One reference clip per test CHUNK, from the split's own file list
+        # (never a glob of wav/, which holds every split together).
+        _npy = sorted({str(s[0]) for s in test_dataset.samples})
+        if fad_mode == "wav":
+            _wav_root = Path(cfg.paths.wav_root)
+            _wavs = [_wav_root / Path(f).relative_to(lat_root).with_suffix(".wav")
+                     for f in _npy]
+            _missing = [w for w in _wavs if not w.exists()]
+            if _missing:
+                raise SystemExit(
+                    f"[test_cond] FAD-VGGish with metrics.fad_reference='wav' "
+                    f"needs the real TEST wavs, but {len(_missing)}/{len(_wavs)} "
+                    f"are missing under {_wav_root} (first: {_missing[0]}).\n"
+                    f"  Either add them -- re-run preprocess_stream.py on the "
+                    f"same output dir with --save_wav test (it does NOT "
+                    f"re-encode the latents) -- or run this test with "
+                    f"metrics.fad_reference=decoded, which decodes the real test "
+                    f"latents through DAC instead (not comparable with published "
+                    f"FAD values).")
+            fad_ref = precompute_audio_reference(_wavs, fad_emb, cache_path=None,
+                                                 device=fad_device)
+        elif fad_mode == "decoded":
+            def _real_clips():
+                for i in range(total):
+                    yield decode(test_dataset[i][0]).view(1, 1, -1), DAC_SAMPLE_RATE
+            _mu, _sig, _n = compute_audio_mu_sigma(
+                _real_clips(), total, fad_emb, device=fad_device,
+                desc="FAD ref (test, decoded)")
+            fad_ref = {"mu": _mu.cpu(), "sigma": _sig.cpu(), "n_total": _n}
+        else:
+            raise SystemExit(
+                f"[test_cond] metrics.fad_reference='{fad_mode}' is not valid: "
+                f"'wav' (real test wavs) or 'decoded' (test latents via DAC).")
+
+    # ---------------- influence: scorers ----------------
+    ev_c = ev_n = None
+    if frame_dims:
+        def _evaluator():
+            return ConditionFidelityEvaluator(
+                enabled_frame=list(frame_dims), device=fid_device,
+                registry=registry, family=family, mir_threshold=mir_threshold)
+        # Two, one per pass: with-cond and without are scored in the same loop,
+        # and each evaluator keeps its own per-sample values to pair afterwards.
+        ev_c, ev_n = _evaluator(), _evaluator()
+        for _name in ev_c.extractors:
+            print(f"[test_cond] influence {_name}: {ev_c.families[_name]}")
+    gemb = {}
+    if "text" in global_configs:
+        from conditions import ClapAudioEmbedder, CONDITION_CONFIG
+        gemb["text"] = ClapAudioEmbedder(
+            model_name=CONDITION_CONFIG["global"]["text"]["kwargs"].get(
+                "model_name", "laion/clap-htsat-unfused"),
+            device=fid_device)
+    if "image" in global_configs:
+        try:
+            from conditions import Wav2ClipAudioEmbedder
+            _w2c = Wav2ClipAudioEmbedder(device=fid_device)
+            _w2c._load()
+            gemb["image"] = _w2c
+        except Exception as _e:
+            print(f"[test_cond] image influence unavailable: "
+                  f"{type(_e).__name__}: {_e}")
+    gsim_names = sorted(gemb)
+
+    # The text slot of a scored generation: the caption's CLAP TEXT vector when
+    # sampling.validation_text_from_caption is on (what the validation metrics
+    # use), else the dataset's own vector (conditioning.text_source).
+    cap_ids, cap_emb = {}, None
+    if (bool(cfg.sampling.get("validation_text_from_caption", False))
+            and "text" in global_configs):
+        cap_ids, cap_emb = tc.load_caption_conditions(test_dataset.latent_root)
+        print("[test_cond] text slot: "
+              + ("the caption's CLAP text vector (validation_text_from_caption)"
+                 if cap_emb is not None else
+                 "no caption embeddings in this dataset -> the chunk's own vector"))
+
+    def text_vec(idx, text_emb):
+        if cap_emb is None:
+            return text_emb
+        cid = cap_ids.get(tc._chunk_key_of(test_dataset,
+                                           test_dataset.samples[idx][1]))
+        return text_emb if cid is None else torch.from_numpy(cap_emb[cid].copy())
+
+    wants_ctx = bool(getattr(model, "text_cross_layers", None))
+
+    # ---------------- generate + score, streamed ----------------
+    def _new_stats():
+        return {"sx": None, "sxx": None, "n": 0}
+
+    def _add_stats(st, emb):
+        e = emb.to(dtype=torch.float64)
+        if st["sx"] is None:
+            st["sx"] = torch.zeros(e.shape[-1], dtype=torch.float64, device=e.device)
+            st["sxx"] = torch.zeros(e.shape[-1], e.shape[-1], dtype=torch.float64,
+                                    device=e.device)
+        st["sx"] += e.sum(dim=0)
+        st["sxx"] += e.T @ e
+        st["n"] += e.shape[0]
+
+    fad_c, fad_u = _new_stats(), _new_stats()
+    gs_c = {c: {} for c in gsim_names}
+    gs_n = {c: {} for c in gsim_names}
+    cond_lat, null_lat = [], []
+    need_null = any_cond          # the influence baseline
+    gen_rng = null_rng = None
+    if seed is not None:
+        gen_rng = torch.Generator(device=device)
+        gen_rng.manual_seed(int(seed))
+        if not paired and need_null:
+            null_rng = torch.Generator(device=device)
+            null_rng.manual_seed(int(seed))
+    n_listened = 0
+    t0 = time.time()
+
+    def _score_one(p, wav, ev, gs, targets, gtargets, fad_stats):
+        wn = wav.numpy()
+        if ev is not None:
+            ev.add_sample(wn, DAC_SAMPLE_RATE, n_frames, targets, sample_id=p)
+        for c in gsim_names:
+            tgt = gtargets.get(c)
+            if tgt is None:
+                continue
+            try:
+                gs[c][p] = float(np.dot(gemb[c].embed(wn, DAC_SAMPLE_RATE),
+                                        np.asarray(tgt).reshape(-1)))
+            except Exception as _e:
+                if not gs[c]:
+                    print(f"[test_cond] {c} similarity unavailable: "
+                          f"{type(_e).__name__}: {_e}")
+        if fad_stats is not None:
+            _add_stats(fad_stats, fad_emb.embed(wav.view(1, 1, -1),
+                                                DAC_SAMPLE_RATE))
+
+    bar = tqdm(total=n_scored, desc="Test metrics")
+    for start in range(0, n_scored, group):
+        grp = list(range(start, min(start + group, n_scored)))
+        items = []
+        for p in grp:
+            (frames_real, frame_cond, label_idx, text_emb, image_emb,
+             text_ctx) = test_dataset[indices[p]]
+            items.append((frames_real, frame_cond, label_idx,
+                          text_vec(indices[p], text_emb), image_emb, text_ctx))
+        fc = {k: torch.stack([it[1][k] for it in items]).to(device).float()
+              for k in frame_dims}
+        gc = {}
+        if "text" in global_configs:
+            gc["text"] = torch.stack([it[3] for it in items]).to(device)
+        if "image" in global_configs:
+            gc["image"] = torch.stack([it[4] for it in items]).to(device)
+        ctx = ({"tokens": torch.stack([it[5]["tokens"] for it in items]),
+                "mask": torch.stack([it[5]["mask"] for it in items])}
+               if wants_ctx else None)
+
+        if paired:
+            lats_c, lats_u = tc.euler_sample_cfg_paired(
+                model, n_frames, device, steps=steps, t_min=t_min, t_max=t_max,
+                use_amp=use_amp, frame_cond=fc, global_cond=gc,
+                guidance=guidance, frame_dims=frame_dims,
+                global_configs=global_configs, gen_rng=gen_rng, text_ctx=ctx)
+        else:
+            lats_c = [tc.euler_sample_cfg(
+                model, n_frames, device, steps=steps, t_min=t_min, t_max=t_max,
+                use_amp=use_amp, frame_cond=fc or None, global_cond=gc or None,
+                guidance=guidance, frame_dims=frame_dims,
+                global_configs=global_configs, gen_rng=gen_rng, text_ctx=ctx)]
+            lats_u = [tc.euler_sample_cfg(
+                model, n_frames, device, steps=steps, t_min=t_min, t_max=t_max,
+                use_amp=use_amp, frame_cond=None, global_cond=None,
+                guidance=1.0, frame_dims=frame_dims,
+                global_configs=global_configs, gen_rng=null_rng,
+                text_ctx=None)] if need_null else [None]
+
+        for k, p in enumerate(grp):
+            frames_real, frame_cond, label_idx, t_vec, i_vec, _ = items[k]
+            targets = {c: v.cpu().numpy() for c, v in frame_cond.items()}
+            gtargets = {"text": t_vec.cpu().numpy() if "text" in global_configs else None,
+                        "image": i_vec.cpu().numpy() if "image" in global_configs else None}
+            cond_lat.append(lats_c[k])
+            wav_c = decode(lats_c[k])
+            _score_one(p, wav_c, ev_c, gs_c, targets, gtargets,
+                       fad_c if fad_emb is not None else None)
+            if lats_u[k] is not None:
+                null_lat.append(lats_u[k])
+                wav_u = decode(lats_u[k])
+                _score_one(p, wav_u, ev_n, gs_n, targets, gtargets,
+                           fad_u if (fad_emb is not None and compute_uncond) else None)
+            elif not any_cond:
+                # No condition at all: the "conditioned" generation IS the
+                # unconditional one (null inputs, no CFG) -- nothing to pair.
+                null_lat.append(lats_c[k])
+
+            if p in listen_pos:
+                # Same files and tags as a plain listening run.
+                label_name = idx_to_label.get(label_idx, str(label_idx))
+                out_path = output_dir / f"generated_{n_listened:04d}_{label_name}.wav"
+                sf.write(str(out_path), wav_c.numpy(), DAC_SAMPLE_RATE)
+                writer.add_audio(f"Audio/generated/{label_name}",
+                                 (wav_c / (wav_c.abs().max() + 1e-8)).view(1, -1),
+                                 global_step=n_listened, sample_rate=DAC_SAMPLE_RATE)
+                wav_r = decode(frames_real)
+                writer.add_audio(f"Audio/real/{label_name}",
+                                 (wav_r / (wav_r.abs().max() + 1e-8)).view(1, -1),
+                                 global_step=n_listened, sample_rate=DAC_SAMPLE_RATE)
+                n_listened += 1
+            bar.update(1)
+    bar.close()
+    elapsed = time.time() - t0
+
+    # ---------------- distributional metrics ----------------
+    dist = {}
+    if dac_ref is not None:
+        for tag, lats in (("cond", cond_lat),
+                          ("uncond", null_lat if compute_uncond else [])):
+            if not lats:
+                continue
+            m = compute_dac_metrics(torch.stack(lats), dac_ref, enabled=enabled,
+                                    device=device)
+            dist[f"fd_dac_{tag}"] = m["fd_dac"]
+            dist[f"kl_{tag}_real_gen"] = m["kl_real_gen"]
+            dist[f"kl_{tag}_gen_real"] = m["kl_gen_real"]
+    if fad_emb is not None:
+        for tag, st in (("cond", fad_c), ("uncond", fad_u)):
+            if st["n"] > 1:
+                mu, sig, _ = compute_mu_sigma(st["sx"], st["sxx"], st["n"])
+                dist[f"fad_vggish_{tag}"] = compute_fad(mu, sig, fad_ref,
+                                                        device=fad_device)
+
+    # ---------------- condition influence (paired) ----------------
+    have_null = bool(null_lat) and any_cond
+    influence, cov = {}, {}
+    if ev_c is not None:
+        influence, cov = pair_influence(ev_c.per_sample(), ev_n.per_sample(),
+                                        coverage_cond=ev_c.coverage(),
+                                        have_null=have_null)
+    _gmetric = {"text": "clap_sim", "image": "clip_sim"}
+    for c in gsim_names:
+        if not gs_c[c]:
+            continue
+        _cm, _nm, _dm, _npair = pair_scalar(gs_c[c], gs_n[c], have_null=have_null)
+        key = _gmetric.get(c, "sim")
+        influence[c] = {key: {"cond": _cm, "null": _nm, "delta": _dm}}
+        cov[f"{c}/{key}"] = {
+            "valid": _npair, "attempted": len(gs_c[c]),
+            "unpaired": len(set(gs_c[c]) ^ set(gs_n[c])) if have_null else 0}
+    for c in global_configs:
+        if c not in influence:
+            influence[c] = {_gmetric.get(c, "sim"): {
+                "cond": None, "null": None, "delta": None,
+                "note": ("no audio->CLIP embedder: pip install wav2clip"
+                         if c == "image" else "no embedder for this condition")}}
+    # Rows read "<cond>_test", as the training's read "<cond>_validation".
+    inf_named = {f"{c}_test": v for c, v in influence.items()}
+    cov_named = {}
+    for k, v in cov.items():
+        c, _, m = k.partition("/")
+        cov_named[f"{c}_test/{m}"] = v
+    panel = (format_influence_panel(inf_named, step=ckpt_step,
+                                    prefix=f"{weights} · test set",
+                                    guidance=guidance, n_samples=n_scored,
+                                    coverage=cov_named)
+             if influence else "")
+
+    # ---------------- report: console, TensorBoard, JSON ----------------
+    _tb = {"fd_dac_cond": "Fd_dac_cond", "kl_cond_real_gen": "Kl_cond/real_gen",
+           "kl_cond_gen_real": "Kl_cond/gen_real",
+           "fd_dac_uncond": "Fd_dac_uncond",
+           "kl_uncond_real_gen": "Kl_uncond/real_gen",
+           "kl_uncond_gen_real": "Kl_uncond/gen_real",
+           "fad_vggish_cond": "Fad_vggish_cond",
+           "fad_vggish_uncond": "Fad_vggish_uncond"}
+    print(f"\n[test_cond] {n_scored} test samples in {elapsed / 60:.1f} min "
+          f"({elapsed / max(1, n_scored):.1f} s per sample)")
+    for k, v in dist.items():
+        if v is not None:
+            print(f"[test_cond]   {_tb[k]:22s} {v:.4f}")
+            writer.add_scalar(f"Test/Metrics/{_tb[k]}", v, ckpt_step)
+    if panel:
+        print("\n" + panel + "\n")
+        writer.add_text("Test/Condition_influence", panel, ckpt_step)
+        writer.add_text("Test/Condition_influence_legend",
+                        format_influence_legend(), 0)
+
+    tag = "all" if n_scored == total else str(n_scored)
+    out_json = output_dir / f"metrics_{Path(args.ckpt).stem}_{tag}.json"
+    out_json.write_text(json.dumps({
+        "checkpoint": str(args.ckpt), "step": ckpt_step, "weights": weights,
+        "n_scored": n_scored, "n_test": total, "seed": seed,
+        "guidance": guidance, "euler_steps": steps,
+        "metrics_enabled": enabled, "fad_reference": fad_mode,
+        "metrics_uncond": compute_uncond, "influence_family": family,
+        "mir_threshold": mir_threshold,
+        "text_from_caption": cap_emb is not None,
+        "minutes": round(elapsed / 60, 2),
+        "distributional": dist, "influence": influence, "coverage": cov,
+        "influence_table_markdown": panel,
+    }, indent=2, default=float), encoding="utf-8")
+    print(f"[test_cond] metrics saved: {out_json}")
+    print(f"[test_cond] {n_listened} of them also saved to listen to: {output_dir}")
 
 
 # ============================================================
@@ -281,6 +758,25 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
 # ============================================================
 def main():
     cfg, args = load_config()
+
+    # ---- test-set metrics (--metrics_samples) ----
+    n_metrics = parse_metrics_samples(args.metrics_samples)
+    tc = None
+    if n_metrics is not None:
+        if args.prompt is not None or args.image is not None:
+            raise SystemExit(
+                "[test_cond] --metrics_samples cannot be combined with --prompt "
+                "/ --image: the metrics score the test set's OWN conditions, and "
+                "an override replaces them for every generation.")
+        # The metrics reuse the training's own sampler, reference adapter and
+        # caption lookup, so a test number is computed exactly like its
+        # validation twin. Importing the module also applies its process
+        # settings -- TF32 matmuls, the CUDA allocator config, the IRCAM cache
+        # redirection -- i.e. the ones the validation metrics run under. Done
+        # HERE, before anything touches CUDA, and only for a metrics run: a
+        # plain listening test runs exactly as before.
+        import training_cond as tc
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Reproducible generation (A/B): seed the global RNG and build a dedicated
@@ -343,21 +839,31 @@ def main():
     print(f"[test_cond] Frame re-injection:    "
           f"{'every ' + str(frame_reinject_every) + ' block(s)' if frame_reinject_every > 0 else 'OFF'}")
 
+    # The cross-attention, same contract: read the stride off the checkpoint
+    # and the CONTEXT WIDTH off the weights themselves, which is the only
+    # source that cannot disagree with the tensors being loaded.
+    text_cross_every = ckpt_text_cross_every(ckpt)
+    text_ctx_dim = ckpt_text_ctx_dim(ckpt)
+
     model = ConditionedAudioDiT(
         kind=model_kind,
         frame_cond_dims=frame_cond_dims,
         frame_cond_out_dims=frame_cond_out_dims,
         global_cond_configs=global_configs,
         frame_reinject_every=frame_reinject_every,
+        text_cross_every=text_cross_every,
+        text_ctx_dim=text_ctx_dim,
     ).to(device)
 
     # Prefer the EMA weights, but ONLY if the shadow was being updated when the
     # checkpoint was written (before training.ema_start it is still the random
     # init). Old checkpoints have no 'ema_ready' key -> assume ready.
+    weights = "EMA"
     if "ema_state_dict" in ckpt and ckpt.get("ema_ready", True):
         model.load_state_dict(ckpt["ema_state_dict"])
         print("[test_cond] Using EMA weights")
     else:
+        weights = "Model"
         model.load_state_dict(ckpt["model_state_dict"])
         if "ema_state_dict" in ckpt:
             print("[test_cond] EMA present but NOT trained yet (checkpoint "
@@ -457,6 +963,13 @@ def main():
         registry=registry,
         preload_latents=False,
         strict_conditions=not args.allow_invalid_conditions,   # #12: strict by default
+        # The text slot is filled as the training fills it (the chunk's CLAP
+        # audio vector, its caption's CLAP text vector, or a mix -- deterministic
+        # outside train): the same arguments build_conditioned_datasets passes
+        # for the training's own test split. Without them the dataset defaulted
+        # to 'audio' whatever the model was trained on.
+        text_source=cfg.conditioning.get("text_source", "audio"),
+        text_mix_p=cfg.conditioning.get("text_mix_p", 0.5),
     )
 
     total = len(test_dataset)
@@ -467,7 +980,8 @@ def main():
 
     n_samples = min(args.n_samples, total)
     indices = torch.linspace(0, total - 1, n_samples).long().tolist()
-    print(f"[test_cond] Test set: {total} samples | using {n_samples}")
+    if n_metrics is None:
+        print(f"[test_cond] Test set: {total} samples | using {n_samples}")
 
     # ============================================================
     # OPTIONAL GLOBAL OVERRIDES (--prompt, --image)
@@ -503,6 +1017,18 @@ def main():
     # ============================================================
     # GENERATION + LOGGING
     # ============================================================
+    if n_metrics is not None:
+        run_test_metrics(
+            tc, model, normalizer, test_dataset, cfg, args, device,
+            frame_dims=frame_cond_dims, global_configs=global_configs,
+            registry=registry, writer=writer, output_dir=output_dir,
+            idx_to_label=idx_to_label, n_metrics=n_metrics,
+            ckpt_step=int(ckpt.get("step", 0) or 0), weights=weights)
+        writer.close()
+        print(f"\n[test_cond] Done!")
+        print(f"[test_cond] TensorBoard:  tensorboard --logdir {log_dir}")
+        return
+
     n_frames    = test_dataset.n_frames
     euler_steps = int(cfg.sampling.euler_steps)
     guidance    = float(cfg.conditioning.guidance_scale)
@@ -513,7 +1039,8 @@ def main():
           f"guidance={guidance}) ---")
 
     for i, idx in enumerate(indices):
-        frames_real, frame_cond_real, label_idx, text_emb, image_emb \
+        (frames_real, frame_cond_real, label_idx, text_emb, image_emb,
+         text_ctx) \
             = test_dataset[idx]
         label_name = idx_to_label.get(label_idx, str(label_idx))
         print(f"\n[test_cond] Sample {i+1}/{n_samples} | "
@@ -533,6 +1060,11 @@ def main():
                 gc["image"] = image_emb_override.unsqueeze(0)
             else:
                 gc["image"] = image_emb.unsqueeze(0).to(device)
+        # The caption of THIS test chunk as a sequence, for a checkpoint whose
+        # blocks cross-attend. It is the dataset's own, so it describes the
+        # same chunk the pooled vector above does.
+        tctx = {"tokens": text_ctx["tokens"].unsqueeze(0),
+                "mask": text_ctx["mask"].unsqueeze(0)}
 
         # --- Generate latent with CFG ---
         with torch.no_grad():
@@ -543,7 +1075,7 @@ def main():
                 use_amp=use_amp,
                 frame_cond=fc, global_cond=gc, guidance=guidance,
                 frame_dims=frame_cond_dims, global_configs=global_configs,
-                gen_rng=gen_rng,
+                gen_rng=gen_rng, text_ctx=tctx,
             )
 
         # --- Latent -> audio (denormalize + DAC decode via from_latents) ---

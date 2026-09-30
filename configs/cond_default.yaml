@@ -104,6 +104,45 @@ model:
   # ---------------------------------------------------------------
   frame_reinject_every: 1
 
+  # ---------------------------------------------------------------
+  # TEXT CROSS-ATTENTION  (PixArt-alpha)
+  # ---------------------------------------------------------------
+  # 0  -> OFF. The text reaches the blocks ONLY as a pooled vector summed into
+  #       the AdaLN conditioning vector c. From c come shift/scale/gate, which
+  #       `modulate` broadcasts over time -- so the text can apply one affine
+  #       transform, the same at every frame. No word can act on frame 200
+  #       differently from frame 10, because the text never enters an attention
+  #       at all.
+  # 1  -> a cross-attention in EVERY block; 2 -> every other block, and so on.
+  #       Each audio token queries the text SEQUENCE: Q from x, K and V from the
+  #       token states of the caption. The conditioning becomes time-varying,
+  #       content-dependent (Q is a function of x, so the same word weighs
+  #       differently at different points and at different depths), and its
+  #       capacity grows with the length of the text instead of being squeezed
+  #       into one vector that also shares a channel with the timestep.
+  #
+  # WHERE IT SITS: between the self-attention and the FFN, the order of
+  # PixArt-alpha and of the LDM/Stable-Diffusion block. It takes NO AdaLN
+  # modulation of its own -- it reads the text directly -- and no positional
+  # encoding on the context: RoPE rotates by position in the AUDIO sequence, and
+  # the text keys are not at any audio position.
+  #
+  # WHAT IT NEEDS FROM THE DATASET: global_conditions/text_labels_tok.npy, the
+  # captions as token sequences. A run with text_cross_every > 0 on a dataset
+  # that has none REFUSES TO START rather than attending to the null token for
+  # a week. Re-run the preprocessing on the same output dir with --global_conds text:
+  # it rewrites only the sidecar and touches no audio.
+  #
+  # COST: about +19% parameters on 'L' with a stride of 1 (+88M on 467M), and
+  # the optimizer state grows with them.
+  #
+  # ARCHITECTURE PARAMETER: it changes the state_dict, so it is checked on
+  # --resume exactly like `kind` and `frame_reinject_every`. To turn it ON for a
+  # run that is already trained, do NOT resume -- use paths.init_from, which
+  # warm-starts from those weights; the output projection is zero-initialised,
+  # so the model starts as the exact same function it was.
+  text_cross_every: 0
+
 
 # ============================================================
 # DATA
@@ -149,7 +188,7 @@ training:
   seed: 42                # global run seed: x0, t-sampling, CFG dropout, DataLoader
                           # shuffle. null = off (free-running). Matches uncond.
 
-  # If true (default), the training refuses to start if any requested frame
+  # If true (default), the training gives an error if any requested frame
   # condition is not present in EVERY train/val .npz (full scan), and the
   # dataset hard-fails instead of silently zero-filling a missing/corrupt
   # condition. Set false only for debug runs where NULL conditions are OK.
@@ -202,15 +241,30 @@ sampling:
                           # (with CFG each step does 2 forward passes)
   t_min: 0.001
   t_max: 0.999
-  n_audio_samples: 4      # conditioned audios logged on TB for listening
+  # How many cards the two COLLECTED audio groups hold: the null generations
+  # ("uncond generation/"), and -- ONLY in a run with no conditions at all --
+  # the real recordings ("ground truth/"). It is also how many panels the cheap
+  # audio preview between metrics steps refreshes.
+  # It does NOT bound the recordings of a CONDITIONED run any more: there every
+  # validation panel opens with the recording its conditions were extracted
+  # from (validation_XX/1_real_validation_XX), so they are all there by
+  # construction and there is nothing left to choose. The knob survives for the
+  # unconditioned case, which has no panels and would otherwise have no real
+  # material to listen to at all.
+  n_audio_samples: 4
 
   # ---------------------------------------------------------------
-  # THE INFLUENCE SET -- one N, three windows
+  # THE INFLUENCE SET -- two halves, three windows
   # ---------------------------------------------------------------
-  # N validation samples AND N out-of-the-box probe stimuli. The SAME samples
-  # produce all three diagnostic windows, which is the point: the number you
-  # read in the table is about the curve you are looking at and the audio you
-  # are hearing.
+  # N_valid validation samples and N_probe out-of-the-box probe stimuli. Within
+  # each half the SAME samples produce all three diagnostic windows, which is
+  # the point: the number you read in the table is about the curve you are
+  # looking at and the audio you are hearing.
+  #
+  # The two halves have their own size (one knob, n_influence_samples, until
+  # 29 Sept 2026). The validation rows and the probe rows of the table are read
+  # side by side ACROSS STEPS -- like the training and the validation loss --
+  # never against each other, so they need not be the same size.
   #
   #   IMAGES  validation_XX/<cond>_target_vs_gen   target vs re-extracted
   #           probe_XX/<cond>_target_vs_gen        idem, on the probe stimuli
@@ -231,12 +285,24 @@ sampling:
   # want hundreds of samples; the influence set is read panel by panel by a
   # human, so it is small and fully shown.
   #
-  # COST per metrics step: N paired generations for validation + N for the probe
-  # (paired = with conditions and without, from the same noise -- the "without"
-  # is what the delta is measured against), plus one re-extraction each. This is
-  # the knob to lower if the metrics step gets too long. Max 16 for the probe
-  # (the size of each bank in probe_conditions.py).
-  n_influence_samples: 16
+  # COST per metrics step: N_valid paired generations for validation + N_probe
+  # for the probe (paired = with conditions and without, from the same noise --
+  # the "without" is what the delta is measured against), plus one
+  # re-extraction each. These are the knobs to lower if the metrics step gets
+  # too long. Both halves are scored with whichever family
+  # metrics.influence_family picks (ours or mir_eval).
+  #
+  # VALIDATION: at least 1, at most n_metrics_samples (the samples are picked
+  # evenly spread inside that list, hence over the whole validation set). The
+  # same samples at every step.
+  n_influence_samples_valid: 16
+  # PROBE: at most 16, the size of each bank in probe_conditions.py (more ->
+  # all 16, and the startup log says so). Fewer than 16 -> that many stimuli
+  # drawn AT RANDOM but FIXED (probe_conditions.PROBE_SUBSET_SEED): the same
+  # subset at every step and in every run, so the probe curve only moves
+  # because the model did. A text bank of single labels is instead cycled to
+  # that length, so every label stays in. 0 -> no probe at all.
+  n_influence_samples_probe: 16
 
   # ---- OUT-OF-THE-BOX PROBE PANELS ----
   # Probe panel i drives EVERY condition active in the run at once, taking the
@@ -245,7 +311,7 @@ sampling:
   # are combined BY INDEX and are therefore NOT mutually aligned -- deliberate,
   # see below. Which stimulus a panel used is written in the TITLE of that
   # panel's comparison image, in the IMAGES window.
-  # Set n_influence_samples: 0 to disable.
+  # Set n_influence_samples_probe: 0 to disable.
                           #
                           # WHY JOINT. With p_drop_each_frame = 0.0 (see below)
                           # the model only ever sees all of its conditions or
@@ -274,7 +340,7 @@ sampling:
 
   # NB: three older knobs are GONE, and the code no longer reads any of them --
   # a leftover in your own config would do nothing:
-  #   n_probes      -> now sampling.n_influence_samples (probe stimuli)
+  #   n_probes      -> now sampling.n_influence_samples_probe (probe stimuli)
   #   n_cond_plot   -> gone: every sample of the influence set is plotted
   #   n_f0_plot     -> gone (it was already only an alias of n_cond_plot)
   #   n_<cond>_probe (f0/energy/chroma/rhythm) -> gone, they were already inert
@@ -289,8 +355,9 @@ sampling:
   # so it is BOUNDED to small subsets -- decoding/re-extracting all of a large
   # n_metrics_samples is what OOM-kills the process. Keep these small.
   #
-  # (The influence set size lives above, as sampling.n_influence_samples: it is
-  # one knob for the validation samples, the probe stimuli and the panels.)
+  # (The influence set sizes live above: sampling.n_influence_samples_valid for
+  # the validation samples and their panels, n_influence_samples_probe for the
+  # probe stimuli and theirs.)
 
   # ---- GLOBAL-CONDITION SIMILARITY SCALARS ----
   # How many validation generations the two similarity curves are averaged over:
@@ -310,7 +377,7 @@ sampling:
   # 0 disables the two curves without touching anything else.
   #
   # NB the influence TABLE is unaffected by this number: its rows are a paired
-  # delta measured on the influence set (n_influence_samples), against the null
+  # delta measured on the influence set (n_influence_samples_valid), against the null
   # pass. This knob only widens the sample the two SCALARS are averaged over.
   n_similarity_samples: 128
 
@@ -332,10 +399,10 @@ sampling:
   # the training's own conditioning, otherwise the two curves would stop being
   # comparable and would say nothing about overfitting. Only the generations the
   # metrics and the panels are built from change.
-  # Needs a dataset preprocessed with --global text by a version that writes
+  # Needs a dataset preprocessed with --global_conds text by a version that writes
   # global_conditions/text_labels_emb.npy; without it the run says so and falls
   # back to the chunk's own vector.
-  validation_text_from_caption: false
+  validation_text_from_caption: true
 
   # ---------------------------------------------------------------
   # CONDITION SUBSETS -- the delta MATRIX
@@ -360,7 +427,8 @@ sampling:
   #                   power of each, but far from the model's operating point.
   #
   # COST: each row other than "all" is a FULL extra generation pass over
-  # n_influence_samples, so the metrics step grows LINEARLY with the number of
+  # n_metrics_samples (scored on n_influence_samples_valid), so the metrics
+  # step grows LINEARLY with the number of
   # rows. With 4 conditions, "loo" alone adds 4 passes; ["loo", "singletons",
   # "all"] adds 8. Start small and read the metrics-step timing before growing.
   #
@@ -464,6 +532,48 @@ metrics:
   # resident (plus the DAC decoder itself, if dac_device below is "cuda"), and
   # CREPE-full on top can overflow a card with little margin.
   fidelity_device: "cuda"
+
+  # ---- WHICH METRICS SCORE THE CONDITION-INFLUENCE ROWS ----
+  # Each row of Validation/Condition_influence compares the condition GIVEN to
+  # the model with the same descriptor RE-EXTRACTED from what it generated.
+  # Two families can do the scoring:
+  #   "influence_metrics"      -> ours (DEFAULT, every run before 23 Sept 2026):
+  #                               f0 Pearson on the voiced frames, chroma/chord
+  #                               cosine, rhythm/energy Pearson.
+  #   "mir_influence_metrics"  -> mir_eval (Raffel et al., ISMIR 2014), the
+  #                               standard MIR metrics, citable and comparable
+  #                               with the literature.
+  # mir_eval covers f0, chroma, chord and rhythm; energy, text and image are
+  # always scored with ours (mir_eval has nothing for them):
+  #   f0             mir_eval.melody: raw pitch / raw chroma / overall
+  #                  accuracy, voicing recall and voicing false alarm;
+  #   chroma, chord  mir_eval.multipitch: chroma precision / recall /
+  #                  accuracy, miss and false alarm error, on the pitch
+  #                  classes that are ON (see mir_threshold below);
+  #   rhythm         mir_eval.beat: beat F-measure / Cemgil / P-score /
+  #                  CMLt / AMLt and downbeat F-measure, on the beat instants
+  #                  beat_this's own rule reads off the curves (maximum within
+  #                  +-60 ms, probability > 0.5).
+  # The startup line "[metrics] extractor=<cond> | ... | metrics=..." says
+  # which family each condition actually got.
+  # Evaluation only -- the training is untouched. Switching it changes the
+  # ROWS of the table, so compare runs within one family.
+  influence_family: "influence_metrics"
+
+  # ---- WHEN A PITCH CLASS COUNTS AS "ON" (chroma / chord, mir family) ----
+  # mir_eval.multipitch compares the LIST of notes that are on in each frame,
+  # while both conditions store 12 continuous values per frame: a class is ON
+  # when its value is >= this.
+  #   chroma -> at least this fraction of the frame's loudest class (every
+  #             chroma frame is scaled so its loudest class is 1);
+  #   chord  -> crema's probability of the class: 0.5 = more likely than not.
+  # Measured on the instruments dataset at 0.5, classes ON per frame on
+  # average: chroma violin 1.8, piano 2.4, guitar 3.9, drums 6.8 (drums have no
+  # notes: their chroma is noise and nearly everything lights up); chord
+  # violin 1.8, piano 2.5, guitar 2.2, drums 0.4 (almost always no chord).
+  # FIXED ONCE: it changes the numbers, so runs compare only at the same value.
+  # Ignored by f0 and by the default family.
+  mir_threshold: 0.5
 
   # ---- DAC decoder: where the shared decoder lives for the whole run ----
   #   "cpu"  -> DEFAULT and historical behaviour. Nothing changes.
@@ -583,6 +693,35 @@ conditioning:
   guidance_scale: 3.0
 
   # ---------------------------------------------------------------
+  # WHAT THE TEXT SLOT IS FED IN TRAINING
+  # ---------------------------------------------------------------
+  # audio   -> the chunk's own CLAP AUDIO embedding. What every run before
+  #            14 Sept 2026 did, and the AudioLDM arrangement: CLAP's two towers
+  #            share a space, so a written prompt can take its place at
+  #            inference. No captions needed, and the vector is rich and exact.
+  # caption -> the CLAP TEXT embedding of that chunk's written description. The
+  #            vector a PROMPT puts there at inference, so training and test
+  #            finally see the same distribution.
+  # mix     -> one or the other per sample, with probability text_mix_p of the
+  #            caption. Random on train; DETERMINISTIC on val/test, so the
+  #            validation loss does not wobble with the draw.
+  #
+  # WHY IT MATTERS (measured on dataset_ready_..._text_instruments, 14 Sept
+  # 2026): audio-to-audio cosines within a class sit at +0.70..+0.82, which is
+  # what the model sees in training, while a chunk's cosine to its own caption's
+  # TEXT vector is +0.24..+0.52. With text_source=audio the slot is handed a
+  # vector from a region it was never trained on.
+  #
+  # THE CROSS-ATTENTION IS NOT GOVERNED BY THIS. Its context is always the
+  # caption's tokens, whatever is chosen here: CLAP's audio tower returns one
+  # vector and there is no sequence to attend over.
+  #
+  # Needs text_labels_emb.npy (any value but 'audio' refuses to start without
+  # it). Same preprocessing pass as the token sequences above.
+  text_source: caption
+  text_mix_p: 0.5
+
+  # ---------------------------------------------------------------
   # Per-run SELECTION of which conditions to activate.
   # Subset of what is enabled=True in CONDITION_CONFIG (conditions.py).
   #   null  -> use all conditions marked enabled=True in CONDITION_CONFIG
@@ -600,7 +739,7 @@ conditioning:
   #
   # DEFAULT: f0-only. This matches the current preprocessing line
   # (--conditions f0). Add "energy" / "chroma" / "rhythm" once you have
-  # extracted them onto the dataset; the training refuses to start otherwise
+  # extracted them onto the dataset; the training gives an error message at the beginning otherwise
   # (see training.strict_conditions).
   # ---------------------------------------------------------------
   enabled_frame:  ["f0"]
@@ -660,3 +799,15 @@ paths:
   # Checkpoint path to resume from (override also from --resume CLI).
   # When resuming, a new run starts; the config registers resume_from.
   resume_from:    null
+
+  # WARM START: a NEW run that begins from another run's weights. Not a resume --
+  # step counter, optimizer, scheduler and RNG all start from zero, and only the
+  # model and the EMA shadow are seeded. This is how model.text_cross_every is
+  # turned on for an already-trained model: the cross-attention's output
+  # projection is zero-initialised, so the warm-started model computes exactly
+  # the function the checkpoint had.
+  # Only weights the NEW architecture adds may be missing; anything else is
+  # refused with the list of keys, rather than left at its random init behind a
+  # line that says "warm start".
+  # Mutually exclusive with resume_from.
+  init_from:      null

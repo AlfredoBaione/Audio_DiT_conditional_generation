@@ -807,6 +807,54 @@ class CLAPTextCondition(GlobalConditionExtractor):
         feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
         return feat.cpu().numpy().astype(np.float32)
 
+    @property
+    def ctx_dim(self) -> int:
+        """Width of ONE token state -- the text tower's hidden size (768 for
+        clap-htsat-unfused), NOT `dim`. See encode_tokens for why the two
+        differ."""
+        self._load()
+        return int(self._model.config.hidden_size)
+
+    @torch.no_grad()
+    def encode_tokens(self, texts: List[str]):
+        """Encode strings -> ((N, Lmax, ctx_dim) float32, (N,) int32 lengths).
+
+        The TOKEN-LEVEL states of CLAP's text tower: one vector per token
+        instead of one per string. This is what a cross-attention needs, and it
+        is exactly what `encode_batch` cannot give -- the projected embedding is
+        a single vector, and an attention with one key is a learned bias, not an
+        attention.
+
+        PRE-PROJECTION ON PURPOSE, hence `ctx_dim` (768) and not `dim` (512).
+        The 512-d shared space is where audio and text are COMPARED, which is
+        what the pooled condition and the similarity metric need; the 768-d
+        token states are where the individual words still are, and the model
+        learns its own way into them through K and V. Projecting them down to
+        512 first would spend a compression on the one thing this path exists
+        to keep.
+
+        Rows are padded with zeros to the longest string in `texts` and the
+        TRUE LENGTH is returned beside them. The padding is zeroed here as well
+        as masked later: padding that reaches K and V is padding the model reads
+        as words, and a mask lost somewhere between here and the network would
+        then fail silently rather than loudly.
+
+        NOT L2-normalized, unlike every other method on this class. There is no
+        shared space to normalize into here, and scaling each token to unit norm
+        would erase the only cue that distinguishes a content word from a
+        separator.
+        """
+        self._load()
+        inputs = self._processor(list(texts), return_tensors="pt", padding=True)
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        out = self._model(**inputs)
+        h = out.last_hidden_state.float()
+        mask = inputs["attention_mask"].to(h.dtype)
+        h = h * mask.unsqueeze(-1)
+        lengths = inputs["attention_mask"].sum(dim=1)
+        return (h.cpu().numpy().astype(np.float32),
+                lengths.cpu().numpy().astype(np.int32))
+
     # ---- AUDIO SIDE: what the preprocessing actually stores ---------------
     #
     # The condition is called "text" because that is the SLOT, and text is what

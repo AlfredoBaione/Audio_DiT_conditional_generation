@@ -234,6 +234,84 @@ class FFN(nn.Module):
 
 
 # ============================================================
+# CROSS-ATTENTION ON A TEXT SEQUENCE  (PixArt-alpha)
+# ============================================================
+class CrossAttention(nn.Module):
+    """
+    The audio tokens QUERY a text sequence: Q from x, K and V from the context.
+
+    WHY IT EXISTS AT ALL. The pooled text vector reaches the network through
+    AdaLN, where it becomes shift/scale/gate -- vectors of shape (B, hidden)
+    that `modulate` broadcasts over time. So it can only apply ONE affine
+    transform, the same at every one of the ~431 frames: there is no path by
+    which a word could act on frame 200 differently from frame 10. Here every
+    audio token computes its own query and reads the words it needs. Three
+    things follow that AdaLN cannot give: the conditioning becomes time-varying,
+    it becomes content-dependent (Q is a function of x, so the same word weighs
+    differently depending on what is already being generated, and differently
+    again at each depth), and its capacity grows with the length of the text
+    instead of being compressed into one vector that also has to share a channel
+    with the timestep embedding.
+
+    NO POSITIONAL ENCODING ON THE CONTEXT. RoPE rotates queries and keys by
+    their position in the AUDIO sequence; the text keys are not at any audio
+    position, and rotating them by one would assert an alignment between word i
+    and frame i that nothing in the data supports. PixArt does the same: the
+    cross-attention sees the text as a set the model orders through the token
+    states themselves, which already carry the sentence's own positions.
+
+    NO AdaLN MODULATION on this sub-layer, again as in PixArt: the branch reads
+    the text directly, and the block's six adaLN parameters stay what they are
+    in the official DiT, driving the self-attention and the FFN.
+
+    `ctx_mask` is a BOOLEAN key mask, True where a token is real. It is not
+    optional in practice: captions have different lengths, they are padded into
+    one tensor, and padding that reaches K and V is padding the model reads as
+    words. The caller must never hand a row whose mask is all-False -- softmax
+    over an empty set of keys is NaN, not zero -- which is why
+    ConditionedAudioDiT substitutes a learned null token instead of masking a
+    row out entirely.
+
+    The output projection is ZERO-INITIALISED (see initialize_weights), the
+    adaLN-Zero / ControlNet principle and PixArt's own choice: at step 0 this
+    sub-layer contributes exactly 0, so a model built with cross-attention
+    computes the same function as one without it and can be warm-started from a
+    checkpoint that never had it.
+    """
+
+    def __init__(self, hidden_size: int, n_heads: int, ctx_dim: int):
+        super().__init__()
+        if hidden_size % n_heads != 0:
+            raise ValueError(
+                f"hidden_size {hidden_size} is not divisible by n_heads {n_heads}")
+        self.n_heads = n_heads
+        self.head_dim = hidden_size // n_heads
+        self.q = nn.Linear(hidden_size, hidden_size, bias=True)
+        # ONE Linear for K and V: they read the same context, so a single
+        # matmul over the (short) text sequence is cheaper than two and the
+        # split is free.
+        self.kv = nn.Linear(ctx_dim, 2 * hidden_size, bias=True)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor,
+                ctx_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, T, C = x.shape
+        L = ctx.shape[1]
+        q = self.q(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv(ctx.to(x.dtype)).view(B, L, 2, self.n_heads, self.head_dim)
+        k = kv[:, :, 0].transpose(1, 2)      # (B, heads, L, head_dim)
+        v = kv[:, :, 1].transpose(1, 2)
+        attn_mask = None
+        if ctx_mask is not None:
+            # (B, 1, 1, L): broadcast over heads and over every audio token.
+            # Boolean: True = this key takes part.
+            attn_mask = ctx_mask.view(B, 1, 1, L)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).reshape(B, T, C)
+        return self.proj(out)
+
+
+# ============================================================
 # DIT BLOCK (identical to network.py: RoPE attn + SwiGLU FFN)
 # ============================================================
 class DiTBlock(nn.Module):
@@ -250,12 +328,25 @@ class DiTBlock(nn.Module):
     `drop` is wired ONLY into the FFN (not the attention). Default 0.0 -> inert.
 
     Frame-level conditions are NOT handled here (they are concatenated at the
-    input); global conditions reach the block only through `c` (AdaLN), exactly
-    like the class label in DiT.
+    input); the pooled global conditions reach the block only through `c`
+    (AdaLN), exactly like the class label in DiT.
+
+    OPTIONAL CROSS-ATTENTION on a text sequence (`cross_attn_ctx_dim` > 0),
+    inserted BETWEEN the self-attention and the FFN -- the order of PixArt-alpha
+    and of the LDM/Stable-Diffusion BasicTransformerBlock:
+
+        x = x + gate_msa * attn(modulate(norm1(x)))
+        x = x + cross_attn(norm_cross(x), ctx)        <- only when built
+        x = x + gate_mlp * mlp (modulate(norm2(x)))
+
+    When it is NOT built, this block is network.py's DiT block down to the last
+    operation and the last parameter -- which is what keeps a run without text
+    comparable to every run that came before it, and keeps its checkpoints
+    loadable by this code.
     """
 
     def __init__(self, hidden_size, num_heads, max_seq_len=4096,
-                 mlp_ratio=4.0, drop=0.0):
+                 mlp_ratio=4.0, drop=0.0, cross_attn_ctx_dim=0):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn  = SelfAttention(hidden_size, num_heads, max_seq_len=max_seq_len)
@@ -265,10 +356,32 @@ class DiTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
+        # Built only when asked, so a block without text carries no extra
+        # tensor in the state_dict at all.
+        self.norm_cross = None
+        self.cross_attn = None
+        if int(cross_attn_ctx_dim or 0) > 0:
+            self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False,
+                                           eps=1e-6)
+            self.cross_attn = CrossAttention(hidden_size, num_heads,
+                                             int(cross_attn_ctx_dim))
 
-    def forward(self, x, c):
+    def forward(self, x, c, ctx=None, ctx_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        if self.cross_attn is not None:
+            # NOT guarded on `ctx is not None`. A block that has the sub-layer
+            # and silently skips it when the caller forgot the context would be
+            # a THIRD state -- neither "conditioned" nor the learned null the
+            # CFG dropout trained -- and it would never raise. The model always
+            # supplies a context (its null token when there is no text), so the
+            # only way to arrive here without one is a bug, and it should say so.
+            if ctx is None:
+                raise ValueError(
+                    "this DiTBlock has a cross-attention but no text context "
+                    "reached it; ConditionedAudioDiT.forward must pass one "
+                    "(its learned null token when there is no text)")
+            x = x + self.cross_attn(self.norm_cross(x), ctx, ctx_mask)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -374,6 +487,8 @@ class ConditionedAudioDiT(nn.Module):
         frame_cond_out_dims: Optional[Dict[str, int]]  = None,
         global_cond_configs: Optional[Dict[str, dict]] = None,
         frame_reinject_every: int = 0,
+        text_cross_every:     int = 0,
+        text_ctx_dim:         int = 0,
     ):
         super().__init__()
         cfg = self.CONFIGS[kind]
@@ -427,11 +542,53 @@ class ConditionedAudioDiT(nn.Module):
         # DiT blocks (RoPE handles position inside the attention; max_seq_len is
         # plumbed through so each block can build its rope inv_freq buffer).
         # IDENTICAL to network.py's blocks.
+        # ----- Cross-attention on the text SEQUENCE (optional) -----
+        # WHICH BLOCKS: strided from 0, so every block when the stride is 1 --
+        # unlike the frame re-injection, which skips block 0 because input_proj
+        # has just handed it the conditions. Nothing hands block 0 the text, so
+        # it gets the sub-layer like any other.
+        #
+        # It is OFF unless the run actually has a text condition: a cross-
+        # attention over a context that is always the null token is a per-block
+        # learned bias with a few million parameters, which is worse than
+        # nothing and would sit in the state_dict forever.
+        self.text_cross_every = int(text_cross_every or 0)
+        if self.text_cross_every < 0:
+            raise ValueError(
+                f"text_cross_every must be >= 0 (0 = off), got {text_cross_every}.")
+        self.text_ctx_dim = int(text_ctx_dim or 0)
+        self.text_cross_layers = []
+        if self.text_cross_every > 0 and "text" in self.global_cond_configs:
+            if self.text_ctx_dim <= 0:
+                raise ValueError(
+                    "text_cross_every > 0 needs text_ctx_dim: the width of ONE "
+                    "token state of the text encoder (768 for CLAP "
+                    "clap-htsat-unfused). It is not the pooled dim (512) -- see "
+                    "CLAPTextCondition.encode_tokens.")
+            self.text_cross_layers = [
+                i for i in range(n_layers) if i % self.text_cross_every == 0
+            ]
+
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, n_heads, max_seq_len=max_seq_len,
-                     mlp_ratio=mlp_ratio, drop=drop)
-            for _ in range(n_layers)
+                     mlp_ratio=mlp_ratio, drop=drop,
+                     cross_attn_ctx_dim=(self.text_ctx_dim
+                                         if i in self.text_cross_layers else 0))
+            for i in range(n_layers)
         ])
+
+        # THE NULL CONTEXT, learned, ONE token.
+        # Classifier-free guidance needs an unconditional branch, and for this
+        # path "unconditional" cannot be "no keys": softmax over an empty set is
+        # NaN, so a row can never be masked out entirely. It cannot be a zero
+        # SEQUENCE either -- the zero vector is a perfectly ordinary point of a
+        # hidden-state space that is not normalised, and the model would have to
+        # learn "no text" as a coincidence. PixArt learns the null the same way.
+        # Trained by the CFG dropout exactly like the zero vector of the other
+        # conditions, so guidance extrapolates from something the model saw.
+        self.text_null = None
+        if self.text_cross_layers:
+            self.text_null = nn.Parameter(torch.randn(1, 1, self.text_ctx_dim) * 0.02)
 
         # ----- Per-block re-injection of the frame conditions (optional) -----
         # WHICH BLOCKS: strided over 1..n_layers-1. Index 0 is excluded on
@@ -563,6 +720,25 @@ class ConditionedAudioDiT(nn.Module):
         else:
             print(f"  Frame re-injection: OFF (input concat only, plain JASCO)")
 
+        # Cross-attention report, same rule: a setting that does nothing says so.
+        if self.text_cross_layers:
+            n_x = len(self.text_cross_layers)
+            # per block: LayerNorm (affine-free, 0) + Q + K,V + W_o
+            x_params = n_x * ((hidden_size * hidden_size + hidden_size)
+                              + (self.text_ctx_dim * 2 * hidden_size + 2 * hidden_size)
+                              + (hidden_size * hidden_size + hidden_size))
+            print(f"  Text cross-attention: every {self.text_cross_every} "
+                  f"block(s) -> {n_x} of {n_layers} blocks | "
+                  f"ctx_dim={self.text_ctx_dim} | W_o zero-init | "
+                  f"learned null token | +{x_params/1e6:.2f}M params")
+        elif self.text_cross_every > 0 and "text" not in self.global_cond_configs:
+            print(f"  Text cross-attention: REQUESTED (every "
+                  f"{self.text_cross_every}) but INACTIVE -- this model has no "
+                  f"'text' global condition to attend to.")
+        else:
+            print(f"  Text cross-attention: OFF (the text reaches the blocks "
+                  f"only as a pooled vector through AdaLN)")
+
     def initialize_weights(self):
         """
         Identical to network.py / facebookresearch/DiT:
@@ -625,6 +801,33 @@ class ConditionedAudioDiT(nn.Module):
                 nn.init.constant_(gate[-1].weight, 0)
                 nn.init.constant_(gate[-1].bias, 1.0)
 
+        # Zero-out the OUTPUT projection of every cross-attention. Same reason
+        # and same place in the order as above: _basic_init has just given it a
+        # xavier init like every other Linear, and this overrides it. The effect
+        # is PixArt's: at step 0 the whole sub-layer adds exactly 0, so the
+        # model computes the same function as one built without cross-attention
+        # -- which is what makes warm-starting from such a checkpoint exact
+        # rather than approximately right.
+        #
+        # ONLY the output projection, and it is worth being precise about what
+        # that buys, because the obvious guess is wrong. At step 0, with W_o=0,
+        # Q, K and V receive NO gradient at all: the gradient reaching the
+        # attention output is grad_out @ W_o.T, which is zero. What IS non-zero
+        # is the gradient of W_o ITSELF -- it is grad_out against the attention
+        # output, and that output is non-zero because Q/K/V are xavier-
+        # initialised. So W_o leaves the origin on the first step, and from the
+        # second one the whole sub-layer trains normally. (Measured, 14 Sept
+        # 2026: after one backward, grad on W_o non-zero, grad on Q/K/V and on
+        # the null token exactly zero.)
+        #
+        # That is why the zero goes HERE and nowhere else. Zero Q or K,V as
+        # well and the attention output is zero too, so W_o's own gradient
+        # vanishes with everything else and the path never starts.
+        for block in self.blocks:
+            if block.cross_attn is not None:
+                nn.init.constant_(block.cross_attn.proj.weight, 0)
+                nn.init.constant_(block.cross_attn.proj.bias, 0)
+
     def _gather_frame_conditions(
         self,
         frame_conditions: Optional[Dict[str, torch.Tensor]],
@@ -677,18 +880,77 @@ class ConditionedAudioDiT(nn.Module):
             out[name] = c
         return out
 
+    def _gather_text_context(self, ctx, mask, B, device):
+        """
+        -> ((B, L, ctx_dim) float32, (B, L) bool) for the cross-attention, with
+        the LEARNED NULL TOKEN standing in wherever there is no text.
+
+        The third counterpart of _gather_frame_conditions / _gather_global_
+        conditions, and it exists for the same reason: there must be exactly TWO
+        states, "a text" and "the null the dropout trained", never a third that
+        nobody trained and nothing reports.
+
+        `ctx=None` means the WHOLE batch is unconditional -- that is the call
+        the CFG null branch makes, and the one a caller that has no text at all
+        makes. Per-SAMPLE dropout cannot say it that way, so it says it with the
+        mask instead: a row whose mask is entirely False is a dropped sample,
+        and it comes back here as the null token. That is also the only reason
+        this is not a plain passthrough -- a row with no valid key at all would
+        make scaled_dot_product_attention take a softmax over an empty set and
+        return NaN, which would poison the loss of the whole batch.
+        """
+        null = self.text_null.to(device=device, dtype=torch.float32)
+        if ctx is None:
+            return (null.expand(B, 1, -1),
+                    torch.ones(B, 1, dtype=torch.bool, device=device))
+        ctx = ctx.to(device=device, dtype=torch.float32)
+        if ctx.dim() != 3 or ctx.shape[0] != B:
+            raise ValueError(
+                f"text_context must be (B, L, {self.text_ctx_dim}) with B={B}, "
+                f"got {tuple(ctx.shape)}")
+        if ctx.shape[2] != self.text_ctx_dim:
+            raise ValueError(
+                f"text_context has width {ctx.shape[2]}, this model was built "
+                f"for {self.text_ctx_dim}. The context is the TOKEN-level state "
+                f"of the text encoder (768 for CLAP), not the pooled embedding "
+                f"(512) that goes into the AdaLN slot.")
+        if mask is None:
+            mask = torch.ones(ctx.shape[:2], dtype=torch.bool, device=device)
+        else:
+            mask = mask.to(device=device).bool()
+            if mask.shape != ctx.shape[:2]:
+                raise ValueError(
+                    f"text_context_mask {tuple(mask.shape)} does not match the "
+                    f"context {tuple(ctx.shape[:2])}")
+        empty = ~mask.any(dim=1)
+        if bool(empty.any()):
+            ctx, mask = ctx.clone(), mask.clone()
+            ctx[empty] = 0.0
+            ctx[empty, 0] = null[0, 0]
+            mask[empty] = False
+            mask[empty, 0] = True
+        return ctx, mask
+
     def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         frame_conditions:  Optional[Dict[str, torch.Tensor]] = None,
         global_conditions: Optional[Dict[str, torch.Tensor]] = None,
+        text_context:      Optional[torch.Tensor] = None,
+        text_context_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         x: (B, n_frames, token_dim)   one token per DAC frame
         t: (B,)                        timestep in [0, 1]
         frame_conditions:  {"f0": (B,T,2), "chroma": (B,T,12), "rhythm": (B,T,2)} or None
         global_conditions: {"text":  (B,d),  "image":  (B,d), ...}    or None
+        text_context:      (B, L, text_ctx_dim) token states of the text, or
+                           None for "no text" (the learned null token). Ignored
+                           by a model built without cross-attention.
+        text_context_mask: (B, L) bool, True where a token is real. A row that
+                           is all-False is a CFG-dropped sample and becomes the
+                           null token.
 
         Returns:
             velocity field of shape (B, n_frames, token_dim)
@@ -739,6 +1001,14 @@ class ConditionedAudioDiT(nn.Module):
         # saw. dtype: under autocast frame_proj is fp32 and x is fp16; the
         # Linear returns fp16 and the add matches x. Outside autocast both are
         # fp32.
+        # The text SEQUENCE, resolved once for the whole depth: every block that
+        # has a cross-attention reads the same context, exactly as every block
+        # reads the same c.
+        ctx = ctx_mask = None
+        if self.text_cross_layers:
+            ctx, ctx_mask = self._gather_text_context(
+                text_context, text_context_mask, B, x.device)
+
         reinject = self.frame_reinject if (self.reinject_layers and
                                            frame_proj is not None) else None
         for i, block in enumerate(self.blocks):
@@ -753,7 +1023,7 @@ class ConditionedAudioDiT(nn.Module):
                 gate = torch.repeat_interleave(
                     gate, self.frame_slot_repeats, dim=-1).unsqueeze(1)
                 x = x + reinject[str(i)](frame_proj * gate)
-            x = block(x, c)
+            x = block(x, c, ctx, ctx_mask)
 
         x = self.final_layer(x, c)
         return x
@@ -784,6 +1054,47 @@ def ckpt_frame_reinject_every(ckpt: dict) -> int:
         if isinstance(cfg, dict):
             v = (cfg.get("model", None) or {}).get("frame_reinject_every", None)
     return int(v or 0)
+
+
+def ckpt_text_cross_every(ckpt: dict) -> int:
+    """
+    Recover `text_cross_every` from a checkpoint, the twin of
+    ckpt_frame_reinject_every and for the same reason: it adds four tensors per
+    selected block plus the null token, so a script that rebuilds the model from
+    a checkpoint and guesses it wrong gets a load failure, not a slightly
+    different sample.
+
+    Three sources, in order: the top-level field, the stored config, then 0 --
+    which is the correct answer for every checkpoint written before the
+    cross-attention existed, and is exactly what those runs were trained as.
+    """
+    v = ckpt.get("text_cross_every", None)
+    if v is None:
+        cfg = ckpt.get("config", None)
+        if isinstance(cfg, dict):
+            v = (cfg.get("model", None) or {}).get("text_cross_every", None)
+    return int(v or 0)
+
+
+def ckpt_text_ctx_dim(ckpt: dict) -> int:
+    """
+    The width of ONE text token as the checkpoint was trained, read off the
+    state_dict itself rather than off a config field.
+
+    Off the WEIGHTS on purpose: this number is not a preference, it is a shape,
+    and the only thing that can state it without being able to lie is the tensor
+    whose shape it is. `blocks.<i>.cross_attn.kv.weight` is (2*hidden, ctx_dim).
+    Returns 0 when the checkpoint has no cross-attention.
+    """
+    sd = ckpt.get("model_state_dict", None)
+    if not isinstance(sd, dict) or not sd:
+        sd = ckpt.get("ema_state_dict", None)
+    if not isinstance(sd, dict):
+        return 0
+    for k, v in sd.items():
+        if k.endswith("cross_attn.kv.weight") and hasattr(v, "shape"):
+            return int(v.shape[1])
+    return 0
 
 
 def check_ckpt_reinject_gate(ckpt: dict, where: str = "this checkpoint") -> None:

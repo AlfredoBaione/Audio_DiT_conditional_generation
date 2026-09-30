@@ -115,8 +115,9 @@ save_wav: "none"
 conditions: null
 
 # Global conditions: "text", "image", or "text,image".
-# (This is the one key whose name differs from its flag: the CLI spells it
-#  --global, which Python cannot use as an attribute name.)
+# The flag is --global_conds, the same name as this key, like every other
+# option here. (--global is still accepted as an alias: it was the only
+# spelling until 14 Sept 2026 and it is in commands already written down.)
 #
 # INDEPENDENT of `conditions` above: either can be used alone, both together,
 # and each takes any subset. Adding one later is incremental in the same way --
@@ -151,15 +152,42 @@ text_vocab:   null
 #   1 = the class alone        ("Sound_Violin")
 #   2 = class + nearest phrase ("Sound_Violin · \"a bowed tremolo\" (+0.31)")
 #   3 = class + the two nearest, and so on up to the vocabulary length.
-# With --global text this is written for EVERY chunk into
+# With --global_conds text this is written for EVERY chunk into
 #   global_conditions/text_labels.jsonl      one row per chunk
 #   global_conditions/text_labels_cos.npy    the FULL cosine table, same order
 #   global_conditions/text_labels.json       what it was built from
+# and, for the DISTINCT captions only (with --global_conds text, which is what loads
+# the CLAP text tower):
+#   global_conditions/text_labels_emb.npy      their pooled CLAP TEXT embedding
+#   global_conditions/text_labels_tok.npy      the same captions as TOKEN
+#                                              sequences, (n, L, 768) float16
+#   global_conditions/text_labels_tok_len.npy  how many tokens of each are real
+#
+# WHAT READS WHAT. The pooled embeddings are the vector the AdaLN text slot
+# takes under conditioning.text_source = caption|mix, and what
+# sampling.validation_text_from_caption substitutes. The token sequences are
+# what model.text_cross_every attends over -- a pooled vector is a single key,
+# which is a learned bias and not an attention. A training run that asks for the
+# cross-attention on a dataset without them REFUSES TO START.
+#
+# DISTINCT ON THE ENCODED STRING, not on the human one: `drum · "edm" (+0.54)`
+# and the same phrase at (+0.53) are one input to CLAP and one row here, while
+# the per-chunk .jsonl keeps each chunk's own cosines.
+#
+# RE-RUNNING JUST FOR THESE. Point the same command at the same output dir: the
+# sources whose outputs are complete are skipped (no audio read, no latent
+# re-encoded) and only the sidecar is rewritten. It is rewritten whenever one of
+# the files above is missing, so a dataset built before they existed does NOT
+# need --force -- which would redo the whole pipeline.
+#
 # The .npy is why this number is not a commitment: another N is re-derived from
 # it without re-reading a single .npz. The training does NOT decide how many
 # phrases a panel shows -- it reads the caption the dataset carries.
 # The class is exact (the chunk's folder); the phrases are a closed-vocabulary
 # retrieval over the stored CLAP vector and are always shown with their cosine.
+# NB it also decides how much the text channel can carry: with 1 the caption IS
+# the class name, so under text_source=caption the slot becomes a label with as
+# many distinct values as there are classes.
 text_labels_n: 2
 
 # Flatten every source into one class directory.

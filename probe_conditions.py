@@ -18,6 +18,11 @@ Everything downstream is medium-agnostic: whichever conditions a run activates,
 each panel i is driven by the i-th stimulus of every active bank at once, so
 the probe presents the model with exactly the shape it was trained on.
 
+The TEXT bank is the one bank that depends on the dataset: the probe has to
+speak at the level of detail of the text the model is trained on. A dataset
+whose captions are single labels is probed with those labels and nothing else;
+one with richer captions, with TEXT_PROMPTS. See text_probe_bank.
+
 What makes a probe different from the validation rows:
 
     The validation rows score the model against REAL recordings. That is the
@@ -48,7 +53,8 @@ Build one standalone to look at it before training:
     python probe_conditions.py image  ./cache/probe_image
     python probe_conditions.py text   ./cache/probe_text
 (the global banks take no --n_frames: one embedding does not depend on the
-chunk geometry.)
+chunk geometry. The standalone text build is always TEXT_PROMPTS: a training
+run picks its text bank from its dataset.)
 """
 
 import os
@@ -161,26 +167,36 @@ ENERGY_SHAPES = [
 # Each entry is a list of (pitch classes as MIDI note numbers, duration_in_beats)
 # segments, rendered as sustained additive chords. Pitch classes are what a
 # chromagram sees; the octave is chosen inside the tone generator.
+# An EMPTY note list is a rest. In the target a rest is a pale, diffuse column,
+# not a dark one: the chromagram scales every frame to a maximum of 1, silence
+# included.
 CHROMA_CHORDS = [
     ("C_major_triad",   [([60, 64, 67], 8)]),
-    ("A_minor_triad",   [([57, 60, 64], 8)]),
-    ("single_pc_C",     [([48, 60, 72], 8)]),
+    ("A_minor_cadence", [([57, 60, 64], 2), ([62, 65, 69], 2),
+                         ([64, 68, 71], 2), ([57, 60, 64], 2)]),
+    ("single_pc_C_G",   [([48, 60, 72], 4), ([43, 55, 67], 4)]),
     ("I_IV_V",          [([60, 64, 67], 3), ([65, 69, 72], 3),
                          ([67, 71, 74], 2)]),
     ("C_then_Fsharp",   [([60, 64, 67], 4), ([66, 70, 73], 4)]),
-    ("fifth_C_G",       [([60, 67], 8)]),
-    ("tritone_C_Fs",    [([60, 66], 8)]),
+    ("fifths_staccato", [([60, 67], 1.5), ([], 0.5), ([67, 74], 1.5), ([], 0.5),
+                         ([65, 72], 1.5), ([], 0.5), ([60, 67], 1.5), ([], 0.5)]),
+    ("tritone_to_G",    [([60, 66], 4), ([59, 62, 67], 4)]),
     ("alternating_C_F", [([60, 64, 67], 2), ([65, 69, 72], 2),
                          ([60, 64, 67], 2), ([65, 69, 72], 2)]),
-    ("chromatic_cluster", [([60, 61, 62], 8)]),
-    ("whole_tone",      [([60, 62, 64, 66], 8)]),
-    ("quartal_C_F_Bb",  [([60, 65, 70], 8)]),
-    ("D_major_triad",   [([62, 66, 69], 8)]),
+    ("cluster_shift",   [([60, 61, 62], 4), ([65, 66, 67], 4)]),
+    ("whole_tone_alt",  [([60, 62, 64, 66], 2), ([61, 63, 65, 67], 2),
+                         ([60, 62, 64, 66], 2), ([61, 63, 65, 67], 2)]),
+    ("quartal_up_down", [([60, 65, 70], 3), ([62, 67, 72], 3),
+                         ([60, 65, 70], 2)]),
+    ("D_major_repeated", [([62, 66, 69], 1), ([], 0.4), ([62, 66, 69], 1),
+                          ([], 0.4), ([62, 66, 69], 1), ([], 0.4),
+                          ([62, 66, 69], 1)]),
     ("descending_5ths", [([60, 64, 67], 2), ([65, 69, 72], 2),
                          ([58, 62, 65], 2), ([63, 67, 70], 2)]),
     ("pc_sweep",        [([60], 1), ([62], 1), ([64], 1), ([65], 1),
                          ([67], 1), ([69], 1), ([71], 1), ([72], 1)]),
-    ("Eb_major_triad",  [([63, 67, 70], 8)]),
+    ("Eb_two_phrases",  [([63, 67, 70], 1.5), ([56, 60, 63], 1.5), ([], 2),
+                         ([58, 62, 65], 1.5), ([63, 67, 70], 1.5)]),
     ("cluster_then_triad", [([60, 61, 62, 63], 4), ([60, 64, 67], 4)]),
 ]
 
@@ -225,6 +241,12 @@ RHYTHM_GRIDS = [
 # banks there is nothing to synthesize, because the condition is already born as
 # text -- the "synthesizer" hands the string straight to the run's CLAP text
 # encoder, exactly as a caption would be at inference time.
+#
+# WHICH TEXT BANK A RUN USES is decided by its dataset, not here: the probe
+# must say as much as the text the model is trained on, and no more. These
+# descriptions are for a dataset whose captions are RICHER than a single
+# label; a dataset of single labels is probed with its own labels
+# (text_probe_bank, below).
 #
 # The prompts are elementary and mutually distant on purpose, for the same
 # reason the f0 bank holds a scale and not a phrase of real music: an
@@ -288,12 +310,36 @@ IMAGE_SHAPES = [
 ]
 
 # ---- CHORD --------------------------------------------------
-# The chord condition (crema's chord pitch classes) is probed with the chroma
-# bank above, rendered by the same synthesizer: its stimuli already ARE
-# sustained chords, and a triad is exactly what a chord recognizer is for. The
-# clusters and the whole-tone / quartal sets fall outside crema's vocabulary;
-# as with the rhythm grids, the target is whatever the run's own extractor
-# makes of them, so they still score a self-consistent goal.
+# The chord condition (crema's chord pitch classes) is probed with sustained
+# chords, rendered by the chroma synthesizer: a triad is exactly what a chord
+# recognizer is for. This is the list the chroma bank held before that bank was
+# given more movement, kept as it was so that the chord probe (and every chord
+# cache) did not change with it. The clusters and the whole-tone / quartal sets
+# fall outside crema's vocabulary; as with the rhythm grids, the target is
+# whatever the run's own extractor makes of them, so they still score a
+# self-consistent goal.
+CHORD_CHORDS = [
+    ("C_major_triad",   [([60, 64, 67], 8)]),
+    ("A_minor_triad",   [([57, 60, 64], 8)]),
+    ("single_pc_C",     [([48, 60, 72], 8)]),
+    ("I_IV_V",          [([60, 64, 67], 3), ([65, 69, 72], 3),
+                         ([67, 71, 74], 2)]),
+    ("C_then_Fsharp",   [([60, 64, 67], 4), ([66, 70, 73], 4)]),
+    ("fifth_C_G",       [([60, 67], 8)]),
+    ("tritone_C_Fs",    [([60, 66], 8)]),
+    ("alternating_C_F", [([60, 64, 67], 2), ([65, 69, 72], 2),
+                         ([60, 64, 67], 2), ([65, 69, 72], 2)]),
+    ("chromatic_cluster", [([60, 61, 62], 8)]),
+    ("whole_tone",      [([60, 62, 64, 66], 8)]),
+    ("quartal_C_F_Bb",  [([60, 65, 70], 8)]),
+    ("D_major_triad",   [([62, 66, 69], 8)]),
+    ("descending_5ths", [([60, 64, 67], 2), ([65, 69, 72], 2),
+                         ([58, 62, 65], 2), ([63, 67, 70], 2)]),
+    ("pc_sweep",        [([60], 1), ([62], 1), ([64], 1), ([65], 1),
+                         ([67], 1), ([69], 1), ([71], 1), ([72], 1)]),
+    ("Eb_major_triad",  [([63, 67, 70], 8)]),
+    ("cluster_then_triad", [([60, 61, 62, 63], 4), ([60, 64, 67], 4)]),
+]
 
 PROBE_BANKS = {
     "f0": PROBE_MELODIES,
@@ -302,7 +348,7 @@ PROBE_BANKS = {
     "rhythm": RHYTHM_GRIDS,
     "text": TEXT_PROMPTS,
     "image": IMAGE_SHAPES,
-    "chord": CHROMA_CHORDS,
+    "chord": CHORD_CHORDS,
 }
 
 # Which banks are GLOBAL conditions (one vector per sample, AdaLN) rather than
@@ -318,6 +364,75 @@ def is_global_probe(condition: str) -> bool:
     curve. The two differ in medium, in what a target looks like and in what a
     degenerate bank means, and every branch in this file keys off this."""
     return str(condition) in GLOBAL_PROBE_NAMES
+
+
+def _slug(text) -> str:
+    """A label made safe for a stimulus NAME (meta.json, file stems): lower
+    case, every run of characters that are not letters or digits collapsed to
+    one '_'."""
+    s = "".join(ch if ch.isalnum() else "_" for ch in str(text).lower())
+    return "_".join(p for p in s.split("_") if p)[:40] or "caption"
+
+
+def text_probe_bank(caption_table=None, n_panels=None):
+    """
+    -> (bank, why): the TEXT probe bank for the dataset a run trains on, and
+    one line saying which bank was chosen and why.
+
+    `n_panels` is how many panels the run asks for
+    (sampling.n_influence_samples_probe; None = as many as TEXT_PROMPTS, and
+    never more than that). It matters only for the single-label bank below,
+    which is CYCLED to exactly n_panels entries: a random
+    subset of the 16-long cycle could drop a label altogether (4 of 16 over
+    labels A, B, C, D can come out A, A, C, D), while cycling to n keeps every
+    label in turn. The descriptions bank is returned whole, and a smaller
+    n_panels takes its fixed random subset in build_condition_probe_set like
+    any other bank.
+
+    The probe has to speak at the level of detail of the text the model is
+    trained on. That level is written by the preprocessing, as `n_terms` in
+    global_conditions/text_labels.json (1 = the caption is the class alone):
+
+        n_terms == 1   the captions ARE single labels, so the probe uses those
+                       labels and nothing else, taken in turn until the bank is
+                       n_panels long (default: as long as TEXT_PROMPTS):
+                       labels A, B, C give the panels
+                       A, B, C, A, B, C, ... A repeated label is not a wasted
+                       panel: every panel starts from its own noise, so it is
+                       one more generation from the same text.
+        n_terms > 1    the captions are richer than a label: TEXT_PROMPTS.
+
+    A dataset with a text vector but no caption file can only predate that
+    file (the preprocessing writes it whenever it extracts text): TEXT_PROMPTS,
+    as before, and `why` says so.
+
+    `caption_table` is audio_dataset_cond.load_caption_table(...), passed in
+    rather than read here so that this module needs no knowledge of the dataset
+    layout. The labels are the strings the preprocessing gave to CLAP, verbatim
+    and in the table's order: no list of words lives in this file, and another
+    dataset is probed with its own.
+    """
+    table = caption_table or {}
+    labels = [str(c) for c in (table.get("captions_text")
+                               or table.get("captions") or [])]
+    n_terms = table.get("n_terms")
+    n = len(TEXT_PROMPTS)
+    if not labels:
+        return TEXT_PROMPTS, (f"the dataset has no caption file -> the {n} "
+                              f"descriptions")
+    if n_terms is None:
+        return TEXT_PROMPTS, (f"the caption file does not say how many terms "
+                              f"its captions have -> the {n} descriptions")
+    if int(n_terms) > 1:
+        return TEXT_PROMPTS, (f"the dataset's captions have {int(n_terms)} "
+                              f"terms -> the {n} descriptions")
+    if n_panels is not None:
+        n = max(1, min(int(n_panels), n))
+    words = [labels[i % len(labels)] for i in range(n)]
+    more = f" (the first {n} of {len(labels)})" if len(labels) > n else ""
+    return ([(_slug(w), w) for w in words],
+            f"the dataset's captions are single labels -> those labels, in "
+            f"turn: {', '.join(labels[:n])}{more}")
 
 
 # ============================================================
@@ -692,7 +807,7 @@ class ConditionProbeSet:
     conditioned a generation instead of just its slug."""
 
     def __init__(self, condition, directory, names, targets, sr, duration_s,
-                 specs=None):
+                 specs=None, tokens=None, tok_len=None):
         self.condition = str(condition)
         self.dir = str(directory)
         self.names = list(names)
@@ -700,6 +815,13 @@ class ConditionProbeSet:
         self.sr = int(sr)
         self.duration_s = float(duration_s)
         self.specs = list(specs) if specs is not None else []
+        # TEXT probes only: the prompts as TOKEN sequences, (n, L, ctx_dim)
+        # plus their true lengths. The pooled vector in `targets` is what the
+        # AdaLN slot takes and what the similarity metric scores; this is what
+        # a cross-attention can attend over. None on a set built before the
+        # cross-attention existed, and on every non-text condition.
+        self.tokens = tokens
+        self.tok_len = tok_len
         self.is_global = is_global_probe(condition)
 
     def __len__(self):
@@ -738,6 +860,22 @@ class ConditionProbeSet:
             return str(self.specs[i])
         return self.names[i]
 
+    def context(self, i: int):
+        """{'tokens': (1, L, ctx), 'mask': (1, L)} for stimulus i, batch-1 and
+        ready for the model -- or None when this set has no token sequences.
+
+        None means 'this probe cannot drive a cross-attention', and the caller
+        has to decide what that is worth; it must never be read as 'no text',
+        which is a different statement the model has a learned token for.
+        """
+        if self.tokens is None or i >= len(self.tokens):
+            return None
+        tok = torch.from_numpy(np.asarray(self.tokens[i], dtype=np.float32))
+        n = int(self.tok_len[i])
+        mask = torch.zeros(tok.shape[0], dtype=torch.bool)
+        mask[:n] = True
+        return {"tokens": tok.unsqueeze(0), "mask": mask.unsqueeze(0)}
+
     def label(self, i: int) -> str:
         """What to write on a panel for stimulus i: the prompt itself when there
         is one, the slug otherwise."""
@@ -759,11 +897,17 @@ def _synth_fingerprint(condition: str) -> dict:
     return {"synth_sha1": hashlib.sha1((src + helpers).encode()).hexdigest()}
 
 
-def _fingerprint(condition, n_probes, n_frames, sr, duration_s, extractor):
+def _fingerprint(condition, n_probes, n_frames, sr, duration_s, extractor,
+                 bank=None):
     """Everything that would change the targets. The extractor's parameters are
     read off the object with dir() -- NOT vars(), which sees only the instance
     __dict__ and would drop a parameter carried as a class attribute, leaving a
-    stale cache reusable with no sign of it."""
+    stale cache reusable with no sign of it.
+
+    `bank` is the list actually built (None = the module's own), so a text bank
+    that follows the dataset rebuilds its cache when the dataset's labels
+    change. For the module's own bank the payload is byte-identical to what it
+    was before `bank` existed, and every cache on disk stays a hit."""
     ex = {}
     for k in sorted(dir(extractor)):
         if k.startswith("_") or k == "device":   # device: speed, never values
@@ -787,10 +931,11 @@ def _fingerprint(condition, n_probes, n_frames, sr, duration_s, extractor):
                 if is_global_probe(condition) else
                 {"n_frames": int(n_frames), "sr": int(sr),
                  "duration_s": round(float(duration_s), 6)})
+    bank = PROBE_BANKS[condition] if bank is None else bank
     payload = {
         "condition": condition,
         "n_probes": int(n_probes),
-        "stimuli": json.loads(json.dumps(PROBE_BANKS[condition][:n_probes])),
+        "stimuli": json.loads(json.dumps(list(bank)[:n_probes])),
         "synth": _synth_fingerprint(condition),
         "extractor": ex,
         **geometry,
@@ -844,29 +989,87 @@ def _build_global_probe_targets(condition, entries, synth, extractor,
     if verbose and len(targets) > 1:
         M = np.stack(targets)                      # (n, dim), already L2-normed
         S = M @ M.T
-        np.fill_diagonal(S, -np.inf)
-        near = S.max(axis=1)
-        finite = S[np.isfinite(S)]
+        # A bank may REPEAT a stimulus on purpose: a dataset of single labels
+        # cycles its few words over the panels (text_probe_bank). A repeat is
+        # the same condition by construction, not a collision, so the spread is
+        # measured between DIFFERENT stimuli only -- each entry is masked
+        # against itself and against its own repeats. With no repeats this is
+        # exactly the diagonal, i.e. the report is unchanged.
+        keys = [json.dumps(spec, sort_keys=True) for _name, spec in entries]
+        first = {}
+        for i, k in enumerate(keys):
+            first.setdefault(k, i)
+        S[np.array([[a == b for b in keys] for a in keys])] = -np.inf
+        uniq = sorted(first.values())
+        U = S[np.ix_(uniq, uniq)]
+        finite = U[np.isfinite(U)]
         for i, (name, _spec) in enumerate(entries):
+            if first[keys[i]] != i:
+                print(f"  [{i:02d}] {name:<20s} repeat of "
+                      f"[{first[keys[i]]:02d}]")
+                continue
+            if not np.isfinite(S[i]).any():
+                print(f"  [{i:02d}] {name:<20s} dim={targets[i].shape[0]} "
+                      f"(the only distinct stimulus)")
+                continue
             j = int(np.argmax(S[i]))
             flag = ("  <-- nearly identical to its neighbour: these two "
                     "stimuli drive the model with the same condition"
-                    if near[i] > 0.95 else "")
+                    if S[i, j] > 0.95 else "")
             print(f"  [{i:02d}] {name:<20s} dim={targets[i].shape[0]} "
-                  f"nearest={near[i]:+.3f} ({entries[j][0]}){flag}")
-        print(f"{tag} bank spread: mean pairwise cosine "
-              f"{float(finite.mean()):+.3f}, max {float(finite.max()):+.3f} "
-              f"(lower = the stimuli are better separated)")
+                  f"nearest={S[i, j]:+.3f} ({entries[j][0]}){flag}")
+        if finite.size:
+            print(f"{tag} bank spread: mean pairwise cosine "
+                  f"{float(finite.mean()):+.3f}, max "
+                  f"{float(finite.max()):+.3f} "
+                  f"(lower = the stimuli are better separated)"
+                  + (f", over {len(uniq)} distinct stimuli"
+                     if len(uniq) < len(entries) else ""))
     return targets
+
+
+# Seed of the probe SUBSET (fewer stimuli than a bank holds). A constant, not a
+# config key: the subset has to be the same at every metrics step and in every
+# run, or a probe curve would mix "the model improved" with "other stimuli were
+# drawn". Changing it changes which stimuli a smaller probe uses.
+PROBE_SUBSET_SEED = 0
+
+
+def probe_subset_indices(bank_size: int, n: int) -> list:
+    """-> the indices of the bank entries a probe of `n` stimuli uses, in bank
+    order.
+
+    n >= bank_size -> the whole bank, 0..bank_size-1: exactly what every run
+                      did before, so a full probe and its cache are unchanged.
+    n <  bank_size -> n entries drawn at random WITHOUT replacement, from a
+                      generator seeded with PROBE_SUBSET_SEED: random, so a
+                      small probe is not stuck with the head of a bank that is
+                      ordered by kind (the first 4 f0 stimuli are all scales,
+                      arpeggios and leaps); FIXED, so it is the same subset at
+                      every step and in every run. The banks of one run share
+                      one size, hence one subset of positions.
+
+    A local generator: the global numpy / torch streams are not touched."""
+    bank_size = int(bank_size)
+    n = max(1, min(int(n), bank_size))
+    if n >= bank_size:
+        return list(range(bank_size))
+    rng = np.random.default_rng(PROBE_SUBSET_SEED)
+    return sorted(int(i) for i in rng.choice(bank_size, size=n, replace=False))
 
 
 def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
                               n_probes: int = 16, duration_s: float = 5.0,
                               sr: int = DAC_SAMPLE_RATE, force: bool = False,
-                              verbose: bool = True) -> ConditionProbeSet:
+                              verbose: bool = True,
+                              bank=None) -> ConditionProbeSet:
     """
     Build (or load from cache) the out-of-the-box probe set for `condition`
     ("f0" | "energy" | "chroma" | "rhythm" | "chord" | "text" | "image").
+
+    `bank`, when given, replaces PROBE_BANKS[condition] -- same list of
+    (name, spec) -- and is how the text bank follows the dataset
+    (text_probe_bank). None = the module's own bank, as always.
 
     `extractor` is the RUN'S extractor for that condition --
     registry.frame_extractors[condition] for a frame condition,
@@ -881,20 +1084,44 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
         text   -> take the prompt,       ENCODE  a (dim,) CLAP vector
     `n_frames`, `sr` and `duration_s` are ignored for the global conditions:
     nothing about a single embedding depends on the chunk geometry.
+
+    `n_probes` below the bank's size takes a FIXED random subset of it
+    (probe_subset_indices); above it, the whole bank, and it says so. The
+    subset is what gets built, cached and fingerprinted, so changing
+    n_probes rebuilds the cache and the full bank keeps every existing one.
     """
     if condition not in PROBE_BANKS:
         raise ValueError(f"no probe bank for condition '{condition}'. "
                          f"Available: {sorted(PROBE_BANKS)}.")
-    bank = PROBE_BANKS[condition]
-    n_probes = max(1, min(int(n_probes), len(bank)))
+    bank = list(PROBE_BANKS[condition] if bank is None else bank)
+    if not bank:
+        raise ValueError(f"empty probe bank for condition '{condition}'")
+    tag = f"[{condition}-probe]"
+    if int(n_probes) > len(bank) and verbose:
+        print(f"{tag} asked for {int(n_probes)} stimuli, the bank holds "
+              f"{len(bank)} -> using all {len(bank)}")
+    # From here on `bank` IS the stimuli used: the whole bank, or its fixed
+    # random subset, in bank order.
+    full_size = len(bank)
+    bank = [bank[i] for i in probe_subset_indices(full_size, n_probes)]
+    n_probes = len(bank)
     probe_dir = str(probe_dir)
+    # A subset gets a folder of its own next to the full bank's: two runs
+    # sharing one cache_dir with different probe sizes would otherwise rebuild
+    # each other's cache at every start (the fingerprint differs), and could
+    # write the same files at once. The full bank stays where it always was.
+    # Measured against the module's bank as well, because a text bank that
+    # follows the dataset arrives already cycled to the size asked for
+    # (text_probe_bank) and is then "whole" by its own length.
+    if n_probes < max(full_size, len(PROBE_BANKS[condition])):
+        probe_dir = os.path.join(probe_dir, f"subset_{n_probes:02d}")
     os.makedirs(probe_dir, exist_ok=True)
     meta_path = os.path.join(probe_dir, "meta.json")
     npz_path = os.path.join(probe_dir, "targets.npz")
-    fp = _fingerprint(condition, n_probes, n_frames, sr, duration_s, extractor)
+    fp = _fingerprint(condition, n_probes, n_frames, sr, duration_s, extractor,
+                      bank)
     names = [name for name, _ in bank[:n_probes]]
     specs = [spec for _, spec in bank[:n_probes]]
-    tag = f"[{condition}-probe]"
     # The stimulus file, per medium. A text probe has none: the prompt lives in
     # meta.json, so there is nothing on disk to check for or to go missing.
     ext = {"image": ".png"}.get(condition, None if condition == "text" else ".wav")
@@ -909,14 +1136,28 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
             if meta.get("fingerprint") == fp:
                 data = np.load(npz_path)
                 targets = [data[f"probe_{i:02d}"] for i in range(n_probes)]
-                if ext is None or all(os.path.exists(_stim_path(i))
-                                      for i in range(n_probes)):
+                tok = data["tok"] if "tok" in data.files else None
+                tlen = data["tok_len"] if "tok_len" in data.files else None
+                # A TEXT cache written before the token sequences existed is
+                # treated as a MISS, not as a set with no tokens: the
+                # fingerprint cannot see the difference, and a silent hit
+                # would leave a cross-attention run driving every probe with
+                # the null token. Rebuilding costs one pass of CLAP over the
+                # prompts.
+                stale_text = (condition == "text" and tok is None)
+                if stale_text and verbose:
+                    print(f"{tag} cache predates the token sequences "
+                          f"-> rebuilding")
+                if not stale_text and (ext is None
+                                       or all(os.path.exists(_stim_path(i))
+                                              for i in range(n_probes))):
                     if verbose:
                         print(f"{tag} cache hit: {n_probes} stimuli "
                               f"from {probe_dir}")
                     return ConditionProbeSet(condition, probe_dir, names,
                                              targets, sr, duration_s,
-                                             specs=specs)
+                                             specs=specs, tokens=tok,
+                                             tok_len=tlen)
                 if verbose:
                     print(f"{tag} cache metadata matches but the stimulus "
                           f"files are missing -> rebuilding")
@@ -932,8 +1173,25 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
         targets = _build_global_probe_targets(
             condition, bank[:n_probes], synth, extractor, _stim_path, tag,
             verbose)
+        # The same prompts, a second time, as TOKEN sequences. Not a
+        # duplicate: one vector cannot be attended over, so the pooled targets
+        # above and these are the two halves of the same condition.
+        tok = tlen = None
+        if condition == "text" and hasattr(extractor, "encode_tokens"):
+            try:
+                tok, tlen = extractor.encode_tokens([str(sp) for sp in specs])
+                if verbose:
+                    print(f"{tag} token sequences: {tok.shape[0]} x "
+                          f"{tok.shape[1]} token(s) x {tok.shape[2]} "
+                          f"(lengths {int(tlen.min())}..{int(tlen.max())})")
+            except Exception as e:
+                print(f"{tag} token sequences NOT built "
+                      f"({type(e).__name__}: {e}); a cross-attention run "
+                      f"will drive this probe with the null token.")
+                tok = tlen = None
+        extra = ({} if tok is None else {"tok": tok, "tok_len": tlen})
         np.savez(npz_path, **{f"probe_{i:02d}": t
-                              for i, t in enumerate(targets)})
+                              for i, t in enumerate(targets)}, **extra)
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump({"fingerprint": fp, "condition": condition,
                        "names": names,
@@ -947,7 +1205,8 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
         if verbose:
             print(f"{tag} saved to {probe_dir}")
         return ConditionProbeSet(condition, probe_dir, names, targets, sr,
-                                 duration_s, specs=specs)
+                                 duration_s, specs=specs, tokens=tok,
+                                 tok_len=tlen)
 
     # ---- FRAME conditions: synthesize audio, extract a curve ----
     import soundfile as sf
@@ -1026,7 +1285,8 @@ def _title(condition, kind, label, step, prefix, guidance, score):
 def plot_f0_comparison(target, generated, kind="valid", label="",
                        step=None, prefix=None, guidance=None, corr=None,
                        fps: float = DAC_FRAMES_PER_S,
-                       pad_octaves: float = 1.0) -> torch.Tensor:
+                       pad_octaves: float = 1.0,
+                       corr_name: str = "corr") -> torch.Tensor:
     """
     "<target> vs f0_gen": the conditioning contour and the contour re-extracted
     from the generation it conditioned, OVERLAID on one log-Hz axis, with a thin
@@ -1035,6 +1295,10 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
     `kind` names the target in the title and in the legend: "probe" -> f0_probe
     (an elementary synthetic melody), "valid" -> f0_valid (a real validation
     recording). `label` says WHICH one ('scale up', 'sample #12').
+    `corr` is the sample's score and `corr_name` the metric it is, printed as
+    `<corr_name>=<corr>` in the title: "corr" with the project's own metrics,
+    a mir_eval name (overall_accuracy) with metrics.influence_family set to
+    mir_influence_metrics.
 
     Design notes:
       * OVERLAID, not side by side: the quantity of interest is the DIFFERENCE
@@ -1119,7 +1383,7 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
     if guidance is not None:
         sub.append(f"guidance={guidance}")
     if corr is not None and np.isfinite(corr):
-        sub.append(f"corr={corr:+.3f}")
+        sub.append(f"{corr_name}={corr:+.3f}")
     ax.set_title(head, fontsize=17, fontweight="bold",
                  pad=28 if sub else 10)
     if sub:
@@ -1169,7 +1433,8 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
 def plot_condition_comparison(condition, target, generated, kind="valid",
                               label="", step=None, prefix=None, guidance=None,
                               score=None, fps: float = DAC_FRAMES_PER_S,
-                              dpi: int = 130) -> torch.Tensor:
+                              dpi: int = 130,
+                              score_name: str = None) -> torch.Tensor:
     """
     Target vs re-extracted condition, as one image, in the form that suits the
     condition's shape:
@@ -1193,9 +1458,12 @@ def plot_condition_comparison(condition, target, generated, kind="valid",
         # dive to 0 Hz, and voicing in a ribbon under the plot instead of
         # shading that floods the figure when the generation is mostly
         # unvoiced. None of that generalizes to a curve or a heatmap.
+        # `score_name` names the score in its title: the f0 metric depends on
+        # metrics.influence_family (the other titles say `score=` as before).
         return plot_f0_comparison(target, generated, kind=kind, label=label,
                                   step=step, prefix=prefix, guidance=guidance,
-                                  corr=score, fps=fps)
+                                  corr=score, fps=fps,
+                                  corr_name=score_name or "corr")
 
     tgt = np.asarray(target, dtype=np.float32)
     gen = np.asarray(generated, dtype=np.float32)

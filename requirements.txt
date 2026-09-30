@@ -48,7 +48,7 @@ transformers         # CLAP (text) + CLIP (image) global conditions
 Pillow               # image loading for the CLIP image condition
 
 # ---- evaluation metrics ----
-mir_eval             # f0 fidelity: voicing + cents conversion (condition_metrics.py)
+mir_eval             # metrics.influence_family: mir_influence_metrics (condition_metrics.py)
 # VGGish is loaded via torch.hub (harritaylor/torchvggish) — no pip package,
 # but its hubconf.py declares dependencies ['torch','numpy','resampy',
 # 'soundfile'] and torch.hub REFUSES to load the repo if one is missing:
@@ -64,7 +64,8 @@ wav2clip             # image influence — audio in CLIP space (conditions.py)
 
 # =============================================================================
 # NOT installable via this file (environment-specific):
-#   * manage_gpus  — IRCAM-internal GPU-lock package, used ONLY by
-#                    launch_training_cond.py on IRCAM servers. Run the training
-#                    script directly elsewhere.
+#   * manage_gpus  — IRCAM-internal GPU-lock package, used ONLY by the two
+#                    launchers, launch_training_cond.py and launch_test_cond.py,
+#                    on IRCAM servers. Run training_cond.py / test_cond.py
+#                    directly elsewhere.
 # =============================================================================

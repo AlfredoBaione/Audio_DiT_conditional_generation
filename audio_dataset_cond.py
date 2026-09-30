@@ -80,6 +80,111 @@ from conditions import ConditionRegistry
 
 
 # ============================================================
+# THE CAPTION SIDECAR
+# ============================================================
+def caption_dir(latent_root):
+    return Path(latent_root).parent / "global_conditions"
+
+
+def chunk_key_for(latent_root, cond_path):
+    """The key text_labels.jsonl is indexed by: the chunk's .npz path relative
+    to conditions/, without the extension. None when it cannot be formed.
+
+    The sidecar is keyed by PREPROCESSING chunk, which is the unit the CLAP
+    vector belongs to. When the model's n_frames is shorter than a stored chunk,
+    several training samples come out of one chunk and share its caption --
+    correctly: they were extracted from the very same audio.
+    """
+    try:
+        if cond_path is None:
+            return None
+        root = Path(latent_root).parent / "conditions"
+        return Path(cond_path).relative_to(root).with_suffix("").as_posix()
+    except Exception:
+        return None
+
+
+def load_caption_table(latent_root):
+    """
+    Everything preprocess_stream.write_text_labels stored about the CAPTIONS,
+    as one dict -- or {} when the dataset carries none.
+
+        ids      {chunk key: caption index}
+        emb      (n_captions, dim) float32   the CLAP TEXT embedding, pooled
+        tok      (n_captions, L, ctx) float32  its TOKEN-level states
+        tok_len  (n_captions,) int              how many of those are real
+        captions [str]                          what they say
+        captions_text [str]                     the same, as CLAP was given them
+        n_terms  int                            terms per caption (1 = the class)
+
+    ONE loader for both consumers -- the dataset, which hands the vectors to the
+    model, and the metrics step, which uses them for
+    sampling.validation_text_from_caption -- because the two must never disagree
+    about which caption belongs to which chunk. It lives here rather than in the
+    training script for the same reason the embeddings themselves do: this is a
+    property of the DATASET, and reading it must never require CLAP.
+
+    Missing pieces are simply absent from the returned dict: a dataset
+    preprocessed before the token sequences existed still has `emb`, and the
+    caller decides whether that is enough for what it wants to run.
+    """
+    d = caption_dir(latent_root)
+    meta_p, jsonl_p = d / "text_labels.json", d / "text_labels.jsonl"
+    if not (meta_p.exists() and jsonl_p.exists()):
+        return {}
+    try:
+        meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        captions = list(meta.get("captions", []))
+        n_cap = len(captions)
+        if n_cap == 0:
+            return {}
+        ids = {}
+        with open(jsonl_p, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                cid = r.get("caption_id")
+                if r.get("chunk") and cid is not None and 0 <= cid < n_cap:
+                    ids[r["chunk"]] = int(cid)
+        out = {"ids": ids, "captions": captions}
+        # What the text probe needs to speak at the dataset's level of detail
+        # (probe_conditions.text_probe_bank): the strings CLAP was given, and
+        # how many terms each caption has.
+        ctext = list(meta.get("captions_text", []))
+        if len(ctext) == n_cap:
+            out["captions_text"] = ctext
+        if meta.get("n_terms") is not None:
+            out["n_terms"] = int(meta["n_terms"])
+
+        emb_p = d / "text_labels_emb.npy"
+        if emb_p.exists():
+            emb = np.load(str(emb_p)).astype(np.float32)
+            if emb.ndim == 2 and emb.shape[0] == n_cap:
+                out["emb"] = emb
+            else:
+                print(f"[captions] text_labels_emb.npy is {emb.shape} for "
+                      f"{n_cap} caption(s) -> ignored")
+
+        tok_p, len_p = (d / "text_labels_tok.npy", d / "text_labels_tok_len.npy")
+        if tok_p.exists() and len_p.exists():
+            tok = np.load(str(tok_p)).astype(np.float32)
+            tlen = np.load(str(len_p)).astype(np.int64)
+            if (tok.ndim == 3 and tok.shape[0] == n_cap
+                    and tlen.shape == (n_cap,)
+                    and int(tlen.max()) <= tok.shape[1]):
+                out["tok"], out["tok_len"] = tok, tlen
+            else:
+                print(f"[captions] text_labels_tok.npy is {tok.shape} / "
+                      f"{tlen.shape} for {n_cap} caption(s) -> ignored")
+        return out
+    except Exception as e:
+        print(f"[captions] sidecar unreadable ({type(e).__name__}: {e})")
+        return {}
+
+
+# ============================================================
 # CONDITIONED DATASET
 # ============================================================
 class ConditionedAudioDataset(Dataset):
@@ -91,8 +196,14 @@ class ConditionedAudioDataset(Dataset):
         frames:      (n_frames, 72)
         frame_conds: Dict[str, Tensor] — e.g. {"f0": (n_frames, 2), ...}
         label_idx:   int
-        text_emb:    (text_dim,) — embedding of the class name
+        text_emb:    (text_dim,) — the vector the text slot is GIVEN, which
+                     conditioning.text_source decides (the chunk's own CLAP
+                     audio embedding, or its caption's CLAP text one)
         image_emb:   (image_dim,) — random image embedding of the class
+        text_ctx:    {'tokens': (L, ctx_dim), 'mask': (L,)} — the caption as
+                     a SEQUENCE, for the cross-attention. All-False mask
+                     when this dataset has none; the network reads that as
+                     its learned null token.
     """
 
     def __init__(
@@ -108,6 +219,8 @@ class ConditionedAudioDataset(Dataset):
         registry:        Optional[ConditionRegistry] = None,
         preload_latents: bool  = True,
         strict_conditions: bool = True,
+        text_source:     str   = "audio",
+        text_mix_p:      float = 0.5,
     ):
         self.files          = [Path(f) for f in files]
         self.latent_root    = Path(latent_root)
@@ -140,6 +253,37 @@ class ConditionedAudioDataset(Dataset):
         self._text_dim: int = 0
         self._probe_text_dim()
 
+        # WHAT THE TEXT SLOT IS FED, decided here rather than in the model
+        # because it is a property of the DATA:
+        #   audio   -- the chunk's own CLAP AUDIO embedding. What every run
+        #              before 14 Sept 2026 did, and the AudioLDM arrangement.
+        #   caption -- the CLAP TEXT embedding of that chunk's written
+        #              description. The vector a PROMPT puts there at inference,
+        #              so training and test finally see the same distribution.
+        #   mix     -- one or the other, per sample. Deterministic on val/test
+        #              (by index), so the validation loss does not wobble with
+        #              the draw and stays comparable across checkpoints.
+        # The cross-attention CONTEXT is not governed by this: it is always the
+        # caption's tokens, because a pooled audio embedding is one vector and
+        # there is no sequence to attend over. See text_context_for().
+        self.text_source = str(text_source or "audio").lower()
+        if self.text_source not in ("audio", "caption", "mix"):
+            raise ValueError(
+                f"text_source must be 'audio', 'caption' or 'mix', got "
+                f"{text_source!r}")
+        self.text_mix_p = float(text_mix_p)
+        self._captions = load_caption_table(self.latent_root) if self._text_dim else {}
+        self._cap_warned = False
+        if self._text_dim and self.text_source != "audio" and "emb" not in self._captions:
+            raise RuntimeError(
+                f"conditioning.text_source='{self.text_source}' needs the CLAP "
+                f"TEXT embedding of each caption, and this dataset has none "
+                f"(global_conditions/text_labels_emb.npy). Re-run the "
+                f"preprocessing on the same output dir with --global_conds text: it "
+                f"rewrites only the sidecar and does not touch the audio.")
+        self._ctx_dim = int(self._captions["tok"].shape[2]) if "tok" in self._captions else 0
+        self._ctx_len = int(self._captions["tok"].shape[1]) if "tok" in self._captions else 0
+
         self._image_embeddings: Dict[str, List[np.ndarray]] = {}
         self._image_files: Dict[str, List[str]] = {}
         self._image_dim: int = 0
@@ -154,6 +298,13 @@ class ConditionedAudioDataset(Dataset):
               f"frame_conds={'ON' if has_frame_conds else 'OFF'} ({self._get_frame_names()}) | "
               f"text={'ON' if self._text_dim else 'OFF'} | "
               f"image={'ON' if self._image_embeddings else 'OFF'}")
+        if self._text_dim:
+            print(f"[CondDataset/{self.split}] text slot: {self.text_source}"
+                  + (f" (p={self.text_mix_p})" if self.text_source == "mix" else "")
+                  + f" | {len(self._captions.get('captions', []))} distinct "
+                    f"caption(s) | cross-attention context: "
+                  + (f"{self._ctx_len} token(s) x {self._ctx_dim}"
+                     if self._ctx_dim else "NOT in this dataset"))
 
     def _get_frame_names(self) -> List[str]:
         if self.registry is None:
@@ -320,7 +471,7 @@ class ConditionedAudioDataset(Dataset):
             f"[CondDataset/{self.split}] the 'text' global condition is active "
             f"but no chunk carries it. Extract it with:\n"
             f"    python preprocess_stream.py SRC {self.latent_root.parent} "
-            f"--global text\n"
+            f"--global_conds text\n"
             f"(it re-reads the audio but re-encodes no latent, and keeps every "
             f"condition already on disk).")
 
@@ -360,7 +511,7 @@ class ConditionedAudioDataset(Dataset):
                 f"[CondDataset/{self.split}] the 'image' global condition is "
                 f"active but {bank_dir} does not exist. Build it with:\n"
                 f"    python preprocess_stream.py SRC {self.latent_root.parent} "
-                f"--global image --image_root <folder of <class>/*.jpg>\n"
+                f"--global_conds image --image_root <folder of <class>/*.jpg>\n"
                 f"(it encodes only the images; no latent is touched).")
 
         wanted = set(self._present_classes or list(self.label_to_idx.keys()))
@@ -576,7 +727,7 @@ class ConditionedAudioDataset(Dataset):
                 raise RuntimeError(
                     f"'text' missing for {npy_path.name} (cond_path={cond_path}). "
                     f"Re-run: python preprocess_stream.py SRC "
-                    f"{self.latent_root.parent} --global text  "
+                    f"{self.latent_root.parent} --global_conds text  "
                     f"-- or set training.strict_conditions=false to zero-fill it.")
             self._warn_cond_once("'text' missing -> zero-filled")
             text_emb = torch.zeros(self._text_dim)
@@ -598,7 +749,85 @@ class ConditionedAudioDataset(Dataset):
         else:
             img_emb = torch.zeros(1)
 
-        return frames, frame_cond, label_idx, text_emb, img_emb
+        # 5. THE TEXT SLOT AND ITS CONTEXT.
+        # Done last because it may REPLACE text_emb computed above: under
+        # text_source 'caption' (or a 'mix' draw) the slot receives the
+        # caption's CLAP TEXT vector instead of the chunk's own audio one.
+        cid = self._caption_id_for(cond_path)
+        if self._text_dim and self._use_caption_for(idx):
+            cap = self._captions.get("emb")
+            if cap is not None and cid is not None:
+                text_emb = torch.from_numpy(cap[cid].copy())
+            elif self.strict_conditions:
+                raise RuntimeError(
+                    f"text_source='{self.text_source}' but {npy_path.name} has "
+                    f"no caption in global_conditions/text_labels.jsonl "
+                    f"(key={chunk_key_for(self.latent_root, cond_path)!r}). "
+                    f"Re-run the preprocessing with --global_conds text, or set "
+                    f"training.strict_conditions=false to fall back to the "
+                    f"chunk's own audio vector.")
+            else:
+                self._warn_cap_once("no caption for this chunk -> audio vector")
+
+        text_ctx = self.text_context_for(cid)
+
+        return frames, frame_cond, label_idx, text_emb, img_emb, text_ctx
+
+    # ---- caption plumbing -------------------------------------------------
+    def _warn_cap_once(self, msg):
+        if not self._cap_warned:
+            self._cap_warned = True
+            print(f"[CondDataset/{self.split}] captions: {msg} "
+                  f"(warned once)")
+
+    def _caption_id_for(self, cond_path):
+        key = chunk_key_for(self.latent_root, cond_path)
+        if key is None:
+            return None
+        return self._captions.get("ids", {}).get(key)
+
+    def _use_caption_for(self, idx: int) -> bool:
+        """Whether THIS sample's text slot takes the caption vector.
+
+        'mix' is random on train -- that is the point, the model must see both
+        distributions -- and DETERMINISTIC elsewhere. A validation loss whose
+        conditioning is re-drawn at every evaluation is a loss that moves for
+        reasons that have nothing to do with the model, and the whole use of
+        that curve is to be compared with itself across checkpoints.
+        """
+        if self.text_source == "audio":
+            return False
+        if self.text_source == "caption":
+            return True
+        if self.split == "train":
+            return random.random() < self.text_mix_p
+        return (idx % 2) == 0
+
+    def text_context_for(self, cid):
+        """{'tokens': (L, ctx_dim), 'mask': (L,) bool} for the cross-attention.
+
+        ALWAYS the caption's tokens, whatever text_source says, because this is
+        the one channel that cannot take an audio embedding: CLAP's audio tower
+        returns a single vector and an attention over one key is a learned bias.
+
+        A dataset with no token sidecar, or a chunk with no caption, gets a
+        single all-False mask. That is not "skip the sub-layer" -- the network
+        reads an empty mask as its LEARNED NULL TOKEN, the same value the CFG
+        dropout trains -- so the shape is always well-defined and there is never
+        a third state. A run that MEANT to use the cross-attention must not get
+        here silently, which is why training_cond refuses to start when
+        model.text_cross_every > 0 and the dataset has no tokens.
+        """
+        L = max(1, self._ctx_len)
+        D = max(1, self._ctx_dim)
+        tok = self._captions.get("tok")
+        if tok is None or cid is None:
+            return {"tokens": torch.zeros(L, D),
+                    "mask": torch.zeros(L, dtype=torch.bool)}
+        n = int(self._captions["tok_len"][cid])
+        mask = torch.zeros(L, dtype=torch.bool)
+        mask[:n] = True
+        return {"tokens": torch.from_numpy(tok[cid].copy()), "mask": mask}
 
 
 # ============================================================
@@ -606,7 +835,7 @@ class ConditionedAudioDataset(Dataset):
 # ============================================================
 def collate_conditioned(batch):
     """Custom collate for the DataLoader."""
-    frames_l, conds_l, labels_l, text_l, image_l = zip(*batch)
+    frames_l, conds_l, labels_l, text_l, image_l, ctx_l = zip(*batch)
 
     frames = torch.stack(frames_l)
     labels = torch.tensor(labels_l, dtype=torch.long)
@@ -618,7 +847,14 @@ def collate_conditioned(batch):
         for name in conds_l[0].keys():
             frame_conds[name] = torch.stack([c[name] for c in conds_l])
 
-    return frames, frame_conds, labels, text_embs, image_embs
+    # The context is padded to a fixed length by the dataset (every caption
+    # shares one table), so a plain stack is correct and no per-batch padding
+    # is needed. The mask travels with it: without it the model cannot tell a
+    # short caption from a long one that happens to end in zeros.
+    text_ctx = {"tokens": torch.stack([c["tokens"] for c in ctx_l]),
+                "mask":   torch.stack([c["mask"]   for c in ctx_l])}
+
+    return frames, frame_conds, labels, text_embs, image_embs, text_ctx
 
 
 # ============================================================
@@ -634,6 +870,8 @@ def build_conditioned_datasets(
     preload:         bool = True,
     strict_conditions: bool = True,
     splits_path:     Optional[str] = None,
+    text_source:     str = "audio",
+    text_mix_p:      float = 0.5,
 ):
     """
     Builds the conditioned train/val/test datasets from the SPLIT-LESS dataset,
@@ -692,7 +930,7 @@ def build_conditioned_datasets(
         print("[build_conditioned_datasets] note: image_root is no longer read "
               "at training time. The image condition comes from the dataset's "
               "own global_conditions/image/ bank (preprocess_stream.py "
-              "--global image --image_root ...).")
+              "--global_conds image --image_root ...).")
 
     common = dict(
         label_to_idx=label_to_idx,
@@ -703,6 +941,8 @@ def build_conditioned_datasets(
         normalizer=normalizer,
         registry=registry,
         strict_conditions=strict_conditions,
+        text_source=text_source,
+        text_mix_p=text_mix_p,
     )
 
     train = ConditionedAudioDataset(files=splits["train"], split="train",

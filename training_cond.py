@@ -109,7 +109,7 @@ from audio_dataset_npy import (
 )
 from network_cond import ConditionedAudioDiT, TOKEN_DIM, check_ckpt_reinject_gate
 from audio_dataset_cond import (
-    build_conditioned_datasets, collate_conditioned,
+    build_conditioned_datasets, collate_conditioned, load_caption_table,
 )
 from conditions import (
     ConditionRegistry,
@@ -357,28 +357,60 @@ def _validate_cache(cache_dir, fingerprint, guarded_files):
     print(f"[cache] fresh cache -> wrote {meta_path}")
 
 
-def _scan_frame_conditions(condition_root):
+def _npz_keys(npz):
+    """Key list of ONE .npz (no array decompression), or None if unreadable."""
+    try:
+        with np.load(str(npz)) as d:
+            return set(d.files)
+    except Exception:
+        return None
+
+
+def _scan_frame_conditions(condition_root, io_workers=16, block=4096):
     """
     SPLIT-LESS full scan: over ALL .npz under condition_root (any depth), count
     how many exist and, per condition name, in how many the key is present. Reads
-    only the .npz key list (no array decompression), so it stays cheap.
+    only the .npz key list (no array decompression).
     Returns {"total": int, "present": {name: count}}.
+
+    PARALLEL READS + a progress bar. Each file costs a disk round trip, not
+    computation -- measured 10-16 ms per file the first time it is read against
+    0.12 ms once it is in the OS cache -- and there is one file per chunk. Read
+    one at a time that is minutes on a small dataset but HOURS on a corpus of
+    hundreds of thousands of chunks, spent in silence with the GPU already
+    locked and idle: on IRCAM that gets the run terminated before it starts
+    (XL_chord_lakh on oban, 30 Sept 2026). `io_workers` threads cut the cold
+    scan 8.7x on the laptop it was measured on (np.load releases the GIL during
+    I/O); the COUNTS are the same, a count does not depend on the order the
+    files are read in. There is no work here a GPU could take over -- the time
+    is the disk.
+
+    The paths are handed to the pool `block` at a time: executor.map() would
+    otherwise turn the whole file list into futures up front, which is GBs of
+    host RAM on a multi-million-file corpus.
     """
     from collections import Counter as _Counter
+    from concurrent.futures import ThreadPoolExecutor
+    from itertools import islice
     root = Path(condition_root) if condition_root else None
     if root is None or not root.exists():
         return {"total": 0, "present": {}}
     total = 0
     present = _Counter()
-    for npz in root.rglob("*.npz"):
-        try:
-            with np.load(str(npz)) as d:
-                keys = set(d.files)
-        except Exception:
-            continue
-        total += 1
-        for k in keys:
-            present[k] += 1
+    paths = root.rglob("*.npz")
+    with ThreadPoolExecutor(max_workers=max(1, io_workers)) as ex:
+        with tqdm(desc="Condition scan", unit="file") as pbar:
+            while True:
+                chunk = list(islice(paths, block))
+                if not chunk:
+                    break
+                for keys in ex.map(_npz_keys, chunk):
+                    if keys is None:
+                        continue
+                    total += 1
+                    for k in keys:
+                        present[k] += 1
+                pbar.update(len(chunk))
     return {"total": total, "present": dict(present)}
 
 
@@ -450,6 +482,27 @@ def load_config():
                   "from the YAML/CLI).")
         del _meta
 
+    # THE INFLUENCE SET, ONE KNOB -> TWO (29 Sept 2026). A config written before
+    # then -- the checkpoint's own on a resume, or an old dumped config.yaml
+    # passed with --config -- carries sampling.n_influence_samples, which meant
+    # BOTH halves. Its value becomes both new keys, so an old run resumes with
+    # exactly the panels it had; on a resume it wins over the YAML's defaults
+    # like every other checkpoint value. The old key is then removed, so the
+    # dumped config.yaml holds only what the code reads. Before the CLI merge,
+    # so a CLI value for the new keys still wins.
+    _smp = cfg.get("sampling", None)
+    if _smp is not None and "n_influence_samples" in _smp:
+        _old = _smp.get("n_influence_samples")
+        # 0 as well as null: the old reader was `... or 16`, so an old 0 ran
+        # with 16 -- and that is what the resumed run must keep.
+        _old = int(_old or 16)
+        for _k in INFLUENCE_SET_KEYS.values():
+            _smp[_k] = _old
+        del _smp["n_influence_samples"]
+        print(f"[config] sampling.n_influence_samples={_old} (older config) -> "
+              f"n_influence_samples_valid={_old}, "
+              f"n_influence_samples_probe={_old}")
+
     # CLI overrides win over everything (YAML + checkpoint config), but a typo in
     # a key must FAIL rather than silently create a phantom top-level entry while
     # the real parameter keeps its YAML value. `from_dotlist` parses each token,
@@ -465,12 +518,32 @@ def load_config():
             base_keys = set(_flatten_keys(OmegaConf.to_container(cfg, resolve=False)))
             bad = [k for k in _flatten_keys(OmegaConf.to_container(cli_cfg))
                    if k not in base_keys]
+            _hint = ""
+            if "sampling.n_influence_samples" in bad:
+                _hint = ("\n          sampling.n_influence_samples is now two "
+                         "keys: sampling.n_influence_samples_valid and "
+                         "sampling.n_influence_samples_probe.")
             raise SystemExit(
                 f"[config] unknown CLI override key(s): {bad or [str(e)]}\n"
                 f"          These do not exist in {args.config}. Check the "
                 f"spelling and the dotted path (e.g. 'data.num_val_batches', not "
-                f"'data_num_val_batches'). Nothing was run.")
+                f"'data_num_val_batches'). Nothing was run.{_hint}")
         OmegaConf.set_struct(cfg, False)
+
+    # The two influence-set sizes, checked here so a bad value costs a second.
+    # Validation must keep at least one sample: its panels and the audio preview
+    # number their blocks off that list, and with none of it they would fall
+    # back to a different spread of the validation set. The probe may be 0 (off).
+    _smp = cfg.get("sampling", None)
+    if _smp is not None:
+        for _which, _lo in (("valid", 1), ("probe", 0)):
+            _k = INFLUENCE_SET_KEYS[_which]
+            _v = _smp.get(_k, None)
+            if _v is not None and int(_v) < _lo:
+                raise SystemExit(
+                    f"[config] sampling.{_k} = {_v}, must be >= {_lo}"
+                    f"{' (0 turns the probe off)' if _which == 'probe' else ''}"
+                    f". Nothing was run.")
 
     # CFG DROPOUT BUCKETS: the three group probabilities must leave room for the
     # "keep both" case. They partition [0, 1) into disjoint ranges (see
@@ -607,7 +680,7 @@ class EMAModel:
 # ======================
 def apply_cfg_dropout(frame_cond, global_cond, device, global_configs, B,
                       p_drop_all, p_drop_frame, p_drop_global,
-                      p_drop_each_frame=0.0):
+                      p_drop_each_frame=0.0, text_ctx_mask=None):
     """
     Per-sample CFG dropout, in two stages.
 
@@ -672,7 +745,20 @@ def apply_cfg_dropout(frame_cond, global_cond, device, global_configs, B,
             global_cond[k] = global_cond[k] * keep_mask \
                              + null_g[k] * (1 - keep_mask)
 
-    return frame_cond, global_cond
+    # The cross-attention context follows the SAME coin as the pooled text.
+    # It has to: they are two views of one condition, and dropping one while
+    # keeping the other would build a branch -- "no vector but here are the
+    # words" -- that the CFG null pass never produces and that guidance would
+    # then extrapolate away from nothing.
+    #
+    # Only the MASK is dropped, not the tokens. A row masked to all-False is
+    # what ConditionedAudioDiT reads as its learned null token, so the null of
+    # this channel is a value the model owns rather than a tensor this function
+    # has to invent -- and the tokens do not have to be re-written every step.
+    if text_ctx_mask is not None:
+        text_ctx_mask = text_ctx_mask & (~drop_g).view(B, 1)
+
+    return frame_cond, global_cond, text_ctx_mask
 
 
 # ======================
@@ -684,7 +770,7 @@ VALIDATION_PROTOCOL = "fixed_subset_common_noise_sample_weighted_v2"
 def compute_loss(model, batch, device, use_amp, t_min, t_max,
                  global_configs, p_drop_all, p_drop_frame, p_drop_global,
                  training=True, x0=None, t=None, p_drop_each_frame=0.0):
-    frames, frame_cond, _labels, text_embs, image_embs = batch
+    frames, frame_cond, _labels, text_embs, image_embs, text_ctx = batch
     # NB: `labels` is discarded as conditioning (CLAP-text plays that role
     # better now). It is kept in the batch only as metadata for logging.
 
@@ -716,18 +802,29 @@ def compute_loss(model, batch, device, use_amp, t_min, t_max,
     if "image" in global_configs:
         gc["image"] = image_embs.to(device)
 
+    # The text SEQUENCE. Sent only when the model actually has a
+    # cross-attention: on every other model it would be silently ignored, and
+    # moving a (B, L, 768) tensor to the GPU every step to have it ignored is
+    # bandwidth spent on nothing.
+    ctx = ctx_mask = None
+    if getattr(model, "text_cross_layers", None) and text_ctx is not None:
+        ctx = text_ctx["tokens"].to(device, non_blocking=True)
+        ctx_mask = text_ctx["mask"].to(device, non_blocking=True)
+
     # CFG dropout only at training time
     if training:
-        fc, gc = apply_cfg_dropout(
+        fc, gc, ctx_mask = apply_cfg_dropout(
             fc, gc, device, global_configs, B,
             p_drop_all=p_drop_all,
             p_drop_frame=p_drop_frame,
             p_drop_global=p_drop_global,
             p_drop_each_frame=p_drop_each_frame,
+            text_ctx_mask=ctx_mask,
         )
 
     with torch.amp.autocast('cuda', enabled=use_amp):
-        pred = model(xt, t, frame_conditions=fc, global_conditions=gc)
+        pred = model(xt, t, frame_conditions=fc, global_conditions=gc,
+                     text_context=ctx, text_context_mask=ctx_mask)
         loss = F.mse_loss(pred, target)
     return loss
 
@@ -735,7 +832,8 @@ def compute_loss(model, batch, device, use_amp, t_min, t_max,
 @torch.no_grad()
 def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
                       frame_cond, global_cond, guidance,
-                      frame_dims, global_configs, gen_rng=None):
+                      frame_dims, global_configs, gen_rng=None,
+                      text_ctx=None):
     """
     Euler integrator with classifier-free guidance.
     Both `frame_cond` and `global_cond` are expected as batch=1 dicts on device.
@@ -744,6 +842,12 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
     `gen_rng` (optional torch.Generator) fixes the initial-noise x0 so the metric
     FD/KL are comparable across checkpoints (mirrors the uncond metrics seed);
     None = free-running.
+
+    `text_ctx` is {"tokens": (1, L, d), "mask": (1, L)} for the cross-attention,
+    or None. The NULL branch always passes text_context=None, which the model
+    resolves to its learned null token -- the same value the training dropout
+    showed it, which is the only thing that makes the extrapolation below mean
+    anything.
     """
     model.eval()
     x = torch.randn(1, n_frames, TOKEN_DIM, device=device, generator=gen_rng)
@@ -755,7 +859,14 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
     # NB: test the CONTENT, not `is not None`: with every condition disabled the
     # caller passes empty dicts ({}), which are "no conditioning" -- treating them
     # as present would engage CFG and burn two IDENTICAL forwards per step.
-    has_cond = bool(frame_cond) or bool(global_cond)
+    # The context only exists for a model that has the sub-layer; anything else
+    # would be ignored, and the null branch never sends one at all.
+    ctx = ctx_mask = None
+    if getattr(model, "text_cross_layers", None) and text_ctx is not None:
+        ctx = text_ctx["tokens"].to(device)
+        ctx_mask = text_ctx["mask"].to(device)
+
+    has_cond = bool(frame_cond) or bool(global_cond) or (ctx is not None)
     use_cfg = (guidance > 1.0) and has_cond
 
     for i in range(steps):
@@ -765,13 +876,16 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
             if use_cfg:
                 fc = frame_cond if frame_cond else null_fc
                 gc = global_cond if global_cond else null_gc
-                v_c = model(x, t, frame_conditions=fc,      global_conditions=gc)
-                v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc)
+                v_c = model(x, t, frame_conditions=fc,      global_conditions=gc,
+                            text_context=ctx, text_context_mask=ctx_mask)
+                v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc,
+                            text_context=None)
                 v = v_u + guidance * (v_c - v_u)
             else:
                 v = model(x, t,
                           frame_conditions=frame_cond or null_fc,
-                          global_conditions=global_cond or null_gc)
+                          global_conditions=global_cond or null_gc,
+                          text_context=ctx, text_context_mask=ctx_mask)
         x = x + v.float() * dt
 
     return x[0].cpu()
@@ -780,7 +894,8 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
 @torch.no_grad()
 def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_amp,
                             frame_cond, global_cond, guidance,
-                            frame_dims, global_configs, gen_rng=None):
+                            frame_dims, global_configs, gen_rng=None,
+                            text_ctx=None):
     """
     FUSED CFG sampler: produces the CONDITIONED and the UNCONDITIONAL samples for
     B samples at once, from the same initial noise, in ONE batch-3B forward per
@@ -848,13 +963,32 @@ def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_am
     global_batch = {n: torch.cat([gc_c.get(n, null_gc[n]), null_gc[n], null_gc[n]],
                                  dim=0) for n in null_gc}
 
+    # The text sequence, stacked the same way. The tokens are repeated on all
+    # three branches and only the MASK distinguishes them: rows B..3B-1 are
+    # masked to all-False, which the model resolves to its learned null token.
+    # Repeating the tokens rather than sending zeros keeps this tensor one
+    # `cat` of one array -- and the mask is the single place where "this branch
+    # has no text" is written, so the two null branches cannot drift apart.
+    ctx_batch = ctx_mask_batch = None
+    if getattr(model, "text_cross_layers", None) and text_ctx is not None:
+        tok = text_ctx["tokens"].to(device)
+        msk = text_ctx["mask"].to(device)
+        if tok.shape[0] != B:
+            raise ValueError(
+                f"text_ctx has batch {tok.shape[0]}, the conditions say B={B}")
+        ctx_batch = torch.cat([tok, tok, tok], dim=0)
+        ctx_mask_batch = torch.cat(
+            [msk, torch.zeros_like(msk), torch.zeros_like(msk)], dim=0)
+
     for i in range(steps):
         tv = t_min + i * dt
         t = torch.ones(3 * B, device=device) * tv
         xb = torch.cat([x_cond, x_cond, x_unc], dim=0)   # (3B, n_frames, TOKEN_DIM)
         with torch.amp.autocast('cuda', enabled=use_amp):
             vb = model(xb, t, frame_conditions=frame_batch,
-                       global_conditions=global_batch)
+                       global_conditions=global_batch,
+                       text_context=ctx_batch,
+                       text_context_mask=ctx_mask_batch)
         v_c    = vb[0:B].float()
         v_null = vb[B:2 * B].float()
         v_u    = vb[2 * B:3 * B].float()
@@ -914,42 +1048,57 @@ def audio_panel_tags(family, idx, active_conditions=(), suffix="",
        cards that stay together and are visibly walled off from the next sample.
 
     2. Inside a block cards are sorted alphabetically and flow into a grid that
-       wraps every 2-3 cards depending on window width. Only the first two
-       positions are therefore side by side at EVERY width -- so slots 1 and 2
-       are the f0 target and the generation conditioned on it, the one A/B these
-       panels exist for.
+       wraps every 2-3 cards depending on window width, so the numeric prefix
+       is what fixes the listening order. That order is: the RECORDING the
+       conditions were extracted from, then EVERY condition the generation was
+       given, then the generation itself LAST.
 
-          1  f0_<family>_XX                     the sonified f0 target
-          2  generation_with_f0_<family>_XX     the generation it conditioned
-          3+ <condition>_<family>_XX            energy, chroma, ... alphabetical
+          1  real_validation_XX         the recording (validation blocks only)
+          2  f0_<family>_XX             the sonified f0 target, when f0 is on
+          3..N <condition>_<family>_XX  the others, alphabetical
+          N+1  generation_<family>_XX   the generation, after all of them
 
-    3. The unconditional generation and the real recording do NOT live in the
-       per-sample block. Each is COLLECTED into a group of its own, holding one
-       card per sample, so that all of them can be heard as a grid of peers
-       instead of one at a time inside separate collapsibles:
+       A PROBE block has no recording -- its stimuli are synthesised, there is
+       nothing they were extracted from -- so there the conditions start at 1.
 
-          uncond generation/uncond_<family>_XX<suffix>
-          ground truth/real_<family>_XX
+       The generation is not named after any single condition. It used to be
+       `generation_with_f0_XX`, which read as "conditioned on f0" on a run that
+       also drove chroma and text -- the card is the generation of the WHOLE
+       block, and the block header (and the condition cards above it) already
+       say what went into it.
+
+    3. The unconditional generation does NOT live in the per-sample block. It is
+       COLLECTED into a group of its own, holding one card per sample, so that
+       all of them can be heard as a grid of peers instead of one at a time
+       inside separate collapsibles:
+
+          uncond generation/uncond_<family>_XX
+
+       The 'ground truth' group is what is LEFT of the same idea: it now holds
+       the recordings of an UNCONDITIONED run only. In a conditioned run every
+       recording sits at the top of its own validation block instead, next to
+       the conditions that were extracted from it -- which is the comparison
+       anyone actually makes, and it was being made across two windows.
 
        The family and the index in the CARD name are what ties a card back to
        the block it belongs to: 'uncond generation/uncond_validation_03' is the
-       null twin of 'validation_03/2_generation_with_f0_validation_03', drawn
-       from the same noise, and 'ground truth/real_validation_03' is the
-       recording that block's conditions were extracted from. These groups are
-       flat -- no numeric prefix -- because nothing inside them is an ordered
-       A/B against a neighbouring card.
+       null twin of 'validation_03/4_generation_validation_03', drawn from the
+       same noise. The group is flat -- no numeric prefix -- because nothing
+       inside it is an ordered A/B against a neighbouring card.
 
     The card names repeat the family and index that the block header already
     shows. That redundancy is deliberate: a card read, filtered or screenshotted
     on its own still says what it is and which sample it belongs to.
 
     `family` is "probe" or "validation". `suffix` decorates the BLOCK header
-    (the probe melody's name) and, since the collected groups have no block
-    header to carry it, the uncond CARD name as well; the index stays the
-    cross-reference to the f0 image of the same sample either way. If f0 is not
-    among the active conditions the first one alphabetically leads instead, and
-    the generation card is named after IT -- the panel never claims an f0
-    pairing that was not part of the run.
+    only (the probe prompt, the validation label). It is deliberately NOT put
+    on the uncond card: "uncond_probe_00 [solo pipe organ ...]" reads as a
+    generation driven by that prompt, which is the one thing it is not. The
+    index is the cross-reference to the block (and to the f0 image of the same
+    sample), where the prompt can be read. f0 leads the
+    condition cards when it is active because it is the one most listened to
+    against the generation; if it is off, the first condition alphabetically
+    takes slot 1 and nothing else changes.
 
     With NO condition active at all (pure-unconditional run) the block
     generation IS the unconditional generation -- nothing was dropped to obtain
@@ -973,41 +1122,128 @@ def audio_panel_tags(family, idx, active_conditions=(), suffix="",
     block = f"{family}_{idx:02d}{suffix}"
     tail = f"{family}_{idx:02d}"
 
-    conditions = {}
-    if lead is not None:
-        conditions[lead] = f"{block}/1_{lead}_{tail}"
-    for j, cname in enumerate(n for n in active if n != lead):
-        conditions[cname] = f"{block}/{3 + j}_{cname}_{tail}"
+    # THE RECORDING LEADS THE BLOCK -- but only where one exists. A validation
+    # panel is built FROM a real chunk: its conditions were extracted from that
+    # recording, so the recording is where the listening starts, the conditions
+    # are what was taken out of it, and the generation is what they produced. A
+    # probe panel has no such recording (its stimuli are synthesised), and an
+    # unconditioned run has no per-sample block at all -- there the recording
+    # keeps its own collected group, which is the only way to hear real material
+    # in a run with no panels.
+    panel_real = (family == "validation" and conditioned)
+    first = 2 if panel_real else 1
 
-    uncond = f"{UNCOND_AUDIO_GROUP}/uncond_{tail}{suffix}"
-    real = f"{REAL_AUDIO_GROUP}/real_{tail}"
+    # Then every condition card -- f0 leading when it is on -- and the
+    # generation after the last of them, so a panel is listened to in the order
+    # it was built: the recording, the stimuli taken from it, then what they
+    # produced.
+    ordered = ([lead] + [n for n in active if n != lead]) if lead else []
+    conditions = {c: f"{block}/{j + first}_{c}_{tail}"
+                  for j, c in enumerate(ordered)}
+    gen_slot = len(ordered) + first
+
+    uncond = f"{UNCOND_AUDIO_GROUP}/uncond_{tail}"
+    real = (f"{block}/1_real_{tail}" if panel_real
+            else f"{REAL_AUDIO_GROUP}/real_{tail}")
 
     return {
         "conditions": conditions,
-        # Three cases, not two:
-        #   a frame condition leads  -> the card is named after it;
-        #   only globals conditioned -> the generation still owns a card in the
-        #     block, but there is no frame condition to name it after (a CLAP
-        #     vector has no waveform to sit beside it);
-        #   nothing conditioned      -> the generation IS the uncond card, and
-        #     the two keys deliberately name the same tag: the callers that
-        #     write the null baseline are guarded on a condition being active,
-        #     so the tag is still written exactly once.
-        "generation": (f"{block}/2_generation_with_{lead}_{tail}"
-                       if lead is not None
-                       else (f"{block}/2_generation_{tail}" if conditioned
-                             else uncond)),
+        # Two cases:
+        #   anything conditioned -> the generation owns the last card of the
+        #     block, named after the block and NOT after one of the conditions
+        #     (naming it after f0 hid chroma, rhythm and text from a reader of
+        #     the card alone -- the very conditions the panel is there to show);
+        #   nothing conditioned  -> the generation IS the uncond card, and the
+        #     two keys deliberately name the same tag: the callers that write
+        #     the null baseline are guarded on a condition being active, so the
+        #     tag is still written exactly once.
+        "generation": (f"{block}/{gen_slot}_generation_{tail}"
+                       if conditioned else uncond),
         "generation_no_cond": uncond,
         "real": real,
     }
-def subset_generation_tag(family, idx, label, suffix=""):
+def subset_generation_tag(family, idx, label, suffix="", n_conditions=0,
+                          has_real=False):
     """
     The audio card of ONE condition-subset generation, inside that sample's
-    block. Slot 2 like the reference generation, so every generation of the
-    sample sits together right after the condition cards and they sort among
-    themselves by subset label.
+    block. It takes the SAME slot as the reference generation -- the one right
+    after the last condition card -- so every generation of the sample sits
+    together at the end of the block and they sort among themselves by subset
+    label. `n_conditions` is how many condition cards the block holds; pass the
+    same count audio_panel_tags was given, or the ladder lands above the
+    stimuli instead of below them. `has_real` says whether the recording takes
+    slot 1 of that block (true for a conditioned validation panel), because that
+    is what shifts every card below it down by one.
     """
-    return f"{family}_{idx:02d}{suffix}/2_gen_{label}_{family}_{idx:02d}"
+    return (f"{family}_{idx:02d}{suffix}"
+            f"/{int(n_conditions) + (2 if has_real else 1)}"
+            f"_gen_{label}_{family}_{idx:02d}")
+
+
+# The tags already written by THIS board's fixed cards, one per line. Lives
+# beside the events files because that is what it describes.
+FIXED_CARDS_FILE = ".fixed_cards_logged"
+
+
+def fixed_card_pending(writer, tag):
+    """True the FIRST time `tag` has to be written into this TensorBoard run
+    directory, False every time after -- for the cards that never change.
+
+    WHAT THIS IS FOR. A condition card is a STIMULUS: the sonified f0 the
+    generation was asked for, the picture it was shown, the recording the
+    conditions were extracted from. Those are read from disk, not generated, so
+    they are identical at every step -- the validation panels are a FIXED set of
+    samples (metrics_sample_positions) and the probe stimuli are fixed by
+    construction. Re-logging them gave every one of those cards a step slider
+    that walked through copies of the same picture, right beside the generation
+    whose slider means something. Written once, the card has a single step and
+    TensorBoard drops the control entirely (the audio and image loaders gate the
+    <paper-slider> on `_hasMultipleSteps`, i.e. steps.length > 1). A card with
+    one step is NOT empty at later steps: each card's slider is built from that
+    card's OWN steps, so the loader keeps showing its only datum whatever the
+    generation cards are showing.
+
+    WHY A FILE, PER TAG. A resume reopens the same run directory with a NEW
+    events file, and a second write would file two identical entries under one
+    tag -- bringing the slider back with two copies of the same thing. So what
+    has been written has to outlive the process. Per TAG rather than per family
+    because the writers cover different panels: the cheap audio preview
+    refreshes the first n_audio_samples blocks, the metrics step covers the
+    whole influence set, and the real recordings are logged at startup. One flag
+    for all of them would let whichever ran first close the door on the others.
+
+    A resume into a FRESH run directory finds no file and writes every card
+    again, which is what that board needs. Deleting the file re-writes them all
+    on the next step -- which is also the answer if the panels are ever widened
+    (n_influence_samples_valid / _probe or n_plot raised) on an existing board."""
+    d = getattr(writer, "log_dir", None)
+    if not d:
+        return True                      # nowhere to remember: write it
+    cache = getattr(fixed_card_pending, "_cache", None)
+    if cache is None:
+        cache = fixed_card_pending._cache = {}
+    seen = cache.get(d)
+    if seen is None:
+        try:
+            with open(os.path.join(d, FIXED_CARDS_FILE), encoding="utf-8") as fh:
+                seen = {line.rstrip("\n") for line in fh}
+        except OSError:
+            seen = set()
+        cache[d] = seen
+    # A tag is one line of the file, so it must not contain one. Nothing builds
+    # a tag with a newline in it today (the block suffixes are one-line captions
+    # truncated to 48 chars); normalising here keeps a future one from silently
+    # splitting into two entries that never match again.
+    key = tag.replace("\n", " ")
+    if key in seen:
+        return False
+    seen.add(key)
+    try:
+        with open(os.path.join(d, FIXED_CARDS_FILE), "a", encoding="utf-8") as fh:
+            fh.write(key + "\n")
+    except OSError:
+        pass                             # unwritable dir: at worst they repeat
+    return True
 
 
 def resolve_influence_subsets(spec, active_names):
@@ -1120,17 +1356,33 @@ def metrics_sample_positions(n_samples, n_influence):
         torch.linspace(0, n_samples - 1, n_fid).round().long().tolist()))
 
 
-def influence_set_size(sampling_cfg, default=16) -> int:
-    """sampling.n_influence_samples -- the N of the influence set.
+INFLUENCE_SET_KEYS = {"valid": "n_influence_samples_valid",
+                      "probe": "n_influence_samples_probe"}
 
-    ONE knob for: how many validation samples and how many probe stimuli are
-    evaluated, plotted and played. It is NOT n_metrics_samples: the
-    distributional metrics (FD-DAC / KL / FAD) run on that much larger pool,
-    because they estimate a covariance and want the samples; the influence set
-    is what a human reads panel by panel, so it is small and fully shown."""
+
+def influence_set_size(sampling_cfg, which="valid", default=16) -> int:
+    """The N of one half of the influence set:
+      which="valid" -> sampling.n_influence_samples_valid, how many validation
+                       samples are scored, plotted and played;
+      which="probe" -> sampling.n_influence_samples_probe, how many probe
+                       stimuli (at most the size of a bank, 16).
+
+    Two knobs since 29 Sept 2026 (one, n_influence_samples, before). Each half
+    stays self-consistent -- its table rows describe exactly the samples its
+    panels show -- and the two are read side by side across steps, like the
+    training and the validation loss, never against each other.
+
+    It is NOT n_metrics_samples: the distributional metrics (FD-DAC / KL / FAD)
+    run on that much larger pool, because they estimate a covariance and want
+    the samples; the influence set is what a human reads panel by panel, so it
+    is small and fully shown.
+
+    Only a MISSING key (or null) falls back to `default`. A 0 is honoured: it
+    turns the probe off. The ranges are checked once in load_config."""
     if sampling_cfg is None:
         return int(default)
-    return int(sampling_cfg.get("n_influence_samples", default) or default)
+    v = sampling_cfg.get(INFLUENCE_SET_KEYS[which], None)
+    return int(default) if v is None else int(v)
 
 
 # ======================
@@ -1149,7 +1401,7 @@ def generate_and_log_audio(
     of blocks, and the step slider walks each block through training instead of
     scattering near-identical tags across the dashboard.
 
-    It refreshes the condition cards and `2_generation_with_f0_validation_XX`;
+    It refreshes the condition cards and the `generation_validation_XX` card;
     the null generation and the real reference are added by the metrics step,
     which is the only place they are computed.
 
@@ -1188,7 +1440,8 @@ def generate_and_log_audio(
 
     for k, p in enumerate(panel_pos):
         idx = indices[p] if p < len(indices) else indices[-1]
-        _frames_real, frame_cond_real, _label_idx, text_emb, image_emb = val_dataset[idx]
+        (_frames_real, frame_cond_real, _label_idx, text_emb, image_emb,
+         text_ctx) = val_dataset[idx]
 
         fc = {kk: v.unsqueeze(0).to(device).float()
               for kk, v in frame_cond_real.items()}
@@ -1198,6 +1451,10 @@ def generate_and_log_audio(
         if "image" in global_configs:
             gc["image"] = image_emb.unsqueeze(0).to(device)
 
+        tctx = None
+        if getattr(model, "text_cross_layers", None):
+            tctx = {"tokens": text_ctx["tokens"].unsqueeze(0),
+                    "mask":   text_ctx["mask"].unsqueeze(0)}
         gen = euler_sample_cfg(
             model, n_frames, device,
             steps=sampling_cfg.euler_steps,
@@ -1206,6 +1463,7 @@ def generate_and_log_audio(
             use_amp=use_amp,
             frame_cond=fc, global_cond=gc, guidance=guidance,
             frame_dims=frame_dims, global_configs=global_configs,
+            text_ctx=tctx,
         )
         if not torch.isfinite(gen).all():
             continue
@@ -1222,11 +1480,19 @@ def generate_and_log_audio(
         # Same cards as the metrics step, written to the SAME tags: the f0
         # target and the generation it produced are the first two cards of the
         # block, each on its own player.
+        # The condition cards go in ONCE, at step 0: this panel is the same
+        # validation sample at every step (metrics_sample_positions), so its
+        # stimulus never changes and a slider over it would walk through copies
+        # of one waveform. Only the generation below moves with training. The
+        # guard is per tag because this preview refreshes only the first
+        # n_audio_samples blocks while the metrics step covers the whole
+        # influence set -- see fixed_card_pending.
         for cname, carr in sorted(frame_cond_real.items()):
             son = sonify_condition(cname, carr.cpu().numpy(), DAC_SAMPLE_RATE)
-            if son is not None:
+            if son is not None and fixed_card_pending(
+                    writer, tags["conditions"][cname]):
                 writer.add_audio(tags["conditions"][cname], norm_wav(son),
-                                 global_step=step,
+                                 global_step=0,
                                  sample_rate=DAC_SAMPLE_RATE)
 
         writer.add_audio(tags["generation"], wn,
@@ -1246,22 +1512,31 @@ def generate_and_log_audio(
 def log_real_audio_samples(val_dataset, normalizer, writer, n_samples,
                            sampling_cfg=None, frame_dims=None,
                            global_configs=None):
-    """Logs the real audio of the PANEL samples at step 0, into the same
-    "ground truth" group the metrics step writes, so the reference is audible
-    from the start instead of only appearing at the first metrics step. The
-    card name carries the sample index, which is what ties it back to the
-    validation_XX block and to the f0 image of the same XX."""
+    """Logs the real audio of the PANEL samples at step 0, so the recording is
+    audible from the start instead of only appearing at the first metrics step.
+
+    CONDITIONED run: one card at the TOP of every validation block, beside the
+    conditions that were extracted from that very recording. EVERY panel of the
+    influence set gets one -- `n_samples` does not bound it, because a panel
+    without its recording is a panel you cannot judge, and the cost is one DAC
+    decode each, once per board.
+
+    UNCONDITIONED run: there are no per-sample blocks at all, so the recordings
+    go to the collected "ground truth" group and `n_samples`
+    (sampling.n_audio_samples) is what says how many to log -- that case is the
+    only reason the knob still exists."""
     dac_model = get_dac()
 
     total = len(val_dataset)
     panel_pos, indices = [], []
     # `frame_dims or global_configs`: same reason as generate_and_log_audio --
-    # a global-only run has the ordinary panels, so real_validation_XX must be
-    # the recording of the same sample the metrics step will put in block XX.
-    if sampling_cfg is not None and (frame_dims or global_configs):
+    # a global-only run has the ordinary panels, so the recording of block XX
+    # must be the sample the metrics step will put in block XX.
+    conditioned = bool(frame_dims or global_configs)
+    if sampling_cfg is not None and conditioned:
         n_metrics = int(getattr(sampling_cfg, "n_metrics_samples", 512) or 512)
         panel_pos = metrics_sample_positions(
-            n_metrics, influence_set_size(sampling_cfg))[:max(0, int(n_samples))]
+            n_metrics, influence_set_size(sampling_cfg))
         indices = torch.linspace(0, total - 1, n_metrics).long().tolist()
     if not panel_pos:
         panel_pos = list(range(min(int(n_samples), total)))
@@ -1270,21 +1545,32 @@ def log_real_audio_samples(val_dataset, normalizer, writer, n_samples,
 
     _sfx = validation_panel_suffixes(val_dataset, sampling_cfg, frame_dims,
                                      global_configs)
+    written = 0
     for k, p in enumerate(panel_pos):
+        # Checked BEFORE the decode: this runs at every startup, and on a resume
+        # into the same run directory the card is already there. Writing it
+        # again would put a second step-0 entry under one tag and give a
+        # recording a step slider -- see fixed_card_pending.
+        # `conditioned` decides WHERE the card goes: slot 1 of block XX, or the
+        # collected group. It is the same flag audio_panel_tags is given
+        # everywhere else, so all the writers agree on the one tag.
+        tag = audio_panel_tags("validation", k, suffix=_sfx.get(k, ""),
+                               conditioned=conditioned)["real"]
+        if not fixed_card_pending(writer, tag):
+            continue
         idx = indices[p] if p < len(indices) else indices[-1]
         # ConditionedAudioDataset returns a 5-tuple: take only the frames
-        frames, _frame_cond, _label_idx, _text_emb, _image_emb = val_dataset[idx]
+        frames, _frame_cond, _label_idx, _text_emb, _image_emb, _ctx = val_dataset[idx]
         waveform = decode_frames_to_wav(frames, normalizer, dac_model).unsqueeze(0)
         wn = waveform / (waveform.abs().max() + 1e-8)
 
-        writer.add_audio(
-            audio_panel_tags("validation", k,
-                             suffix=_sfx.get(k, ""))["real"], wn,
-            global_step=0, sample_rate=DAC_SAMPLE_RATE,
-        )
+        writer.add_audio(tag, wn, global_step=0, sample_rate=DAC_SAMPLE_RATE)
+        written += 1
 
     # dac_model is the shared singleton -> do not delete it.
-    print(f"  {len(panel_pos)} real audios logged on TensorBoard")
+    print(f"  {written} real audios logged on TensorBoard"
+          + ("" if written == len(panel_pos)
+             else f" ({len(panel_pos) - written} already on this board)"))
 
 
 # ======================
@@ -1407,6 +1693,35 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                 np.stack([gtargets[c][i] for i in idxs])).to(device).float()
         return gc
 
+    # The cross-attention context of a group of probe stimuli: the PROMPT as a
+    # token sequence, from the text bank itself. A model without the sub-layer
+    # gets None and nothing is built.
+    #
+    # A probe bank with no token sequences is reported ONCE rather than passed
+    # over: on such a run every probe generation would be driven by the null
+    # token, the panels would still be drawn and the influence row would still
+    # be computed, and nothing on screen would say that the prompt never
+    # reached the model.
+    _probe_ctx_warned = []
+
+    def _text_ctx(idxs):
+        if not getattr(model, "text_cross_layers", None):
+            return None
+        ps = (probe_sets or {}).get("text")
+        if ps is None or "text" not in gnames:
+            return None
+        items = [ps.context(i) for i in idxs]
+        if any(c is None for c in items):
+            if not _probe_ctx_warned:
+                _probe_ctx_warned.append(True)
+                print("    [probe] WARNING: the text bank carries no token "
+                      "sequences, so the cross-attention sees only its null "
+                      "token on every probe. Delete the probe_text cache and "
+                      "let it rebuild.")
+            return None
+        return {"tokens": torch.cat([c["tokens"] for c in items], dim=0),
+                "mask":   torch.cat([c["mask"]   for c in items], dim=0)}
+
     # Same seeding contract as the validation metrics: a fixed generator makes
     # the probe curves comparable ACROSS checkpoints (what moves is the model,
     # not the noise). None = free-running.
@@ -1440,7 +1755,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                 frame_cond=_frame_cond(grp), global_cond=_global_cond(grp),
                 guidance=guidance,
                 frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng,
+                gen_rng=gen_rng, text_ctx=_text_ctx(grp),
             )
             cond_lat.extend(gc)
             null_lat.extend(gu)
@@ -1458,7 +1773,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                 frame_cond=_frame_cond([i]), global_cond=_global_cond([i]),
                 guidance=guidance,
                 frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng,
+                gen_rng=gen_rng, text_ctx=_text_ctx([i]),
             ))
 
     # ---- score + collect the curves, one decode per generation ----
@@ -1519,11 +1834,14 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
 
         # The score shown in each plot title is that condition's FIRST metric,
         # whatever it is called (f0/energy -> corr, chroma -> cosine,
-        # rhythm -> beat_corr): the probe must not hardcode a metric name that
-        # only some conditions have.
+        # rhythm -> beat_corr; under mir_eval f0 -> overall_accuracy, chroma /
+        # chord -> chroma_accuracy): the probe must not hardcode a metric name
+        # that only some conditions have.
+        # Its name travels with it, so the f0 title says which number it is.
         for c in names:
             _mkeys = sorted(k for k in ps_cond if k.startswith(f"{c}/"))
             corr_map = ps_cond.get(_mkeys[0], {}) if _mkeys else {}
+            _mname = _mkeys[0].partition("/")[2] if _mkeys else None
             if i in cont_cond.get(c, {}):
                 tgt, gen = cont_cond[c][i]
                 writer.add_image(
@@ -1535,7 +1853,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                         c, tgt, gen, kind="probe",
                         label=f"'{probe_sets[c].names[i]}'", step=step,
                         prefix=prefix, guidance=guidance,
-                        score=corr_map.get(i)),
+                        score=corr_map.get(i), score_name=_mname),
                     global_step=step)
 
         # The GLOBAL stimuli of the same panel, in the same block.
@@ -1544,14 +1862,19 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         # picture from audio. A text prompt is not an image at all: it rides in
         # the TITLE of the panel's other cards via `suffix` below, and its
         # adherence is a number, which belongs in the influence table.
+        # Once per board, at step 0: the stimulus is a file on disk, chosen
+        # before training starts, so it is the same picture at every probe step
+        # and a slider over it would walk through copies of itself.
         for c in gnames:
             if c != "image":
                 continue
             try:
-                writer.add_image(
-                    f"{_blk}/image_condition",
-                    np.asarray(probe_sets[c].image(i)).transpose(2, 0, 1),
-                    global_step=step)
+                _arr = np.asarray(probe_sets[c].image(i)).transpose(2, 0, 1)
+                # Guarded AFTER the load, so a picture that failed to open is
+                # retried at the next probe step instead of being written off.
+                _tag = f"{_blk}/image_condition"
+                if fixed_card_pending(writer, _tag):
+                    writer.add_image(_tag, _arr, global_step=0)
             except Exception as _e:
                 print(f"    [probe] image card {i:02d} unavailable: "
                       f"{type(_e).__name__}: {_e}")
@@ -1562,16 +1885,20 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         tags = audio_panel_tags("probe", i, names, suffix=_suffix,
                                 conditioned=bool(names or gnames))
 
-        # The stimuli are re-logged at every probe step even though they never
-        # change -- the audio slider shows the value AT the selected step, so a
-        # card written once would be empty at every later step. They are logged
-        # unconditionally, including when nothing was generated: the card is
-        # what keeps a failed panel visible instead of silently absent. Each is
-        # logged at its OWN bank's rate, which need not be the DAC's.
+        # The stimuli are written ONCE for the whole board, at step 0: they are
+        # read from probe_sets, so they are the same sound at every probe step
+        # and a card with one step carries no slider (fixed_card_pending
+        # explains why a file, not a flag, is what remembers it across a
+        # resume). They are written unconditionally, including when nothing was
+        # generated: the card is what keeps a failed panel visible instead of
+        # silently absent. Each is logged at its OWN bank's rate, which need not
+        # be the DAC's.
         for c in names:
+            if not fixed_card_pending(writer, tags["conditions"][c]):
+                continue
             writer.add_audio(tags["conditions"][c],
                              norm_wav(probe_sets[c].wav(i)),
-                             global_step=step, sample_rate=probe_sets[c].sr)
+                             global_step=0, sample_rate=probe_sets[c].sr)
         if wavs_cond[i] is not None:
             writer.add_audio(tags["generation"], norm_wav(wavs_cond[i]),
                              global_step=step, sample_rate=DAC_SAMPLE_RATE)
@@ -1712,35 +2039,17 @@ def load_caption_conditions(latent_root):
 
     Distinct captions, not one row per chunk: with --text_labels_n 1 a four-class
     corpus has four of them.
+
+    A thin view over audio_dataset_cond.load_caption_table, which is the single
+    reader of that sidecar. It has to be the same one the DATASET uses: the two
+    would otherwise be free to disagree about which caption belongs to which
+    chunk, and the disagreement would show up as a validation number that
+    describes a different description from the one in the panel header.
     """
-    try:
-        d = Path(latent_root).parent / "global_conditions"
-        meta_p, emb_p = d / "text_labels.json", d / "text_labels_emb.npy"
-        jsonl_p = d / "text_labels.jsonl"
-        if not (meta_p.exists() and emb_p.exists() and jsonl_p.exists()):
-            return {}, None
-        meta = json.loads(meta_p.read_text(encoding="utf-8"))
-        emb = np.load(str(emb_p)).astype(np.float32)
-        n_cap = len(meta.get("captions", []))
-        if emb.ndim != 2 or emb.shape[0] != n_cap or n_cap == 0:
-            print(f"[metrics] text_labels_emb.npy does not match the caption "
-                  f"list ({emb.shape} vs {n_cap}) -> ignored")
-            return {}, None
-        ids = {}
-        with open(jsonl_p, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                r = json.loads(line)
-                cid = r.get("caption_id")
-                if r.get("chunk") and cid is not None and 0 <= cid < n_cap:
-                    ids[r["chunk"]] = int(cid)
-        return ids, emb
-    except Exception as e:
-        print(f"[metrics] caption embeddings unreadable "
-              f"({type(e).__name__}: {e})")
+    t = load_caption_table(latent_root)
+    if not t or "emb" not in t:
         return {}, None
+    return t.get("ids", {}), t["emb"]
 
 
 def _chunk_key_of(val_dataset, cond_path):
@@ -2038,6 +2347,17 @@ def evaluate_and_log_metrics(
     # ---- generate n_samples latents, conditioned or unconditional ----
     # For the conditioned pass we also keep, for the first n_log samples, the
     # real latent (to decode the real audio) and the target condition.
+    # The cross-attention context of a batch of panel samples. None on a model
+    # without the sub-layer, so nothing is stacked or moved for a run that
+    # cannot use it.
+    _wants_ctx = bool(getattr(model, "text_cross_layers", None))
+
+    def _stack_ctx(items):
+        if not _wants_ctx or not items:
+            return None
+        return {"tokens": torch.stack([c["tokens"] for c in items]),
+                "mask":   torch.stack([c["mask"]   for c in items])}
+
     def _generate(conditioned, subset=None):
         """`subset`: when given, only these frame conditions are handed to the
         model; the others are left out and the network zero-fills them, which is
@@ -2057,7 +2377,8 @@ def evaluate_and_log_metrics(
             gen_rng = torch.Generator(device=device)
             gen_rng.manual_seed(int(metrics_seed))
         for j, idx in enumerate(indices):
-            frames_real, frame_cond_real, _lab, text_emb, image_emb = val_dataset[idx]
+            (frames_real, frame_cond_real, _lab, text_emb, image_emb,
+             text_ctx) = val_dataset[idx]
             text_emb = _text_vec_for(idx, text_emb)
             if conditioned:
                 fc = {k: v.unsqueeze(0).to(device).float()
@@ -2077,8 +2398,9 @@ def evaluate_and_log_metrics(
                 })
                 if j in log_id_set:
                     real_frames[j] = frames_real
+                tctx = _stack_ctx([text_ctx])
             else:
-                fc, gc, g = None, None, 1.0
+                fc, gc, g, tctx = None, None, 1.0, None
             gen = euler_sample_cfg(
                 model, n_frames, device,
                 steps=sampling_cfg.euler_steps,
@@ -2086,7 +2408,7 @@ def evaluate_and_log_metrics(
                 use_amp=use_amp,
                 frame_cond=fc, global_cond=gc, guidance=g,
                 frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng,
+                gen_rng=gen_rng, text_ctx=tctx,
             )
             lat_list.append(gen)
         return lat_list, targets, real_frames, global_targets
@@ -2106,12 +2428,14 @@ def evaluate_and_log_metrics(
             gen_rng.manual_seed(int(metrics_seed))
         for start in range(0, len(indices), spf):
             group = indices[start:start + spf]
-            fcs, gcs = [], []
+            fcs, gcs, ctxs = [], [], []
             for j, idx in enumerate(group, start=start):
-                frames_real, frame_cond_real, _lab, text_emb, image_emb = val_dataset[idx]
+                (frames_real, frame_cond_real, _lab, text_emb, image_emb,
+                 text_ctx) = val_dataset[idx]
                 text_emb = _text_vec_for(idx, text_emb)
                 fcs.append(frame_cond_real)
                 gcs.append((text_emb, image_emb))
+                ctxs.append(text_ctx)
                 targets.append({k: v.cpu().numpy() for k, v in frame_cond_real.items()})
                 global_targets.append({
                     "text":  text_emb.cpu().numpy()  if "text"  in global_configs else None,
@@ -2134,7 +2458,7 @@ def evaluate_and_log_metrics(
                 use_amp=use_amp,
                 frame_cond=fc, global_cond=gc, guidance=guidance,
                 frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng,
+                gen_rng=gen_rng, text_ctx=_stack_ctx(ctxs),
             )
             cond_list.extend(gen_c)
             unc_list.extend(gen_u)
@@ -2246,8 +2570,9 @@ def evaluate_and_log_metrics(
     # re-extracting from all of them at once (which OOM-kills the process at
     # large n_metrics_samples), we STREAM it: decode ONE generation -> re-extract
     # its descriptors -> ACCUMULATE the metric -> DISCARD the waveform. Peak RAM
-    # is therefore independent of how many samples we score, so n_influence_samples
-    # can be raised freely -- the only cost of raising it is TIME (the extractor
+    # is therefore independent of how many samples we score, so
+    # n_influence_samples_valid can be raised freely -- the only cost of
+    # raising it is TIME (the extractor
     # runs once per sample). We still HOLD the first n_keep decoded waveforms,
     # which are needed for the disk dump (n_val_save) and the TB previews (n_log).
     # n_val_save / n_influence / n_fid / n_keep were resolved above, before
@@ -2258,7 +2583,7 @@ def evaluate_and_log_metrics(
 
     # ---- how many samples the SIMILARITY SCALARS are averaged over ----
     # Their own knob, separate from n_metrics_samples and from
-    # n_influence_samples, because they answer to different constraints:
+    # n_influence_samples_valid, because they answer to different constraints:
     # FD-DAC/KL estimate a covariance and want hundreds of LATENTS (cheap); the
     # influence set is read panel by panel and is small; these two are the mean
     # of one scalar per sample, which converges fast BUT forces a DAC decode
@@ -2358,7 +2683,7 @@ def evaluate_and_log_metrics(
     # influence one and lives on the conditioned pass alone. Without this flag
     # sim_set stayed empty and the curves were averaged over whatever positions
     # the two sets happened to share -- 4 samples out of 128 with the default
-    # config, and never more than n_influence_samples. The null pass is NOT
+    # config, and never more than n_influence_samples_valid. The null pass is NOT
     # asked for them: it would double the decode+embed cost to widen a delta
     # that is deliberately read on the influence set (see below).
     ps_cond, gsim_cond, cond_wavs, n_fid_used, cov_cond, cont_cond = \
@@ -2554,9 +2879,11 @@ def evaluate_and_log_metrics(
             if not _cc:
                 continue
             # The score in the title is the condition's first metric, whatever
-            # it is named (corr / cosine / beat_corr).
+            # it is named (corr / cosine / beat_corr / overall_accuracy /
+            # chroma_accuracy), and its name goes with it for the f0 title.
             _mk = sorted(k for k in ps_cond if k.startswith(f"{_cname}/"))
             _corr = ps_cond.get(_mk[0], {}) if _mk else {}
+            _mname = _mk[0].partition("/")[2] if _mk else None
             for _j, _sid in enumerate(plot_ids):
                 if _sid not in _cc:
                     continue
@@ -2568,7 +2895,7 @@ def evaluate_and_log_metrics(
                         _cname, _tgt, _gen, kind="valid",
                         label=f"validation sample #{_sid}",
                         step=step, prefix=prefix, guidance=guidance,
-                        score=_corr.get(_sid)),
+                        score=_corr.get(_sid), score_name=_mname),
                     global_step=step)
 
     # ---- the IMAGE condition of the same validation panels ----
@@ -2592,9 +2919,15 @@ def evaluate_and_log_metrics(
             try:
                 _p = Path(image_root) / _cls / _fname
                 _im = np.asarray(_PILImage.open(_p).convert("RGB"))
-                writer.add_image(f"validation_{_j:02d}{_sfx.get(_j, '')}"
-                                 f"/image_condition",
-                                 _im.transpose(2, 0, 1), global_step=step)
+                # Once per board, at step 0: panel _j is the same validation
+                # sample at every metrics step, so this is the same file every
+                # time. Guarded AFTER the open, so a picture that failed to load
+                # is retried at the next step instead of being written off.
+                _tag = (f"validation_{_j:02d}{_sfx.get(_j, '')}"
+                        f"/image_condition")
+                if fixed_card_pending(writer, _tag):
+                    writer.add_image(_tag, _im.transpose(2, 0, 1),
+                                     global_step=0)
                 _shown += 1
             except Exception as _e:
                 _failed = f"{_cls}/{_fname}: {type(_e).__name__}: {_e}"
@@ -2641,7 +2974,9 @@ def evaluate_and_log_metrics(
                     guidance=guidance, frame_dims=frame_dims,
                     global_configs=global_configs,
                     fidelity_evaluator=fidelity_evaluator, dac_model=dac_model,
-                    prefix=prefix, n_plot=n_influence, n_audio=n_audio,
+                    prefix=prefix,
+                    n_plot=influence_set_size(sampling_cfg, "probe"),
+                    n_audio=n_audio,
                     metrics_seed=metrics_seed,
                     global_embedders=global_embedders,
                 )
@@ -2725,6 +3060,23 @@ def evaluate_and_log_metrics(
     # All per-condition adherence/influence lives HERE now, as a single table,
     # NOT as separate scalar curves. TensorBoard keeps a per-step history of the
     # text, so the step slider walks the panel across training.
+    # The table holds the validation rows and the probe rows side by side, and
+    # the probe ones already say `<cond>_probe`. So the validation ones say
+    # `<cond>_validation` instead of the bare condition name: they ARE the
+    # validation panels of the Images and Audio windows (metrics_sample_positions
+    # -- same samples), and a reader should not have to know that "no suffix"
+    # meant validation. Display only: the dicts the rest of the step reads keep
+    # the plain name, which is what the subset matrix matches its labels against.
+    def _row_label(name):
+        return name if name in probe_influence else f"{name}_validation"
+
+    _inf_named = {_row_label(k): v for k, v in influence.items()}
+    _cov_named = {}
+    for _k, _v in (cov_paired or {}).items():
+        # "<cond>/<metric>" -- the condition name never contains a '/'.
+        _c, _, _m = _k.partition("/")
+        _cov_named[f"{_row_label(_c)}/{_m}"] = _v
+
     if influence:
         from condition_metrics import (format_influence_panel,
                                        format_influence_matrix,
@@ -2747,10 +3099,10 @@ def evaluate_and_log_metrics(
             )
         else:
             panel_md = format_influence_panel(
-                influence, step=step, prefix=prefix,
+                _inf_named, step=step, prefix=prefix,
                 guidance=guidance,
                 n_samples=n_fid_used,
-                coverage=cov_paired,
+                coverage=_cov_named,
             )
         writer.add_text("Validation/Condition_influence", panel_md, step)
         # Log the explanatory legend ONCE, on its own tag. Pinned to step 0 so it
@@ -2775,7 +3127,7 @@ def evaluate_and_log_metrics(
               + (f" | FAD-VGGish: {_f(fad_uncond)}" if fad_uncond is not None else ""))
     if influence:
         parts = []
-        for cname, metrics in influence.items():
+        for cname, metrics in _inf_named.items():
             for m, vals in metrics.items():
                 d = vals.get("delta")
                 parts.append(f"{cname}/{m} delta={_f(d)}")
@@ -2838,9 +3190,9 @@ def evaluate_and_log_metrics(
     # ===== AUDIO PANELS on TensorBoard =====
     # ONE BLOCK per validation sample -- audio_panel_tags builds the names and
     # explains the layout -- holding one card per audio:
-    #   1_f0_validation_XX                 - the sonified f0 target
-    #   2_generation_with_f0_validation_XX - the generation it conditioned
-    #   3+_<condition>_validation_XX       - energy, chroma, ...
+    #   1_f0_validation_XX           - the sonified f0 target
+    #   2..N_<condition>_validation_XX - energy, chroma, ... alphabetical
+    #   N+1_generation_validation_XX - the generation all of them produced
     # The null generation and the real recording of the same sample are NOT in
     # this block: they go to the collected groups, one card per sample --
     #   uncond generation/uncond_validation_XX
@@ -2877,12 +3229,18 @@ def evaluate_and_log_metrics(
                                 suffix=_sfx.get(k, ""),
                                 conditioned=any_cond_active)
 
+        # The stimulus cards, ONCE per board at step 0 (fixed_card_pending):
+        # block XX is the same validation sample at every metrics step, so its
+        # conditions are the same waveform every time and re-logging them only
+        # gave a fixed card a step slider. The generation cards below keep
+        # theirs -- those are what actually changes.
         if has_targets:
             for cname, carr in sorted(cond_targets[sid].items()):
                 son = sonify_condition(cname, carr, DAC_SAMPLE_RATE)
-                if son is not None:
+                if son is not None and fixed_card_pending(
+                        writer, tags["conditions"][cname]):
                     writer.add_audio(tags["conditions"][cname], norm_wav(son),
-                                     global_step=step,
+                                     global_step=0,
                                      sample_rate=DAC_SAMPLE_RATE)
 
         _log_audio(cond_wavs[sid], tags["generation"])
@@ -2900,8 +3258,12 @@ def evaluate_and_log_metrics(
                 # the sample sat under `validation_XX [<label>]/`, so with the
                 # text condition on, the combination ladder this card exists for
                 # was split across two blocks in the dashboard.
-                _log_audio(_w, subset_generation_tag("validation", k, _lab,
-                                                     suffix=_sfx.get(k, "")))
+                _log_audio(_w, subset_generation_tag(
+                    "validation", k, _lab, suffix=_sfx.get(k, ""),
+                    n_conditions=len(cond_targets[sid]) if has_targets else 0,
+                    # The recording takes slot 1 of a conditioned validation
+                    # block, so the whole ladder below it shifts down by one.
+                    has_real=any_cond_active))
 
         # With no condition active "generation" already IS the uncond tag
         # (audio_panel_tags maps both keys to it), so the guard is what keeps
@@ -2914,10 +3276,20 @@ def evaluate_and_log_metrics(
         # n_audio_samples like its uncond twin; the .wav on disk is written for
         # every dumped generation regardless (it is what makes a dumped
         # generation listenable against its source).
+        # A RECORDING, so it is the most fixed card of all: written once at
+        # step 0 -- usually by log_real_audio_samples at startup, and here for
+        # whatever panel that pass did not reach. The decode still runs every
+        # time: the .wav on disk below needs it.
+        # NOT bounded by n_audio in a conditioned run: the card is slot 1 of
+        # THIS block, so every panel owns one. The bound survives only for the
+        # unconditioned case, where the recordings go to a collected group and
+        # n_audio_samples is what says how many of them to hear.
         if sid in real_frames:
             real_wav = _decode_one(real_frames[sid], dac_model)
-            if k < n_audio:
-                _log_audio(real_wav, tags["real"])
+            if ((any_cond_active or k < n_audio)
+                    and fixed_card_pending(writer, tags["real"])):
+                writer.add_audio(tags["real"], norm_wav(real_wav),
+                                 global_step=0, sample_rate=DAC_SAMPLE_RATE)
             sf.write(os.path.join(_gen_dir(sid), "real.wav"),
                      real_wav.numpy(), DAC_SAMPLE_RATE)
 
@@ -2937,8 +3309,8 @@ def evaluate_and_log_metrics(
 #   - __getitem__(idx) -> (frames, label_idx)             (2-tuple)
 #   - .samples[idx]    -> (npy_path, start, label_idx)    (3-tuple)
 #   - .n_frames, .idx_to_label
-# The ConditionedAudioDataset returns 5-tuples in both cases (because of
-# frame_conds, text_emb, image_emb). This adapter exposes the "slim view"
+# The ConditionedAudioDataset returns 6-tuples in both cases (because of
+# frame_conds, text_emb, image_emb, text_ctx). This adapter exposes the "slim view"
 # without duplicating data or touching metrics.py.
 class MetricsAdapter:
     """Slim view of ConditionedAudioDataset compatible with metrics.py."""
@@ -2957,7 +3329,7 @@ class MetricsAdapter:
         return len(self._ds)
 
     def __getitem__(self, idx):
-        frames, _frame_cond, label_idx, _text, _image = self._ds[idx]
+        frames, _frame_cond, label_idx, _text, _image, _ctx = self._ds[idx]
         return frames, label_idx
 
 
@@ -3054,6 +3426,12 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
         # Absent in checkpoints written before this option existed -> those
         # readers default it to 0, which is what those runs actually were.
         "frame_reinject_every": int(cfg.model.get("frame_reinject_every", 0)),
+        # Same contract for the cross-attention: it adds four tensors per
+        # selected block plus the null token, so a reader that rebuilds the
+        # model has to know the stride. The WIDTH is not stored -- it is read
+        # off the weights themselves (network_cond.ckpt_text_ctx_dim), which
+        # is the one source that cannot be out of date.
+        "text_cross_every":     int(cfg.model.get("text_cross_every", 0)),
         "config":               OmegaConf.to_container(cfg, resolve=True),
         "label_map":            label_map,
         "frame_cond_dims":      frame_cond_dims,
@@ -3168,6 +3546,30 @@ if __name__ == "__main__":
             f"fad_vggish is.)")
     print(f"[metrics] enabled: {metrics_enabled or '(none: distributional metrics off)'}")
 
+    # Which metrics score the condition-influence rows: ours or mir_eval's
+    # (metrics.influence_family, see the YAML). Checked HERE, at startup, so a
+    # misspelt value stops the run before the references are built. .get()
+    # keeps a config written before the option existed on ours.
+    from condition_metrics import INFLUENCE_FAMILIES
+    influence_family = str(
+        metrics_cfg.get("influence_family", "influence_metrics")
+        if metrics_cfg is not None else "influence_metrics")
+    if influence_family not in INFLUENCE_FAMILIES:
+        raise SystemExit(
+            f"[metrics] metrics.influence_family='{influence_family}' is not a "
+            f"valid choice. Use 'influence_metrics' (ours) or "
+            f"'mir_influence_metrics' (mir_eval, for the conditions it covers).")
+    # The value at which a chroma / chord pitch class counts as ON for the mir
+    # rows (see the YAML). Same startup check; .get() -> 0.5 for older configs.
+    mir_threshold = float(
+        metrics_cfg.get("mir_threshold", 0.5)
+        if metrics_cfg is not None else 0.5)
+    if not 0.0 < mir_threshold <= 1.0:
+        raise SystemExit(
+            f"[metrics] metrics.mir_threshold={mir_threshold} is not in (0, 1]: "
+            f"it is a fraction of the frame's loudest chroma class, and a "
+            f"crema probability for chord.")
+
     if device == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -3187,21 +3589,28 @@ if __name__ == "__main__":
     #   * null / absent  -> train with EXACTLY the frame conditions that have
     #                       actually been EXTRACTED to disk (the .npz contents),
     #                       intersected with the enabled pool in CONDITION_CONFIG.
-    #   * explicit list  -> train with that subset; every requested condition
-    #                       MUST be present in the extracted .npz, otherwise we
-    #                       RAISE (no silent zero-fill of an un-extracted cond).
+    #   * explicit list  -> train with that subset. The .npz are NOT scanned at
+    #                       startup: that the files hold what was asked of the
+    #                       preprocessing is the preprocessing's job, and a
+    #                       sample whose .npz lacks a requested condition is
+    #                       refused by the dataset when it is loaded (RAISE
+    #                       under strict_conditions -- no silent zero-fill).
     # Global conditions (text / image) are NOT stored in the .npz, so
     # enabled_global keeps its previous semantics (null = all enabled in config).
     # The dataset is split-less, so the scan is a single pass over ALL .npz.
+    #
+    # WHY THE EXPLICIT LIST IS NOT SCANNED (30 Sept 2026). The scan opens every
+    # .npz, one per chunk, with the GPU already locked and idle, and IRCAM
+    # terminates a job whose locked GPU does nothing for 15 minutes. On Lakh
+    # (more than 757,000 chunks) XL_chord_lakh was killed twice inside it
+    # before training a single step. With an explicit list it decides nothing:
+    # it only repeated, up front, the check the dataset makes on every sample.
+    # What is given up is WHEN a bad file is found -- at the sample that hits
+    # it instead of at startup -- and, with strict_conditions=false, the
+    # startup count of the files that will be zero-filled.
     # ------------------------------------------------------------------
     enabled_pool = {name for name, c in CONDITION_CONFIG["frame_level"].items()
                     if c.get("enabled", False)}
-    cond_scan = _scan_frame_conditions(cfg.paths.condition_root)
-    # "available" = present in EVERY .npz (usable as a full condition).
-    available_all = {n for n, c in cond_scan["present"].items()
-                     if cond_scan["total"] > 0 and c == cond_scan["total"]}
-    extracted = set(cond_scan["present"].keys())   # any presence (for messages)
-    available = available_all & enabled_pool
 
     enabled_f = cfg.conditioning.get("enabled_frame",  None)
     enabled_g = cfg.conditioning.get("enabled_global", None)
@@ -3210,6 +3619,15 @@ if __name__ == "__main__":
         enabled_f = list(enabled_f)
     if enabled_g is not None:
         enabled_g = list(enabled_g)
+
+    if enabled_f is None:
+        cond_scan = _scan_frame_conditions(cfg.paths.condition_root)
+    else:
+        cond_scan = {"total": 0, "present": {}}     # explicit list: no scan
+    # "available" = present in EVERY .npz (usable as a full condition).
+    available_all = {n for n, c in cond_scan["present"].items()
+                     if cond_scan["total"] > 0 and c == cond_scan["total"]}
+    available = available_all & enabled_pool
 
     if enabled_f is None:
         # Default: train with whatever is present in ALL train .npz.
@@ -3222,23 +3640,18 @@ if __name__ == "__main__":
                 f"{cfg.paths.condition_root}. Extract them first, e.g.:\n"
                 f"  python extract_conditions.py <dataset_root> "
                 f"--conditions f0 --device cuda")
-    else:
-        # Explicit subset: every requested condition MUST be extracted.
-        missing = [c for c in enabled_f if c not in extracted]
-        if missing:
-            raise RuntimeError(
-                f"conditioning.enabled_frame requests {missing}, but these are NOT "
-                f"present in the extracted .npz under {cfg.paths.condition_root}.\n"
-                f"  Extracted/available: {sorted(extracted)}\n"
-                f"  Extract the missing ones first:\n"
-                f"    python extract_conditions.py <dataset_root> "
-                f"--conditions {','.join(missing)} --device cuda")
+    elif enabled_f:
+        print(f"[conditions] enabled_frame={enabled_f} given explicitly -> the "
+              f".npz are not scanned at startup; each sample is checked when it "
+              f"is loaded (training.strict_conditions).")
 
     # ---- U4: STRICT FULL validation of the requested conditions ----
     # Every requested condition must be present in EVERY .npz; otherwise some
     # samples would be silently zero-filled and the model would train on NULL
     # conditions without any error. The dataset is split-less, so this is one
     # full scan over all .npz. strict=True (default) hard-fails.
+    # Runs on the counts of the scan above, so only when enabled_frame was
+    # null; for an explicit list the same rule is enforced per sample.
     strict_conditions = bool(cfg.training.get("strict_conditions", True))
     if enabled_f and cfg.paths.condition_root and cond_scan["total"] > 0:
         problems = []
@@ -3295,6 +3708,12 @@ if __name__ == "__main__":
             registry=registry,
             preload=False,
             strict_conditions=strict_conditions,
+            # WHAT THE TEXT SLOT IS FED -- the chunk's own CLAP AUDIO vector,
+            # its caption's CLAP TEXT vector, or a per-sample mix. A property
+            # of the data, so it is resolved here and the model never learns
+            # which of the two it is looking at.
+            text_source=cfg.conditioning.get("text_source", "audio"),
+            text_mix_p=cfg.conditioning.get("text_mix_p", 0.5),
             # The split is READ from the dataset's splits.json, written by
             # preprocess_stream.py. There is nothing to configure here any more:
             # ratios/seed/stratification are decided once, with the dataset.
@@ -3474,7 +3893,8 @@ if __name__ == "__main__":
     # Conditioning-influence evaluators (validation only, never affect training):
     #   - frame conditions: re-extract the enabled frame conditions from the
     #     generations and compare, paired, to the input ones (f0 corr,
-    #     chroma cosine, rhythm/energy correlation).
+    #     chroma cosine, rhythm/energy correlation -- or mir_eval's metrics
+    #     for the conditions it covers, with metrics.influence_family).
     #   - text (CLAP): the audio side of the same CLAP checkpoint, to score
     #     audio<->text adherence; loaded lazily ONLY if 'text' is active.
     # The per-condition influence (delta vs null) is consolidated in the
@@ -3495,13 +3915,22 @@ if __name__ == "__main__":
         enabled_frame=list(FRAME_COND_DIMS.keys()),
         device=_fid_device,
         registry=registry,   # #15: re-extract with the run's exact extractor config
+        family=influence_family,
+        mir_threshold=mir_threshold,
     )
     for _name, _extractor in fidelity_evaluator.extractors.items():
         _actual_device = getattr(
             _extractor, "device", getattr(_extractor, "_device", "cpu"))
         _batch = getattr(_extractor, "batch_size", None)
         _batch_msg = f" | batch_size={_batch}" if _batch is not None else ""
-        print(f"[metrics] extractor={_name} | device={_actual_device}{_batch_msg}")
+        # `metrics=` is the family that condition actually got: under
+        # mir_influence_metrics a condition mir_eval does not cover keeps ours.
+        # A scorer bound to the ON threshold (mir chroma / chord) says which.
+        _thr = getattr(fidelity_evaluator.fidelity_fns[_name], "keywords",
+                       {}).get("threshold")
+        _thr_msg = f" (ON at >= {_thr})" if _thr is not None else ""
+        print(f"[metrics] extractor={_name} | device={_actual_device}{_batch_msg}"
+              f" | metrics={fidelity_evaluator.families[_name]}{_thr_msg}")
     # ---- ONE EMBEDDER PER SCORABLE GLOBAL CONDITION ----
     # Each maps a GENERATED waveform into the space its condition lives in, so
     # the two can be compared: that cosine is what the influence row and the
@@ -3547,13 +3976,18 @@ if __name__ == "__main__":
     # ambiguous target. It costs one paired generation pass per panel, whatever
     # the number of conditions, because the panel drives them jointly.
     #
-    # sampling.n_influence_samples is the SINGLE knob of the influence set: N
-    # probe stimuli and N validation samples, all of them scored, plotted and
-    # played. It replaces the old trio n_probes / n_cond_plot / (the former,
-    # larger) n_influence_samples, which let the table describe one set of
-    # samples while the panels showed another.
+    # sampling.n_influence_samples_probe is the probe half of the influence set:
+    # that many stimuli per bank, all of them scored, plotted and played (the
+    # validation half has its own knob, n_influence_samples_valid). Fewer than a
+    # bank holds -> build_condition_probe_set picks a FIXED random subset, the
+    # same at every step and in every run; more -> the whole bank, said so.
+    # 0 -> no probe at all.
     probe_sets = {}
-    _n_probes = influence_set_size(cfg.sampling)
+    _n_probes = influence_set_size(cfg.sampling, "probe")
+    print(f"[influence] validation: "
+          f"{influence_set_size(cfg.sampling, 'valid')} samples | probe: "
+          f"{_n_probes if _n_probes > 0 else 'off'}"
+          f"{' stimuli per bank' if _n_probes > 0 else ''}")
     # RNG GUARD. The probe banks are built HERE, before ConditionedAudioDiT is
     # constructed further down, and building the f0 bank runs torchcrepe, which
     # draws from the global torch-CPU and numpy generators (chroma/energy/rhythm
@@ -3581,7 +4015,8 @@ if __name__ == "__main__":
         if _n_probes <= 0:
             continue
         try:
-            from probe_conditions import build_condition_probe_set
+            from probe_conditions import (build_condition_probe_set,
+                                          text_probe_bank)
             # One builder for all four. The only per-condition thing left is
             # WHERE the cache lives: f0 keeps its historical directory (and the
             # paths.f0_probe_dir override) so an existing f0 cache is still a
@@ -3625,12 +4060,23 @@ if __name__ == "__main__":
                     _cond, registry.frame_extractors[_cond])
             _probe_dev = getattr(_probe_extractor, "device",
                                  getattr(_probe_extractor, "_device", "cpu"))
+            # The TEXT bank follows the dataset: captions that are single
+            # labels are probed with those same labels, richer captions with
+            # the descriptions (probe_conditions.text_probe_bank). Every other
+            # condition keeps its own bank, exactly as before.
+            _bank = None
+            if _cond == "text":
+                _bank, _why = text_probe_bank(
+                    load_caption_table(val_dataset.latent_root),
+                    n_panels=_n_probes)
+                print(f"[text-probe] {_why}")
             _ps = build_condition_probe_set(
                 _cond, _probe_root, val_dataset.n_frames,
                 extractor=_probe_extractor,
                 n_probes=_n_probes,
                 duration_s=float(cfg.model.duration_s),
                 sr=DAC_SAMPLE_RATE,
+                bank=_bank,
             )
             probe_sets[_cond] = _ps
             print(f"{_cond} probe: {len(_ps)} elementary stimuli, "
@@ -3684,9 +4130,33 @@ if __name__ == "__main__":
     # defaulted to 0 with .get() so a YAML written before this option existed
     # keeps building exactly the model it used to.
     FRAME_REINJECT_EVERY = int(cfg.model.get("frame_reinject_every", 0))
+
+    # TEXT CROSS-ATTENTION. Architecture parameter like the one above, and
+    # like it, .get() so a YAML written before it existed builds exactly the
+    # model it used to.
+    #
+    # The WIDTH is not a setting: it is the width of one token state of the
+    # text encoder that wrote the dataset, and the dataset is the only thing
+    # that can state it. Reading it off a config field would let a run be
+    # configured for 768 and fed 512 -- the model would build, the load would
+    # pass, and the first forward would raise somewhere unhelpful.
+    TEXT_CROSS_EVERY = int(cfg.model.get("text_cross_every", 0))
+    TEXT_CTX_DIM = int(getattr(train_dataset, "_ctx_dim", 0) or 0)
+    if TEXT_CROSS_EVERY > 0 and "text" in GLOBAL_CONFIGS and TEXT_CTX_DIM <= 0:
+        raise RuntimeError(
+            "model.text_cross_every > 0 but this dataset carries no caption "
+            "TOKEN sequences (global_conditions/text_labels_tok.npy), so the "
+            "cross-attention would attend to the null token at every step and "
+            "learn nothing -- silently, which is why this refuses to start "
+            "instead of warning.\n"
+            "  Re-run the preprocessing on the SAME output dir with "
+            "--global_conds text: it rewrites only the sidecar, reads back the CLAP "
+            "vectors already on disk and does not touch a single audio file."
+        )
     print(f"[MODEL] Building ConditionedAudioDiT-{cfg.model.kind} "
           f"| frame={list(FRAME_COND_DIMS)} | global={list(GLOBAL_CONFIGS)} "
-          f"| frame_reinject_every={FRAME_REINJECT_EVERY}")
+          f"| frame_reinject_every={FRAME_REINJECT_EVERY} "
+          f"| text_cross_every={TEXT_CROSS_EVERY}")
     model = ConditionedAudioDiT(
         kind=cfg.model.kind,
         drop=cfg.model.get("drop", 0.0),
@@ -3694,6 +4164,8 @@ if __name__ == "__main__":
         frame_cond_out_dims=FRAME_COND_OUT_DIMS,
         global_cond_configs=GLOBAL_CONFIGS,
         frame_reinject_every=FRAME_REINJECT_EVERY,
+        text_cross_every=TEXT_CROSS_EVERY,
+        text_ctx_dim=TEXT_CTX_DIM,
     ).to(device)
     # EMA is optional, controlled by cfg.training.use_ema. When disabled,
     # validation/audio/metrics use the live model directly (no shadow copy).
@@ -3764,6 +4236,68 @@ if __name__ == "__main__":
     start_step = 0
 
     # ======================
+    # WARM START (paths.init_from)
+    # ======================
+    # A NEW run that begins from the weights of an old one. Not a resume: the
+    # step counter, the optimizer, the scheduler and the RNG streams all start
+    # from scratch, and only the model (and the EMA shadow) are seeded.
+    #
+    # WHAT IT IS FOR, concretely: turning the cross-attention on. Its output
+    # projection is zero-initialised, so a model built with it computes exactly
+    # the same function as the model without it -- the run can therefore
+    # continue from a checkpoint that never had one, instead of paying for the
+    # steps already spent. `--resume` cannot do that: it refuses an architecture
+    # mismatch, and rightly, because it also restores an optimizer state whose
+    # moments are indexed by parameter.
+    #
+    # THE ONLY KEYS ALLOWED TO BE MISSING are the ones the new architecture
+    # adds. Anything else means the two models disagree about something that is
+    # NOT zero-initialised -- a different kind, other conditions, another
+    # frame_reinject stride -- and silently leaving those at their random init
+    # while reporting a warm start is exactly the failure this checks for.
+    init_from = cfg.paths.get("init_from", None)
+    if init_from and cfg.paths.resume_from:
+        raise RuntimeError(
+            "paths.init_from and paths.resume_from are both set. They are "
+            "different things: resume continues a run (same architecture, same "
+            "optimizer, same step), init_from STARTS one from another run's "
+            "weights. Pick one.")
+    if init_from:
+        if not os.path.exists(init_from):
+            raise FileNotFoundError(f"paths.init_from: {init_from} not found")
+        print(f"Warm start from: {init_from}")
+        _ck = torch.load(init_from, map_location="cpu", weights_only=False)
+        check_ckpt_reinject_gate(_ck, init_from)
+        _sd = (_ck.get("ema_state_dict") if _ck.get("ema_ready", True)
+               and "ema_state_dict" in _ck else _ck.get("model_state_dict"))
+        if not isinstance(_sd, dict):
+            raise RuntimeError(f"{init_from} carries no model weights")
+        _res = model.load_state_dict(_sd, strict=False)
+        _new = tuple(["cross_attn.", "text_null", "norm_cross."])
+        _bad = [k for k in _res.missing_keys if not any(n in k for n in _new)]
+        if _bad or _res.unexpected_keys:
+            raise RuntimeError(
+                f"{init_from} does not fit this model.\n"
+                f"  missing and NOT part of the new cross-attention: "
+                f"{_bad[:8]}{' ...' if len(_bad) > 8 else ''}\n"
+                f"  present in the checkpoint but not in this model: "
+                f"{list(_res.unexpected_keys)[:8]}"
+                f"{' ...' if len(_res.unexpected_keys) > 8 else ''}\n"
+                f"A warm start may only ADD zero-initialised weights. Rebuild "
+                f"this run with the same model.kind, conditions and "
+                f"frame_reinject_every as the checkpoint.")
+        print(f"  {len(_sd) - len(_res.missing_keys)} tensor(s) loaded, "
+              f"{len(_res.missing_keys)} left at their zero/random init "
+              f"(the new cross-attention). Step counter starts at 0.")
+        if ema is not None:
+            # The shadow starts AS the loaded weights, not as the random init it
+            # was deepcopy'd from: otherwise everything the EMA is used for --
+            # validation, the best-checkpoint decision, the previews -- would be
+            # reading noise while the live model is already trained.
+            ema.copy_from(model)
+        del _ck, _sd
+
+    # ======================
     # RESUME
     # ======================
     resume_from = cfg.paths.resume_from
@@ -3800,6 +4334,20 @@ if __name__ == "__main__":
         # of as a wall of "Missing key(s) in state_dict: frame_reinject.1...".
         # Checkpoints written before this option existed have no such key ->
         # default 0, which is exactly what they were trained as.
+        ckpt_cross = int(ckpt.get("text_cross_every", 0))
+        if ckpt_cross != TEXT_CROSS_EVERY:
+            raise RuntimeError(
+                f"Checkpoint was trained with model.text_cross_every="
+                f"{ckpt_cross} but the model was built with "
+                f"{TEXT_CROSS_EVERY}. They must match to resume: the "
+                f"cross-attention adds four tensors per selected block plus "
+                f"the learned null token, so the two state_dicts cannot be "
+                f"put into one another. To START a NEW run with a different "
+                f"value, leave paths.resume_from empty -- a zero-initialised "
+                f"cross-attention computes the same function as none at all, "
+                f"so nothing is lost by warm-starting from this checkpoint "
+                f"with paths.init_from instead, if the run supports it."
+            )
         ckpt_reinject = int(ckpt.get("frame_reinject_every", 0))
         if ckpt_reinject != FRAME_REINJECT_EVERY:
             raise RuntimeError(
@@ -3933,9 +4481,12 @@ if __name__ == "__main__":
     print(f"{'='*60}\n")
 
     # Real reference audio, logged ONCE at step 0 (it never changes during
-    # training, unlike the generations). Mirrors the unconditional project, and
-    # means the reference is audible from the start instead of only appearing at
-    # the first metrics step. Tags: ground truth/real_validation_XX.
+    # training, unlike the generations), so it is audible from the start instead
+    # of only appearing at the first metrics step. In a conditioned run it lands
+    # at the TOP of every validation block, beside the conditions extracted from
+    # it (validation_XX/1_real_validation_XX); n_audio_samples does not bound it
+    # there, only in the unconditioned case, where it fills the 'ground truth'
+    # group instead.
     log_real_audio_samples(
         val_dataset=val_dataset,
         normalizer=normalizer,
