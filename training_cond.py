@@ -1026,7 +1026,7 @@ def norm_wav(x):
 
 
 def audio_panel_tags(family, idx, active_conditions=(), suffix="",
-                     conditioned=None):
+                     conditioned=None, uncond_offset=0):
     """
     The TensorBoard AUDIO tags of ONE sample -> {"conditions": {name: tag},
     "generation": tag, "generation_no_cond": tag, "real": tag}.
@@ -1072,7 +1072,16 @@ def audio_panel_tags(family, idx, active_conditions=(), suffix="",
        all of them can be heard as a grid of peers instead of one at a time
        inside separate collapsibles:
 
-          uncond generation/uncond_<family>_XX
+          uncond generation/uncond_NN
+
+       Just a number. A generation with NO conditions carries nothing of a
+       probe or of a validation sample, so neither word belongs in its name.
+       The validation null generations take 00, 01, ... and the probe ones
+       follow them (`uncond_offset` = how many validation cards there are), so
+       the two families never write to the same tag. Each one still starts
+       from the same noise as the conditioned generation of its block; with
+       `metrics.seed` set, that makes uncond_00 and uncond_<offset> the SAME
+       audio -- both are the seed's first draw, and nothing else differs.
 
        The 'ground truth' group is what is LEFT of the same idea: it now holds
        the recordings of an UNCONDITIONED run only. In a conditioned run every
@@ -1080,25 +1089,20 @@ def audio_panel_tags(family, idx, active_conditions=(), suffix="",
        the conditions that were extracted from it -- which is the comparison
        anyone actually makes, and it was being made across two windows.
 
-       The family and the index in the CARD name are what ties a card back to
-       the block it belongs to: 'uncond generation/uncond_validation_03' is the
-       null twin of 'validation_03/4_generation_validation_03', drawn from the
-       same noise. The group is flat -- no numeric prefix -- because nothing
+       Neither group has the 1_, 2_ ordering prefix of a block, because nothing
        inside it is an ordered A/B against a neighbouring card.
 
-    The card names repeat the family and index that the block header already
-    shows. That redundancy is deliberate: a card read, filtered or screenshotted
-    on its own still says what it is and which sample it belongs to.
+    The card names INSIDE a block repeat the family and index that the block
+    header already shows. That redundancy is deliberate: a card read, filtered
+    or screenshotted on its own still says what it is and which sample it
+    belongs to.
 
     `family` is "probe" or "validation". `suffix` decorates the BLOCK header
-    only (the probe prompt, the validation label). It is deliberately NOT put
-    on the uncond card: "uncond_probe_00 [solo pipe organ ...]" reads as a
-    generation driven by that prompt, which is the one thing it is not. The
-    index is the cross-reference to the block (and to the f0 image of the same
-    sample), where the prompt can be read. f0 leads the
-    condition cards when it is active because it is the one most listened to
-    against the generation; if it is off, the first condition alphabetically
-    takes slot 1 and nothing else changes.
+    only (the probe prompt, the validation label); it never reaches the uncond
+    card, which no prompt drove. f0 leads the condition cards when it is
+    active because it is the one most listened to against the generation; if
+    it is off, the first condition alphabetically takes slot 1 and nothing
+    else changes.
 
     With NO condition active at all (pure-unconditional run) the block
     generation IS the unconditional generation -- nothing was dropped to obtain
@@ -1142,7 +1146,7 @@ def audio_panel_tags(family, idx, active_conditions=(), suffix="",
                   for j, c in enumerate(ordered)}
     gen_slot = len(ordered) + first
 
-    uncond = f"{UNCOND_AUDIO_GROUP}/uncond_{tail}"
+    uncond = f"{UNCOND_AUDIO_GROUP}/uncond_{idx + int(uncond_offset):02d}"
     real = (f"{block}/1_real_{tail}" if panel_real
             else f"{REAL_AUDIO_GROUP}/real_{tail}")
 
@@ -1582,7 +1586,8 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                     output_dir, use_amp, sampling_cfg, guidance,
                     frame_dims, global_configs, fidelity_evaluator,
                     dac_model, prefix, n_plot, n_audio,
-                    metrics_seed=None, global_embedders=None):
+                    metrics_seed=None, global_embedders=None,
+                    uncond_offset=0):
     """
     Generate conditioned on the out-of-the-box probe stimuli of EVERY active
     condition AT ONCE, and report the result three ways.
@@ -1620,7 +1625,8 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
       * AUDIO   the probe_XX/ block: one card per condition holding the stimulus
                 that condition was taken from, then the generation they jointly
                 conditioned. The null generation goes to the "uncond generation"
-                group with the others.
+                group with the others, numbered after the validation ones
+                (`uncond_offset`, see audio_panel_tags).
       * TEXT    a <cond>_probe row per condition for the Condition_influence
                 table, returned to the caller as (influence, coverage) to be
                 merged in. Nothing else: which stimulus each panel used is
@@ -1883,7 +1889,8 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         # image alone has none, and without `conditioned` its generation would
         # be filed as the unconditional one.
         tags = audio_panel_tags("probe", i, names, suffix=_suffix,
-                                conditioned=bool(names or gnames))
+                                conditioned=bool(names or gnames),
+                                uncond_offset=uncond_offset)
 
         # The stimuli are written ONCE for the whole board, at step 0: they are
         # read from probe_sets, so they are the same sound at every probe step
@@ -2979,6 +2986,11 @@ def evaluate_and_log_metrics(
                     n_audio=n_audio,
                     metrics_seed=metrics_seed,
                     global_embedders=global_embedders,
+                    # The probe's uncond cards are numbered AFTER the
+                    # validation ones: the audio loop below writes one for
+                    # each of its first n_audio panels (fid_pos), so that
+                    # count is where the probe's numbers start.
+                    uncond_offset=min(n_audio, len(fid_pos)),
                 )
                 influence.update(probe_influence)
                 cov_paired.update(probe_cov)
@@ -3195,7 +3207,7 @@ def evaluate_and_log_metrics(
     #   N+1_generation_validation_XX - the generation all of them produced
     # The null generation and the real recording of the same sample are NOT in
     # this block: they go to the collected groups, one card per sample --
-    #   uncond generation/uncond_validation_XX
+    #   uncond generation/uncond_XX
     #   ground truth/real_validation_XX
     # Validation/f0_valid_vs_gen_XX is the f0 picture of the same sample, same XX.
     # Everything is peak-normalized: these are meant to be A/B'd by ear, and a

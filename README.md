@@ -952,17 +952,21 @@ validation_XX/2..N_<cond>_validation_XX           energy, chroma, ...
 validation_XX/N+1_generation_validation_XX        the generation they produced
 probe_XX_<melody>/1_f0_probe_XX , /2_chroma_probe_XX , /3_generation_probe_XX
 
-uncond generation/uncond_validation_XX            null generation, same noise
-uncond generation/uncond_probe_XX_<melody>          "     "        (probe)
+uncond generation/uncond_NN                       null generations (validation, then probe)
 ground truth/real_validation_XX                   the real recording
 ```
 
-The index in a collected card's name is the cross-reference: `uncond_validation_03`
-is the null twin of `validation_03/N+1_generation_validation_03`, drawn from
-the same noise, and `real_validation_03` is the recording that block's conditions
-were extracted from. In a PURE-UNCONDITIONAL run nothing is dropped to obtain the
-generation, so it goes straight to `uncond generation/` and no per-sample block is
-created: the audio window is then exactly the two collected groups.
+The uncond cards carry only a number: a generation with no conditions has
+nothing of a probe or of a validation sample in it. The validation ones come
+first and the probe ones follow -- with the defaults (`n_audio_samples: 4`),
+`uncond_00` … `uncond_03` and `uncond_04` … `uncond_07`. Each still starts from
+the same noise as the conditioned generation of its block, so with
+`metrics.seed` set `uncond_00` and `uncond_04` are the same audio (both are the
+seed's first draw). `real_validation_03` is the recording that block's
+conditions were extracted from. In a PURE-UNCONDITIONAL run nothing is dropped
+to obtain the generation, so it goes straight to `uncond generation/` and no
+per-sample block is created: the audio window is then exactly the two collected
+groups.
 
 The generation card is named after the frame condition that leads the block, so
 a run conditioned ONLY on globals — which has no frame condition to name it
