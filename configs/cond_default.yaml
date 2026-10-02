@@ -219,15 +219,17 @@ training:
 # ============================================================
 intervals:
   val:     1000           # validation loss
-  audio:   25000          # audio preview into the per-sample panels on TB
-                          # (the validation_XX/ blocks: the condition cards
-                          # plus 2_generation_with_f0_validation_XX).
-                          # Skipped when the step is
-                          # also a metrics step, which writes the same panels.
-                          # sampling.n_audio_samples generations. The real reference
-                          # audio is logged ONCE at step 0. The richer
-                          # real/with-cond/without-cond comparison is logged at
-                          # intervals.metrics. Set very large to effectively disable.
+  audio:   25000          # UNCONDITIONED preview on TB: refreshes the
+                          # "uncond generation/uncond_NN" cards, the SAME
+                          # cards the metrics step writes, each from the SAME
+                          # starting noise (metrics.seed), so the slider of a
+                          # card walks one generation through training.
+                          # How many: sampling.n_audio_samples. Nothing
+                          # conditioned is generated here: the validation_XX/
+                          # and probe_XX/ panels are written by the metrics
+                          # step alone, every intervals.metrics. Skipped when
+                          # the step is also a metrics step. Set very large
+                          # (or equal to intervals.metrics) to disable.
   metrics: 50000          # computes FD-DAC + KL (both directions)
   ckpt:    50000          # save periodical checkpoint
   keep_last_n_ckpts: 5    # keep only the last N periodic checkpoints
@@ -241,10 +243,12 @@ sampling:
                           # (with CFG each step does 2 forward passes)
   t_min: 0.001
   t_max: 0.999
-  # How many cards the two COLLECTED audio groups hold: the null generations
-  # ("uncond generation/"), and -- ONLY in a run with no conditions at all --
-  # the real recordings ("ground truth/"). It is also how many panels the cheap
-  # audio preview between metrics steps refreshes.
+  # How many UNCONDITIONED generations ("uncond generation/uncond_NN") are on
+  # TensorBoard, per family: N null twins of the validation panels, then N of
+  # the probe panels (4 -> uncond_00..03 + uncond_04..07). Written at every
+  # metrics step and refreshed every intervals.audio, from the same noise.
+  # Only exception: in a run with NO condition at all it also says how many
+  # real recordings to show ("ground truth/"), since there are no panels there.
   # It does NOT bound the recordings of a CONDITIONED run any more: there every
   # validation panel opens with the recording its conditions were extracted
   # from (validation_XX/1_real_validation_XX), so they are all there by

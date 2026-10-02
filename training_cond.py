@@ -531,9 +531,9 @@ def load_config():
         OmegaConf.set_struct(cfg, False)
 
     # The two influence-set sizes, checked here so a bad value costs a second.
-    # Validation must keep at least one sample: its panels and the audio preview
-    # number their blocks off that list, and with none of it they would fall
-    # back to a different spread of the validation set. The probe may be 0 (off).
+    # Validation must keep at least one sample: its panels number their blocks
+    # off that list, and with none of it they would fall back to a different
+    # spread of the validation set. The probe may be 0 (off).
     _smp = cfg.get("sampling", None)
     if _smp is not None:
         for _which, _lo in (("valid", 1), ("probe", 0)):
@@ -1031,11 +1031,11 @@ def audio_panel_tags(family, idx, active_conditions=(), suffix="",
     The TensorBoard AUDIO tags of ONE sample -> {"conditions": {name: tag},
     "generation": tag, "generation_no_cond": tag, "real": tag}.
 
-    Single source of truth for the audio window's layout, because the four
-    places that log audio (the metrics step, the cheap preview between metrics
-    steps, the step-0 real references, the f0 probe) all write into the same
-    blocks and MUST agree on their names -- otherwise one sample would own two
-    half-filled blocks instead of one.
+    Single source of truth for the audio window's layout, because the places
+    that log audio (the metrics step, the step-0 real references, the probe, and
+    the uncond preview between metrics steps) all write into the same blocks
+    and groups and MUST agree on their names -- otherwise one sample would own
+    two half-filled blocks instead of one.
 
     THREE layout facts drive every name here, and all three are properties of
     the dashboard rather than choices:
@@ -1211,10 +1211,10 @@ def fixed_card_pending(writer, tag):
     events file, and a second write would file two identical entries under one
     tag -- bringing the slider back with two copies of the same thing. So what
     has been written has to outlive the process. Per TAG rather than per family
-    because the writers cover different panels: the cheap audio preview
-    refreshes the first n_audio_samples blocks, the metrics step covers the
-    whole influence set, and the real recordings are logged at startup. One flag
-    for all of them would let whichever ran first close the door on the others.
+    because the writers cover different cards: the metrics step writes the
+    condition cards of the whole influence set, and the real recordings are
+    logged at startup. One flag for all of them would let whichever ran first
+    close the door on the others.
 
     A resume into a FRESH run directory finds no file and writes every card
     again, which is what that board needs. Deleting the file re-writes them all
@@ -1341,10 +1341,10 @@ def metrics_sample_positions(n_samples, n_influence):
     (score over 64, plot 4) meant the panels illustrated a number computed on
     samples you never saw.
 
-    Single source of truth also across steps: the metrics step and the cheaper
-    audio preview both write into the validation_XX/ block, so they MUST agree
+    Single source of truth also across steps: the metrics step and the step-0
+    real references both write into the validation_XX/ block, so they MUST agree
     on which validation sample XX is -- otherwise the same block would hold two
-    different recordings depending on which step last wrote to it.
+    different recordings depending on which one wrote it.
 
     The spread is uniform over the WHOLE list, not its first N: the generation
     indices come from linspace(0, len(val)-1, n_samples), so a prefix lands on a
@@ -1389,123 +1389,139 @@ def influence_set_size(sampling_cfg, which="valid", default=16) -> int:
     return int(default) if v is None else int(v)
 
 
+def fallback_panel_count(n_metrics, n_audio, conditioned):
+    """How many generations the validation panel list holds when there is NO
+    influence set to take it from (metrics_sample_positions returned nothing).
+
+    Conditioned run: 2, the rich-logging prefix of the metrics step. Run with NO
+    condition: n_audio_samples, because there the panel generations ARE the
+    'uncond generation' cards, and that knob is what says how many of those
+    there are. Read by the metrics step AND by the uncond preview between
+    metrics steps, so the two write the same cards."""
+    n_metrics = max(0, int(n_metrics or 0))
+    return min(2 if conditioned else max(0, int(n_audio or 0)), n_metrics)
+
+
+def validation_panel_ids(n_metrics, n_influence, influence_active, conditioned,
+                         n_audio):
+    """-> the metrics-generation indices of the validation panels, in panel
+    order: the influence set when there is one, else the first
+    fallback_panel_count generations. The same list the audio panels of
+    evaluate_and_log_metrics enumerate (`panel_ids` there)."""
+    fid = metrics_sample_positions(n_metrics,
+                                   n_influence if influence_active else 0)
+    return list(fid) or list(range(
+        fallback_panel_count(n_metrics, n_audio, conditioned)))
+
+
+def uncond_card_plan(n_audio, panel_ids, has_null_pass, n_probe_panels):
+    """
+    -> [(card, draw)]: every card of the 'uncond generation' group, as the NN of
+    `uncond_NN` and the index of the noise draw it starts from.
+
+    THE DRAW. The metrics step draws one x0 per generation, in order, from a
+    generator seeded with metrics.seed (the null pass and the probe each restart
+    it), so generation i of either list starts from draw i. An unconditional
+    generation depends on nothing else but that noise and the weights. Keeping
+    each card's draw is therefore what lets the preview between metrics steps
+    regenerate the SAME card from the SAME noise: the step slider of uncond_NN
+    walks one generation through training, whichever of the two wrote a step.
+
+    THE CARDS, in the order the metrics step writes them:
+      * validation: the null twin of each of the first n_audio panels (card k
+        <- that panel's generation index), when the step has a null pass. In a
+        run with NO condition the panel generation IS the uncond card, and the
+        panels are the first n_audio generations (fallback_panel_count);
+      * probe: the null twin of each of the first n_audio probe panels, after
+        the validation ones (card off + i <- draw i of the probe's own stream).
+    n_audio_samples is per FAMILY: with the default 4 that is uncond_00..03 from
+    the validation and uncond_04..07 from the probe. With metrics.seed set,
+    uncond_00 and uncond_04 are the same audio: both are draw 0.
+    """
+    n_audio = max(0, int(n_audio or 0))
+    plan = []
+    if has_null_pass:
+        plan += [(k, int(panel_ids[k]))
+                 for k in range(min(n_audio, len(panel_ids)))]
+    off = min(n_audio, len(panel_ids))
+    plan += [(off + i, i)
+             for i in range(min(n_audio, max(0, int(n_probe_panels or 0))))]
+    return plan
+
+
 # ======================
-# AUDIO PREVIEW (conditioned, into the per-sample panels)
+# PREVIEW BETWEEN METRICS STEPS: the uncond cards only
 # ======================
 @torch.no_grad()
-def generate_and_log_audio(
-    model, normalizer, val_dataset, n_frames, step, writer, device,
-    output_dir, n_samples, sampling_cfg, conditioning_cfg, use_amp,
-    frame_dims, global_configs, prefix="EMA",
+def generate_and_log_uncond_preview(
+    model, normalizer, n_frames, step, writer, device, output_dir, plan,
+    sampling_cfg, use_amp, frame_dims, global_configs, metrics_seed=None,
+    prefix="EMA",
 ):
     """
-    Cheap audio preview BETWEEN metrics steps, written into the SAME panels the
-    metrics step uses (the validation_XX/ blocks): same validation samples, same
-    tag names, only a finer cadence. The audio window therefore holds ONE family
-    of blocks, and the step slider walks each block through training instead of
-    scattering near-identical tags across the dashboard.
+    Every intervals.audio steps (skipped on a metrics step): the
+    'uncond generation' cards, and nothing else.
 
-    It refreshes the condition cards and the `generation_validation_XX` card;
-    the null generation and the real reference are added by the metrics step,
-    which is the only place they are computed.
+    NOTHING CONDITIONED IS GENERATED HERE. The validation and probe panels are
+    written by the metrics step alone, every intervals.metrics, so every card of
+    a panel comes from one writer, one noise stream and one text vector. This
+    used to refresh the first n_audio_samples validation panels with
+    conditioned generations, from free-running noise and without the caption
+    substitution of validation_text_from_caption: four panels had twice the
+    cards of the others, and the extra ones were not comparable with them.
 
-    `n_samples` is sampling.n_audio_samples: how many panels to refresh, capped
-    by how many panels exist.
+    `plan` is uncond_card_plan(): the SAME cards the metrics step writes, each
+    regenerated from its own draw of the metrics.seed stream. The generator is a
+    local one, so the global training RNG is not touched. With metrics.seed
+    unset the metrics step free-runs too and there is no draw to reproduce: the
+    cards then start from fresh noise, as the metrics' do.
     """
-    guidance = float(conditioning_cfg.guidance_scale)
-    from condition_metrics import sonify_condition
-
-    total = len(val_dataset)
-    n_metrics = int(getattr(sampling_cfg, "n_metrics_samples", 512) or 512)
-    # The influence set, then the PREFIX of it this preview refreshes: index XX
-    # keeps meaning the same validation sample whether the block was last
-    # written by the metrics step or by this cheaper preview.
-    panel_pos = metrics_sample_positions(
-        n_metrics, influence_set_size(sampling_cfg))[:max(0, int(n_samples))]
-    # The metrics step generates from these val-dataset indices; the panel of
-    # position p describes val_dataset[indices[p]].
-    indices = torch.linspace(0, total - 1, n_metrics).long().tolist()
-    if not panel_pos or not (frame_dims or global_configs):
-        # NO conditioning at all (or no panels): fall back to a plain spread over
-        # the validation set, still one panel per sample. A global-only run does
-        # NOT come here -- it has the same panels as any other conditioned run,
-        # and taking this branch made the preview refresh block validation_XX
-        # with a different validation sample from the one the metrics step put
-        # there.
-        panel_pos = list(range(min(int(n_samples), total)))
-        indices = torch.linspace(0, total - 1,
-                                 max(1, min(int(n_samples), total))).long().tolist()
-    panel_pos = panel_pos[:max(1, int(n_samples))]
-    # ONE source of truth for the block names (see validation_panel_suffixes).
-    _sfx = validation_panel_suffixes(val_dataset, sampling_cfg, frame_dims,
-                                     global_configs)
-
+    if not plan:
+        return
     dac_model = get_dac()
+    gen_rng = None
+    if metrics_seed is not None:
+        gen_rng = torch.Generator(device=device)
+        gen_rng.manual_seed(int(metrics_seed))
 
-    for k, p in enumerate(panel_pos):
-        idx = indices[p] if p < len(indices) else indices[-1]
-        (_frames_real, frame_cond_real, _label_idx, text_emb, image_emb,
-         text_ctx) = val_dataset[idx]
-
-        fc = {kk: v.unsqueeze(0).to(device).float()
-              for kk, v in frame_cond_real.items()}
-        gc = {}
-        if "text" in global_configs:
-            gc["text"] = text_emb.unsqueeze(0).to(device)
-        if "image" in global_configs:
-            gc["image"] = image_emb.unsqueeze(0).to(device)
-
-        tctx = None
-        if getattr(model, "text_cross_layers", None):
-            tctx = {"tokens": text_ctx["tokens"].unsqueeze(0),
-                    "mask":   text_ctx["mask"].unsqueeze(0)}
+    # One generation per DISTINCT draw (uncond_00 and the first probe card share
+    # draw 0), in increasing draw order, so one generator walks the stream.
+    # Skipping a draw costs one randn of the same size as a real one: the same
+    # numel is what keeps this stream aligned with the metrics step, whose
+    # per-sample draws are randn(n_frames, TOKEN_DIM).
+    wav_of, pos = {}, 0
+    for d in sorted({d for _, d in plan}):
+        if gen_rng is not None:
+            while pos < d:
+                torch.randn(n_frames, TOKEN_DIM, device=device,
+                            generator=gen_rng)
+                pos += 1
         gen = euler_sample_cfg(
             model, n_frames, device,
             steps=sampling_cfg.euler_steps,
-            t_min=sampling_cfg.t_min,
-            t_max=sampling_cfg.t_max,
+            t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
             use_amp=use_amp,
-            frame_cond=fc, global_cond=gc, guidance=guidance,
+            frame_cond=None, global_cond=None, guidance=1.0,
             frame_dims=frame_dims, global_configs=global_configs,
-            text_ctx=tctx,
+            gen_rng=gen_rng,
         )
-        if not torch.isfinite(gen).all():
+        pos += 1
+        if torch.isfinite(gen).all():
+            wav_of[d] = decode_frames_to_wav(gen, normalizer, dac_model)
+
+    for card, d in plan:
+        wav = wav_of.get(d)
+        if wav is None:
             continue
-
-        tags = audio_panel_tags("validation", k, frame_cond_real.keys(),
-                                suffix=_sfx.get(k, ""),
-                                conditioned=bool(frame_dims or global_configs))
-
-        # decode_frames_to_wav returns 1-D; unsqueeze back to (1, T), which is
-        # what add_audio expects.
-        waveform = decode_frames_to_wav(gen, normalizer, dac_model).unsqueeze(0)
-        wn = waveform / (waveform.abs().max() + 1e-8)
-
-        # Same cards as the metrics step, written to the SAME tags: the f0
-        # target and the generation it produced are the first two cards of the
-        # block, each on its own player.
-        # The condition cards go in ONCE, at step 0: this panel is the same
-        # validation sample at every step (metrics_sample_positions), so its
-        # stimulus never changes and a slider over it would walk through copies
-        # of one waveform. Only the generation below moves with training. The
-        # guard is per tag because this preview refreshes only the first
-        # n_audio_samples blocks while the metrics step covers the whole
-        # influence set -- see fixed_card_pending.
-        for cname, carr in sorted(frame_cond_real.items()):
-            son = sonify_condition(cname, carr.cpu().numpy(), DAC_SAMPLE_RATE)
-            if son is not None and fixed_card_pending(
-                    writer, tags["conditions"][cname]):
-                writer.add_audio(tags["conditions"][cname], norm_wav(son),
-                                 global_step=0,
-                                 sample_rate=DAC_SAMPLE_RATE)
-
-        writer.add_audio(tags["generation"], wn,
-                         global_step=step, sample_rate=DAC_SAMPLE_RATE)
-
-        wav_path = os.path.join(
-            output_dir, f"step{step:07d}_{prefix}_{k:02d}.wav"
-        )
-        sf.write(wav_path, waveform.squeeze().numpy(), DAC_SAMPLE_RATE)
+        # Built by audio_panel_tags like every other uncond card: the
+        # 'generation_no_cond' tag of index `card` IS uncond generation/uncond_NN.
+        tag = audio_panel_tags("validation", card,
+                               conditioned=True)["generation_no_cond"]
+        writer.add_audio(tag, norm_wav(wav), global_step=step,
+                         sample_rate=DAC_SAMPLE_RATE)
+        sf.write(os.path.join(output_dir,
+                              f"step{step:07d}_{prefix}_uncond_{card:02d}.wav"),
+                 wav.numpy(), DAC_SAMPLE_RATE)
     # dac_model is the shared singleton -> do not delete it.
 
 
@@ -1533,9 +1549,9 @@ def log_real_audio_samples(val_dataset, normalizer, writer, n_samples,
 
     total = len(val_dataset)
     panel_pos, indices = [], []
-    # `frame_dims or global_configs`: same reason as generate_and_log_audio --
-    # a global-only run has the ordinary panels, so the recording of block XX
-    # must be the sample the metrics step will put in block XX.
+    # `frame_dims or global_configs`: a global-only run has the ordinary
+    # panels, so the recording of block XX must be the sample the metrics step
+    # will put in block XX.
     conditioned = bool(frame_dims or global_configs)
     if sampling_cfg is not None and conditioned:
         n_metrics = int(getattr(sampling_cfg, "n_metrics_samples", 512) or 512)
@@ -2132,13 +2148,13 @@ def validation_panel_suffixes(val_dataset, sampling_cfg, frame_dims,
     """{panel index: block suffix} for the validation panels.
 
     THE POINT OF THIS FUNCTION IS THAT THERE IS ONLY ONE OF IT. The block name
-    `validation_XX` is built in five places -- the metrics step, the cheap audio
-    preview between metrics steps, the step-0 real references, the comparison
-    images and the image card -- and TensorBoard groups by the text before the
-    first '/'. A suffix computed in some of them and not the others would give
-    one sample two half-filled blocks instead of one, which is precisely the
-    failure audio_panel_tags spends a paragraph warning about. Every site calls
-    THIS, with the inputs it already has, so they cannot disagree.
+    `validation_XX` is built in four places -- the metrics step, the step-0
+    real references, the comparison images and the image card -- and
+    TensorBoard groups by the text before the first '/'. A suffix computed in
+    some of them and not the others would give one sample two half-filled
+    blocks instead of one, which is precisely the failure audio_panel_tags
+    spends a paragraph warning about. Every site calls THIS, with the inputs it
+    already has, so they cannot disagree.
 
     The suffix names what the panel was conditioned on: the sample's CATEGORY
     (exact, from the dataset) and the nearest phrase to its stored CLAP vector
@@ -2327,7 +2343,12 @@ def evaluate_and_log_metrics(
     # in the same collapsible section.
     _sfx = validation_panel_suffixes(val_dataset, sampling_cfg, frame_dims,
                                      global_configs)
-    n_log = min(2, n_samples)   # how many samples to log richly (audio/real)
+    # How many samples to log richly (audio/real) when there is no influence
+    # set to take the panels from: fallback_panel_count, the rule the uncond
+    # preview between metrics steps reads too (in a run with no condition
+    # these panels ARE the uncond cards).
+    n_log = fallback_panel_count(n_samples, n_audio,
+                                 bool(frame_dims) or bool(global_configs))
     # fid_pos, not plot_ids: the REAL latent of every PANEL sample has to be
     # captured during the generation pass, and a global-only run has panels
     # without any plot_ids (no curve is re-extracted for text or image).
@@ -3225,9 +3246,9 @@ def evaluate_and_log_metrics(
     # fid_pos, NOT plot_ids: plot_ids is empty in a run conditioned only on
     # text/image (nothing re-extracts a curve from audio for those), and falling
     # back to "the first n_log generations" then numbered the audio panels off a
-    # different list from the one validation_panel_suffixes and the cheap audio
-    # preview use -- so block validation_01 held the audio of one validation
-    # sample, the header of a second and, at the preview step, a third.
+    # different list from the one validation_panel_suffixes uses -- so block
+    # validation_01 held the audio of one validation sample and the header of
+    # another.
     # With NO condition active at all there is no influence set, and the
     # fallback (the first n_log generations) is the right and only answer.
     panel_ids = list(fid_pos) or [i for i in sorted(cond_wavs)][:n_log]
@@ -4125,6 +4146,42 @@ if __name__ == "__main__":
         print()
 
     metrics_uncond = bool(cfg.sampling.get("metrics_uncond", True))
+
+    # The 'uncond generation' cards -- which ones exist and the noise each one
+    # starts from -- decided ONCE, from the same inputs the metrics step decides
+    # them with, so the preview between metrics steps (intervals.audio)
+    # refreshes exactly the cards the metrics step writes (uncond_card_plan).
+    _conditioned = bool(FRAME_COND_DIMS) or bool(GLOBAL_CONFIGS)
+    _influence_active = (fidelity_evaluator.active
+                         or any(global_embedders.get(c) is not None
+                                for c in GLOBAL_CONFIGS))
+    _guidance = float(cfg.conditioning.guidance_scale)
+    _n_audio = int(cfg.sampling.get("n_audio_samples", 4) or 0)
+    # A null pass exists when the fused sampler produces it (CFG), when the
+    # uncond metrics ask for it, or when the influence needs it as a baseline;
+    # in a run with no condition the generation itself is the uncond card.
+    _has_null = ((not _conditioned) or metrics_uncond or _influence_active
+                 or (int(cfg.sampling.get("metrics_samples_per_forward", 1)) >= 1
+                     and _guidance > 1.0))
+    # The probe writes a null twin only when it runs paired (guidance > 1),
+    # and it runs only with something to score (the influence is active).
+    _pnames = [c for c in list(FRAME_COND_DIMS) + list(GLOBAL_CONFIGS)
+               if c in probe_sets]
+    _n_probe_panels = (min(influence_set_size(cfg.sampling, "probe"),
+                           min(len(probe_sets[c]) for c in _pnames))
+                       if (_pnames and _influence_active and _guidance > 1.0)
+                       else 0)
+    uncond_plan = uncond_card_plan(
+        _n_audio,
+        validation_panel_ids(int(cfg.sampling.n_metrics_samples),
+                             influence_set_size(cfg.sampling),
+                             _influence_active, _conditioned, _n_audio),
+        _has_null, _n_probe_panels)
+    print(f"Uncond cards: {len(uncond_plan)}"
+          + (f" (uncond_00..uncond_{max(c for c, _ in uncond_plan):02d}), "
+             f"refreshed every intervals.audio and every intervals.metrics "
+             f"from the same noise" if uncond_plan else "")
+          + "\n")
     print(f"Conditioning influence: frame={list(FRAME_COND_DIMS.keys()) or 'none'}"
           f"{' + text(CLAP)' if 'text' in global_embedders else ''}"
           f"{' + image(Wav2CLIP)' if 'image' in global_embedders else ''}"
@@ -4680,35 +4737,31 @@ if __name__ == "__main__":
                     pbar.write(f"  -> Best model: {save_path}")
 
             # ======================
-            # AUDIO PREVIEW (optional, conditioned-only, separate from metrics)
-            # Audio preview every intervals.audio steps, written into the
-            # SAME validation_XX/ audio blocks the metrics step uses: it
-            # refreshes the condition and the with-cond generation, while
-            # the "uncond generation" and "ground truth" groups are filled
-            # by the metrics step. Skipped when the two cadences coincide,
+            # UNCOND PREVIEW every intervals.audio steps: the 'uncond generation'
+            # cards only -- the same ones the metrics step writes, from the same
+            # noise (uncond_card_plan). The conditioned panels are written by
+            # the metrics step alone. Skipped when the two cadences coincide,
             # so a card never gets two values for the same step.
             if (step > 0 and step % cfg.intervals.audio == 0
-                    and step % cfg.intervals.metrics != 0):
-                pbar.write(f"\n  Audio preview step {step}...")
+                    and step % cfg.intervals.metrics != 0 and uncond_plan):
+                pbar.write(f"\n  Uncond preview step {step}...")
                 gen_model = (ema.model
                               if cfg.training.use_ema and step >= cfg.training.ema_start
                               else model)
-                generate_and_log_audio(
+                generate_and_log_uncond_preview(
                     model=gen_model, normalizer=normalizer,
-                    val_dataset=val_dataset,
                     n_frames=n_frames, step=step, writer=writer,
-                    device=device, output_dir=audio_dir,
-                    n_samples=cfg.sampling.n_audio_samples,
+                    device=device, output_dir=audio_dir, plan=uncond_plan,
                     sampling_cfg=cfg.sampling,
-                    conditioning_cfg=cfg.conditioning,
                     use_amp=cfg.training.use_amp,
                     frame_dims=FRAME_COND_DIMS,
                     global_configs=GLOBAL_CONFIGS,
+                    metrics_seed=metrics_seed,
                     prefix=("EMA"
                             if cfg.training.use_ema and step >= cfg.training.ema_start
                             else "Model"),
                 )
-                pbar.write(f"  Audio preview logged (step {step})\n")
+                pbar.write(f"  Uncond preview logged (step {step})\n")
                 model.train()
 
             # ======================

@@ -968,6 +968,14 @@ to obtain the generation, so it goes straight to `uncond generation/` and no
 per-sample block is created: the audio window is then exactly the two collected
 groups.
 
+WHO WRITES WHAT, AND WHEN. The `validation_XX/` and `probe_XX/` panels are
+written by the metrics step alone, every `intervals.metrics`, so all the cards
+of a panel come from one writer and one noise stream. Every `intervals.audio`
+steps in between, only the uncond cards are refreshed: the same cards, each
+regenerated from the same noise draw the metrics step gives it, so the slider of
+`uncond_NN` walks one generation through training. Nothing conditioned is
+generated between metrics steps.
+
 The generation card is named after the frame condition that leads the block, so
 a run conditioned ONLY on globals — which has no frame condition to name it
 after, and no waveform to put beside it — names it plainly:
