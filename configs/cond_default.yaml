@@ -225,12 +225,13 @@ intervals:
                           # starting noise (metrics.seed), so the slider of a
                           # card walks one generation through training.
                           # How many: sampling.n_audio_samples. Nothing
-                          # conditioned is generated here: the validation_XX/
+                          # conditioned is generated here: the test_XX/
                           # and probe_XX/ panels are written by the metrics
                           # step alone, every intervals.metrics. Skipped when
                           # the step is also a metrics step. Set very large
                           # (or equal to intervals.metrics) to disable.
-  metrics: 50000          # computes FD-DAC + KL (both directions)
+  metrics: 50000          # computes FD-DAC + KL (both directions), FAD, the
+                          # Condition_influence table and the panels
   ckpt:    50000          # save periodical checkpoint
   keep_last_n_ckpts: 5    # keep only the last N periodic checkpoints
 
@@ -243,70 +244,51 @@ sampling:
                           # (with CFG each step does 2 forward passes)
   t_min: 0.001
   t_max: 0.999
-  # How many UNCONDITIONED generations ("uncond generation/uncond_NN") are on
-  # TensorBoard, per family: N null twins of the validation panels, then N of
-  # the probe panels (4 -> uncond_00..03 + uncond_04..07). Written at every
-  # metrics step and refreshed every intervals.audio, from the same noise.
-  # Only exception: in a run with NO condition at all it also says how many
-  # real recordings to show ("ground truth/"), since there are no panels there.
-  # It does NOT bound the recordings of a CONDITIONED run any more: there every
-  # validation panel opens with the recording its conditions were extracted
-  # from (validation_XX/1_real_validation_XX), so they are all there by
-  # construction and there is nothing left to choose. The knob survives for the
-  # unconditioned case, which has no panels and would otherwise have no real
-  # material to listen to at all.
+  # How many UNCONDITIONED generations are on TensorBoard: uncond_00,
+  # uncond_01, ... in the "uncond generation" group (4 -> uncond_00..03), each
+  # starting from its own draw of ONE noise stream (metrics.seed), so they are
+  # all different. Written at every metrics step and refreshed every
+  # intervals.audio, from the same noise.
+  # In a run with NO condition at all it also says how many real recordings to
+  # show ("ground truth/"), since there are no panels there.
   n_audio_samples: 4
 
   # ---------------------------------------------------------------
-  # THE INFLUENCE SET -- two halves, three windows
+  # THE CONDITION_INFLUENCE TABLE, AND WHAT IS THERE TO LISTEN TO
   # ---------------------------------------------------------------
-  # N_valid validation samples and N_probe out-of-the-box probe stimuli. Within
-  # each half the SAME samples produce all three diagnostic windows, which is
-  # the point: the number you read in the table is about the curve you are
-  # looking at and the audio you are hearing.
+  # TEXT    Validation/Condition_influence   ONE panel per metrics step: a row
+  #                                          per metric of every condition (ours
+  #                                          or mir_eval's, see
+  #                                          metrics.influence_family), columns
+  #                                          with-cond, null (same noise, no
+  #                                          condition), Δ = with-cond - null,
+  #                                          valid/used. Means over ALL the
+  #                                          n_metrics_samples validation
+  #                                          generations -- the same ones
+  #                                          FD-DAC / KL / FAD are computed on.
+  #                                          There is no knob for it.
   #
-  # The two halves have their own size (one knob, n_influence_samples, until
-  # 29 Sept 2026). The validation rows and the probe rows of the table are read
-  # side by side ACROSS STEPS -- like the training and the validation loss --
-  # never against each other, so they need not be the same size.
+  # The panels below are for LISTENING and LOOKING; nothing measured on them is
+  # in the table:
+  #   IMAGES  test_XX/<cond>_target_vs_gen   target vs re-extracted
+  #           probe_XX/<cond>_target_vs_gen  idem, on the probe stimuli
+  #   AUDIO   test_XX/ , probe_XX/           the recording (test only), one card
+  #                                          per condition (sonified), then the
+  #                                          generation conditioned on them
+  # Both windows group per sample, so N panels read as N collapsible sections.
   #
-  #   IMAGES  validation_XX/<cond>_target_vs_gen   target vs re-extracted
-  #           probe_XX/<cond>_target_vs_gen        idem, on the probe stimuli
-  #   AUDIO   validation_XX/ , probe_XX/           one card per condition
-  #                                                (sonified) + the generation
-  #                                                conditioned on it
-  #   TEXT    Validation/Condition_influence       for each family, how close
-  #                                                the generated condition is to
-  #                                                its target, MINUS how close a
-  #                                                generation WITHOUT conditions
-  #                                                lands. That subtraction is
-  #                                                what makes it an influence.
-  #
-  # Both windows group per sample, so N=16 reads as 16 collapsible sections,
-  # not one flat wall of images.
-  #
-  # This is NOT n_metrics_samples: FD-DAC / KL / FAD estimate a covariance and
-  # want hundreds of samples; the influence set is read panel by panel by a
-  # human, so it is small and fully shown.
-  #
-  # COST per metrics step: N_valid paired generations for validation + N_probe
-  # for the probe (paired = with conditions and without, from the same noise --
-  # the "without" is what the delta is measured against), plus one
-  # re-extraction each. These are the knobs to lower if the metrics step gets
-  # too long. Both halves are scored with whichever family
-  # metrics.influence_family picks (ours or mir_eval).
-  #
-  # VALIDATION: at least 1, at most n_metrics_samples (the samples are picked
-  # evenly spread inside that list, hence over the whole validation set). The
-  # same samples at every step.
-  n_influence_samples_valid: 16
+  # TEST: samples of the TEST split, spread evenly over it, the same ones at
+  # every step. They replace the validation panels (2 Oct 2026). 0 -> none.
+  n_test_panels: 8
   # PROBE: at most 16, the size of each bank in probe_conditions.py (more ->
   # all 16, and the startup log says so). Fewer than 16 -> that many stimuli
   # drawn AT RANDOM but FIXED (probe_conditions.PROBE_SUBSET_SEED): the same
-  # subset at every step and in every run, so the probe curve only moves
-  # because the model did. A text bank of single labels is instead cycled to
-  # that length, so every label stays in. 0 -> no probe at all.
-  n_influence_samples_probe: 16
+  # subset at every step and in every run. A text bank of single labels is
+  # instead cycled to that length, so every label stays in. 0 -> no probe.
+  n_probe_panels: 8
+  #
+  # COST per metrics step: one generation per panel plus one re-extraction
+  # (for the images), on top of the n_metrics_samples generations.
 
   # ---- OUT-OF-THE-BOX PROBE PANELS ----
   # Probe panel i drives EVERY condition active in the run at once, taking the
@@ -315,7 +297,7 @@ sampling:
   # are combined BY INDEX and are therefore NOT mutually aligned -- deliberate,
   # see below. Which stimulus a panel used is written in the TITLE of that
   # panel's comparison image, in the IMAGES window.
-  # Set n_influence_samples_probe: 0 to disable.
+  # Set n_probe_panels: 0 to disable.
                           #
                           # WHY JOINT. With p_drop_each_frame = 0.0 (see below)
                           # the model only ever sees all of its conditions or
@@ -325,14 +307,14 @@ sampling:
                           #
                           # WHY NOT ALIGNED. The probe is an out-of-the-box
                           # controllability check on unambiguous stimuli: it
-                          # answers "does this conditioning move the generation
-                          # at all". The validation rows carry the aligned,
-                          # in-corpus case, but there a condition is often not
-                          # cleanly extractable (a smeared chromagram, a beat
-                          # grid that does not exist) and a middling score does
-                          # not separate weak conditioning from an ambiguous
-                          # target. The two rows answer different questions and
-                          # neither replaces the other.
+                          # shows whether this conditioning moves the
+                          # generation at all. The table and the test panels
+                          # carry the aligned, in-corpus case, but there a
+                          # condition is often not cleanly extractable (a
+                          # smeared chromagram, a beat grid that does not
+                          # exist), so they cannot separate weak conditioning
+                          # from an ambiguous target. They answer different
+                          # questions and neither replaces the other.
                           #
                           # The stimuli live in probe_conditions.py:
                           #   f0     -> scales, arpeggios, octave leaps, ...
@@ -342,52 +324,41 @@ sampling:
                           # Build one standalone to look at it before training:
                           #   python probe_conditions.py energy ./cache/probe_energy --n_frames 431
 
-  # NB: three older knobs are GONE, and the code no longer reads any of them --
-  # a leftover in your own config would do nothing:
-  #   n_probes      -> now sampling.n_influence_samples_probe (probe stimuli)
-  #   n_cond_plot   -> gone: every sample of the influence set is plotted
+  # NB: older knobs that are GONE. A leftover in your own config does nothing;
+  # n_influence_samples* are removed at startup with a log line, and given on
+  # the command line they stop the run with the new names:
+  #   n_influence_samples_valid -> gone: the table uses all n_metrics_samples;
+  #                                the listening panels are n_test_panels
+  #   n_influence_samples_probe -> n_probe_panels
+  #   n_influence_samples       -> (the one knob for both, before 29 Sept 2026)
+  #   n_probes      -> n_probe_panels
+  #   n_cond_plot   -> gone: every panel is plotted
   #   n_f0_plot     -> gone (it was already only an alias of n_cond_plot)
   #   n_<cond>_probe (f0/energy/chroma/rhythm) -> gone, they were already inert
 
-  n_metrics_samples: 512  # conditioned samples used to compute FD-DAC + KL. 512 is a
+  n_metrics_samples: 512  # conditioned samples used to compute FD-DAC + KL, and
+                          # the Condition_influence table on the same ones. 512 is a
                           # stable estimate for a 72-dim covariance; 1024 doubles the
                           # metrics-step TIME for a marginal statistical gain -- keep it
                           # for the final offline evaluation, not for a 1M-step run.
   # ---- AUDIO part of the metrics step (DAC decode + re-extraction) ----
-  # FD-DAC/KL above are latent-only and run on ALL n_metrics_samples (cheap).
-  # The audio part (decode + condition re-extraction + disk dump) is RAM-heavy,
-  # so it is BOUNDED to small subsets -- decoding/re-extracting all of a large
-  # n_metrics_samples is what OOM-kills the process. Keep these small.
+  # FD-DAC/KL above are latent-only. The table needs the audio: every one of
+  # the n_metrics_samples generations is DECODED ONCE, and that one waveform
+  # serves the re-extraction of the conditions, the CLAP / CLIP embedding, the
+  # VGGish embedding of the FAD and the disk dump. It is STREAMED -- decode one,
+  # measure it, drop it -- so the RAM stays flat whatever n_metrics_samples is;
+  # what grows with it is the TIME (one extractor pass per generation; CREPE
+  # for f0 is the slow one, ~0.35 s per clip on a laptop GPU).
   #
-  # (The influence set sizes live above: sampling.n_influence_samples_valid for
-  # the validation samples and their panels, n_influence_samples_probe for the
-  # probe stimuli and theirs.)
-
-  # ---- GLOBAL-CONDITION SIMILARITY SCALARS ----
-  # How many validation generations the two similarity curves are averaged over:
-  #   Validation/Metrics/Audio_text_similarity   (cosine in CLAP's space)
-  #   Validation/Metrics/Audio_image_similarity  (cosine in CLIP's space, via
-  #                                               Wav2CLIP)
-  # They are logged beside FD-DAC / KL / FAD and read the same way: a curve
-  # across training, not a number at a step.
-  #
-  # WHY ITS OWN KNOB, and not n_metrics_samples. FD-DAC and KL estimate a
-  # covariance and want hundreds of samples, but they are LATENT-ONLY and so
-  # cost almost nothing per sample. These two are the mean of one scalar per
-  # sample -- which converges fast -- but each sample they touch must be DECODED
-  # through the DAC and pushed through an embedder. That decode is the
-  # expensive half of the metrics step. 128 gives a mean whose standard error
-  # is already small; going to 512 quadruples the cost to halve it.
-  # 0 disables the two curves without touching anything else.
-  #
-  # NB the influence TABLE is unaffected by this number: its rows are a paired
-  # delta measured on the influence set (n_influence_samples_valid), against the null
-  # pass. This knob only widens the sample the two SCALARS are averaged over.
-  n_similarity_samples: 128
+  # The text / image similarity (cosine in CLAP's / CLIP's space) is a column
+  # of the Condition_influence table, over these same generations. Its two
+  # curves in the time series (Audio_text_similarity / Audio_image_similarity)
+  # and their own sample size, n_similarity_samples, were removed on
+  # 2 Oct 2026: every conditioning measure is read in the table.
 
   # ---- WHAT THE VALIDATION GENERATIONS ARE CONDITIONED ON (text slot) ----
   # false (default): the text slot receives the CLAP AUDIO embedding of the
-  #   chunk, i.e. the same vector training uses. Audio_text_similarity is then
+  #   chunk, i.e. the same vector training uses. The table's text column is then
   #   a cosine between the generation and the SOURCE AUDIO in CLAP's space --
   #   a resemblance to the original, not an adherence to a text.
   # true: the slot receives the CLAP TEXT embedding of that sample's written
@@ -396,9 +367,9 @@ sampling:
   #   the vector a prompt would put there at inference, so the validation then
   #   measures what you will actually do with the model:
   #     * the generations are produced FROM the description;
-  #     * Audio_text_similarity becomes a true audio-vs-text cosine;
-  #     * the text influence row becomes "how much does the written description
-  #       move the output", scored exactly like a frame condition's.
+  #     * the table's text column becomes "how close is the output to the
+  #       written description", a true audio-vs-text cosine.
+  # The same holds for the test panels, and for test_cond.py.
   # TRAINING IS UNTOUCHED either way, and so is the validation LOSS -- it keeps
   # the training's own conditioning, otherwise the two curves would stop being
   # comparable and would say nothing about overfitting. Only the generations the
@@ -409,36 +380,36 @@ sampling:
   validation_text_from_caption: true
 
   # ---------------------------------------------------------------
-  # CONDITION SUBSETS -- the delta MATRIX
+  # CONDITION SUBSETS -- extra columns of the table
   # ---------------------------------------------------------------
-  # Which COMBINATIONS of the active frame conditions to generate and score at
-  # each metrics step. The Condition_influence panel then becomes a matrix:
-  # one row per combination, one column per (condition, metric), each cell the
-  # Δ against the SAME null pass -- a shared baseline is what makes the rows
-  # comparable with one another.
+  # Which COMBINATIONS of the active frame conditions to generate and measure
+  # at each metrics step. Every subset adds its own columns to the
+  # Condition_influence table, headed by its label (no_chroma, only_f0, ...):
+  # the same metrics, on the n_metrics_samples generations conditioned on that
+  # subset only. In the test panels each subset adds one more generation card,
+  # after the one with every condition.
   #
-  # Columns cover EVERY active condition, not only the ones given in that row.
-  # The off-subset cells (marked °) are the interesting ones: give f0 alone and
-  # watch what happens to chroma.
+  # Columns cover EVERY active condition, not only the ones given in that
+  # subset. The off-subset columns (marked °) are the interesting ones: give f0
+  # alone and watch what happens to chroma.
   #
   # Entries are either an explicit list of condition names, or a keyword:
-  #   "all"        -> every active condition (the reference row; costs NOTHING
-  #                   extra, the conditioned pass the step already runs IS it)
-  #   "loo"        -> leave-one-out: N rows, each missing one condition. The
+  #   "all"        -> every active condition (the table's own columns; costs
+  #                   NOTHING extra, the conditioned pass the step already runs
+  #                   IS it)
+  #   "loo"        -> leave-one-out: N subsets, each missing one condition. The
   #                   MARGINAL contribution of each condition at the point where
   #                   the model is actually used. This is the standard ablation.
-  #   "singletons" -> N rows, each with exactly one condition. The standalone
+  #   "singletons" -> N subsets, each with exactly one condition. The standalone
   #                   power of each, but far from the model's operating point.
   #
-  # COST: each row other than "all" is a FULL extra generation pass over
-  # n_metrics_samples (scored on n_influence_samples_valid), so the metrics
-  # step grows LINEARLY with the number of
-  # rows. With 4 conditions, "loo" alone adds 4 passes; ["loo", "singletons",
-  # "all"] adds 8. Start small and read the metrics-step timing before growing.
+  # COST: each subset other than "all" is a FULL extra generation pass over
+  # n_metrics_samples, all of them decoded and measured, so the metrics step
+  # grows LINEARLY with the number of subsets. With 4 conditions, "loo" alone
+  # adds 4 passes; ["loo", "singletons", "all"] adds 8. Start small and read
+  # the metrics-step timing before growing.
   #
-  # [] (the default) -> off: one conditioned pass, one table, exactly as before.
-  # Needs a null pass to subtract, so it is skipped when metrics_uncond=false
-  # or guidance <= 1 (with a printed note, never silently).
+  # [] (the default) -> off: one conditioned pass, the table's own columns.
   #
   # Examples:
   #   influence_subsets: []                          # off
@@ -459,13 +430,13 @@ sampling:
   # DEFAULT false. It is a comparison against the unconditional PROJECT, and this
   # one trains dedicated models: the number is rarely what you are reading.
   #
-  # IMPORTANT -- what this does NOT switch off any more: the generation without
-  # conditions itself. That is the baseline of the condition-influence delta (in
-  # BOTH the validation and the probe rows) and it is nearly free under CFG,
-  # since the unconditional velocity is computed at every step anyway. It is now
-  # produced whenever guidance > 1, regardless of this flag. Until 4 Sept 2026
-  # the two were tied, so setting this to false silently emptied the delta column
-  # of the influence table -- the very number the probe exists to produce.
+  # The generations without conditions themselves are produced at every
+  # metrics step regardless of this flag: they are nearly free under CFG (the
+  # unconditional velocity is computed at every step anyway), they are the null
+  # column of the Condition_influence table (re-extracted and measured like the
+  # conditioned ones: twice the audio work of the table) and the uncond.wav of
+  # each dumped generation. The "uncond generation" cards are generated on
+  # their own (sampling.n_audio_samples).
   metrics_uncond: false
 
   # How many SAMPLES the metrics step fuses into one forward. Each sample needs 3
@@ -520,14 +491,14 @@ metrics:
   # Fd_dac_uncond / Kl_cond / Kl_uncond). Listing a metric is an EXPLICIT request:
   # an unknown/unsupported name is a hard error at startup, not a silent skip.
   # An empty list [] turns the distributional metrics off entirely (and skips
-  # building their reference); the condition-influence panel is unaffected.
+  # building their reference); the Condition_influence table is unaffected.
   # NOTE: the two share the generated mu/covariance, so asking for both costs
   # essentially the same as asking for one -- the heavy part is fitted once.
   enabled: ["fd_dac", "kl_dac", "fad_vggish"]
   seed: 0
 
   # Device for the re-extraction at the metrics step (CREPE-full / beat_this /
-  # CLAP-audio), i.e. what feeds the condition-influence panel.
+  # CLAP-audio), i.e. what feeds the Condition_influence table.
   #   "cuda" -> GPU (default, fastest)
   #   "cpu"  -> move ONLY this part to CPU
   # FD-DAC / KL are unaffected: they always run on the GPU (see metrics.py).
@@ -537,9 +508,9 @@ metrics:
   # CREPE-full on top can overflow a card with little margin.
   fidelity_device: "cuda"
 
-  # ---- WHICH METRICS SCORE THE CONDITION-INFLUENCE ROWS ----
-  # Each row of Validation/Condition_influence compares the condition GIVEN to
-  # the model with the same descriptor RE-EXTRACTED from what it generated.
+  # ---- WHICH METRICS ARE THE COLUMNS OF THE CONDITION-INFLUENCE TABLE ----
+  # Each column of Validation/Condition_influence compares the condition GIVEN
+  # to the model with the same descriptor RE-EXTRACTED from what it generated.
   # Two families can do the scoring:
   #   "influence_metrics"      -> ours (DEFAULT, every run before 23 Sept 2026):
   #                               f0 Pearson on the voiced frames, chroma/chord
@@ -561,7 +532,7 @@ metrics:
   # The startup line "[metrics] extractor=<cond> | ... | metrics=..." says
   # which family each condition actually got.
   # Evaluation only -- the training is untouched. Switching it changes the
-  # ROWS of the table, so compare runs within one family.
+  # COLUMNS of the table, so compare runs within one family.
   influence_family: "influence_metrics"
 
   # ---- WHEN A PITCH CLASS COUNTS AS "ON" (chroma / chord, mir family) ----
@@ -682,8 +653,7 @@ conditioning:
   #
   # NB this is stage 2 ONLY. p_drop_all / p_drop_frame above must stay > 0
   # whatever you choose: they are what teaches the model the NULL case, without
-  # which classifier-free guidance has no v_u to extrapolate from and the
-  # influence panel has no baseline for its delta column.
+  # which classifier-free guidance has no v_u to extrapolate from.
   p_drop_each_frame: 0.0
 
   # Classifier-free guidance scale used when generating audio at validation
@@ -765,7 +735,7 @@ paths:
   splits_path:    null
 
   # Class-organised image folders (image_root/<class>/*.jpg)
-  # Read ONLY to display the conditioning picture in the validation panels --
+  # Read ONLY to display the conditioning picture in the test panels --
   # the embeddings themselves come from the dataset's own
   # global_conditions/image/ bank, built once by preprocess_stream.py. A wrong
   # or missing path costs the image CARDS, nothing else.

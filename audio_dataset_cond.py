@@ -480,9 +480,9 @@ class ConditionedAudioDataset(Dataset):
         """Which split one picture belongs to, from a hash of its FILE NAME.
 
         The images have no split of their own -- they are not the audio -- but
-        the validation panels must not show a picture the model was conditioned
-        on during training, or the panel would be measuring recall of a seen
-        image rather than the conditioning.
+        a val or test sample must not be conditioned on a picture the model was
+        conditioned on during training, or the metrics and the test panels
+        would be measuring recall of a seen image rather than the conditioning.
 
         Hashed by name, not by position, so the assignment survives the bank
         growing: dropping ten new pictures into a class folder and re-running

@@ -1,0 +1,54 @@
+# configs/test_cond.yaml
+#
+# Configuration of the TEST of a conditioned checkpoint (test_cond.py; on the
+# IRCAM servers launch_test_cond.py). The twin of configs/cond_default.yaml:
+# same key names, for what the test decides.
+#
+# HOW THE TEST CONFIG IS BUILT (low -> high priority):
+#   1. the checkpoint's own training config  -- stored inside the .pt: the
+#      model, the dataset and its paths, the conditions, the guidance, the
+#      Euler steps, the metrics and HOW they are computed (metrics.*), the
+#      seed. The test measures exactly as the training's validation did.
+#   2. THIS file                             -- what the TEST decides: how
+#      many test samples are measured and how many panels / cards are shown.
+#   3. the command line                      -- dotlist overrides, as for the
+#      training (e.g. sampling.n_metrics_samples=all metrics.dac_device=cuda);
+#      a key that does not exist stops the test.
+#
+# WHAT THE TEST WRITES ON TENSORBOARD (runs/<run>/test_logs/), all at the
+# checkpoint's training step -- the same windows as the training, but the loss:
+#   Time series  Test/Metrics/*: FD-DAC, KL (both directions), FAD-VGGish
+#                (those in metrics.enabled), on n_metrics_samples test samples,
+#                against the real TEST data.
+#   Text         Test/Condition_influence: the training's panel -- a row per
+#                metric of every condition (text / image included), columns
+#                with-cond, null, Δ, valid/used -- on those same samples; its
+#                legend;
+#                and the config of the test. An unconditioned checkpoint has
+#                no table, only the config.
+#   Images       test_XX/ and probe_XX/: target vs re-extracted condition.
+#   Audio        test_XX/ (recording, sonified conditions, generation),
+#                probe_XX/ (stimuli, generation), uncond generation/uncond_NN.
+# The generations are also written as .wav to runs/<run>/test_outputs/.
+
+sampling:
+  # Test samples, spread over the whole test split, on which FD-DAC, KL, FAD
+  # AND the table are computed -- the same samples for all of them.
+  #   a number -> that many (at most the size of the test split)
+  #   all      -> the whole test split
+  #   0        -> no metrics: only the panels and the uncond cards
+  # --metrics_samples N|all on the command line is a shortcut for this key.
+  n_metrics_samples: 512
+
+  # The panels to listen to and look at -- the same ones the training shows
+  # (sampling.n_test_panels / n_probe_panels / n_audio_samples of
+  # configs/cond_default.yaml). Nothing measured on them is in the table.
+  # TEST panels: samples of the test split, spread evenly over it -- the very
+  # samples of the training's test panels, so for the same checkpoint the two
+  # show the same generations. 0 -> none.
+  n_test_panels: 8
+  # PROBE panels: stimuli per bank of probe_conditions.py, at most 16. 0 -> none.
+  n_probe_panels: 8
+  # UNCONDITIONED generations: uncond_00, uncond_01, ... each from its own
+  # draw of one noise stream (metrics.seed).
+  n_audio_samples: 4

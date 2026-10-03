@@ -2,45 +2,50 @@
 launch_test_cond.py
 
 GPU-lock wrapper for IRCAM servers, dedicated to the TEST of a conditioned
-checkpoint (test_cond.py). The training has its own wrapper,
-launch_training_cond.py; the two are kept separate on purpose.
+checkpoint. The twin of launch_training_cond.py.
 
-Locks ONE GPU (the test runs on a single device) BEFORE importing torch, then
-runs test_cond.py with all the CLI arguments given here, unchanged.
+Locks the GPU BEFORE importing torch, then runs test_cond.py forwarding
+all the remaining CLI arguments to it. The test runs on one device, so the
+launcher always locks ONE GPU (there is no --num-gpus).
 
 Note:
     This launcher relies on the IRCAM-internal `manage_gpus` package and on
-    POSIX `fcntl`, so it is meant for the IRCAM Linux servers only. Elsewhere
-    (the laptop, the Windows VM) run the test directly:
-        python test_cond.py --ckpt <ckpt> [--metrics_samples N|all] [overrides]
+    POSIX `fcntl`. It is therefore meant for the IRCAM Linux servers only.
+    On other systems (e.g. the Windows VM at CAIS LAB) launch the test
+    script directly:
+        python test_cond.py --ckpt <ckpt> [--config ...] [overrides]
 
 Use:
-    # generation only, for listening (as test_cond.py alone)
-    python launch_test_cond.py --ckpt runs/<run>/checkpoints/best_model_step<N>.pt
+    # All defaults (configs/test_cond.yaml)
+    python launch_test_cond.py \\
+        --ckpt runs/cond_A/checkpoints/checkpoint_step50000.pt
 
-    # + the metrics on the whole test set
+    # Custom test config
+    python launch_test_cond.py --ckpt <ckpt> --config configs/my_test.yaml
+
+    # Metrics on the whole test split / no metrics (panels only)
     python launch_test_cond.py --ckpt <ckpt> --metrics_samples all
+    python launch_test_cond.py --ckpt <ckpt> --metrics_samples 0
 
-    # + a dotlist override, passed through like any other argument
-    python launch_test_cond.py --ckpt <ckpt> --metrics_samples all \\
-        metrics.fad_reference=decoded
+    # CLI overrides (passed straight to test_cond.py)
+    python launch_test_cond.py --ckpt <ckpt> \\
+        sampling.n_test_panels=4 metrics.dac_device=cuda
 
-The launcher consumes no argument of its own. -h / --help prints this text
-without locking anything; for the test's options: python test_cond.py --help
+The only argument the launcher consumes is --script.
+Everything else is passed verbatim to test_cond.py.
 """
 
 import os
 import sys
+import fcntl
+import argparse
 import platform
 
 
 # ============================================================
-# PARALLEL LOCK  (same mechanism as launch_training_cond.py)
+# PARALLEL LOCK
 # ============================================================
 class ParallelLock:
-    """Serializes the lock negotiation between processes starting at the
-    same time on the same machine."""
-
     def __init__(self, path=None):
         if path is None:
             path = os.path.expanduser("~/.gpu_setup.lock")
@@ -48,54 +53,73 @@ class ParallelLock:
         self.fd = None
 
     def __enter__(self):
-        import fcntl
         self.fd = open(self.path, "w")
         fcntl.flock(self.fd, fcntl.LOCK_EX)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        import fcntl
         fcntl.flock(self.fd, fcntl.LOCK_UN)
         self.fd.close()
 
 
 # ============================================================
-# GPU LOCK (one device)
+# GPU LOCKING
 # ============================================================
-def acquire_gpu_lock():
-    """Lock one GPU with the IRCAM lock system; returns the locked ids."""
-    if "torch" in sys.modules:
+def acquire_gpu_locks(num_devices=1):
+    """Locks num_devices GPUs using IRCAM lock system."""
+    if 'torch' in sys.modules:
         raise RuntimeError(
             "torch has been imported BEFORE locking the GPU. "
-            "Lock the GPU before every torch import.")
+            "Lock the GPUs before every torch import."
+        )
 
     try:
         import manage_gpus as mgp
     except ImportError:
         raise RuntimeError(
-            "did not find manage_gpus. Available only on IRCAM servers; "
-            "elsewhere run: python test_cond.py ...")
+            "did not find manage_gpus. "
+            "Available only on IRCAM servers."
+        )
+
+    if num_devices > 4:
+        raise ValueError(
+            f"At most 4 GPU supported per node (asked {num_devices})."
+        )
 
     with ParallelLock():
-        # A lock this user already holds (e.g. taken by a shell) is reused.
         devices = mgp.retrieve_my_gpu_locks()
 
         if not devices:
             gpu_ids = mgp.board_ids()
             if gpu_ids is None or len(gpu_ids) == 0:
-                raise RuntimeError(f"No GPU available on {platform.node()}.")
-            locked_gpu_id = mgp.get_gpu_lock()
-            if locked_gpu_id >= 0:
-                devices.append(locked_gpu_id)
+                raise RuntimeError(
+                    f"No GPU available on {platform.node()}."
+                )
+
+            for _ in range(num_devices):
+                locked_gpu_id = mgp.get_gpu_lock()
+                if locked_gpu_id >= 0:
+                    devices.append(locked_gpu_id)
+
             if not devices:
                 raise RuntimeError(
-                    f"Impossible to obtain a GPU on {platform.node()}.")
+                    f"Impossible to obtain a GPU on {platform.node()}."
+                )
+
+            if len(devices) < num_devices:
+                print(
+                    f"[WARN] asked {num_devices} GPU, obtained {len(devices)}.",
+                    file=sys.stderr,
+                )
 
         cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
         if not cuda_visible:
-            raise RuntimeError("CUDA_VISIBLE_DEVICES not set after locking.")
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
-            sorted(cuda_visible.split(",")))
+            raise RuntimeError(
+                "CUDA_VISIBLE_DEVICES not set after locking."
+            )
+        cuda_visible = sorted(cuda_visible.split(","))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible)
+
         return devices
 
 
@@ -103,23 +127,32 @@ def acquire_gpu_lock():
 # MAIN
 # ============================================================
 if __name__ == "__main__":
-    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+    # Parse only --script; everything else is forwarded to test_cond.py.
+    # No --num-gpus: the test runs on one device, so one GPU is locked.
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--script", type=str, default="test_cond.py",
+                        help="Test script to run "
+                              "(default: test_cond.py)")
+    parser.add_argument("-h", "--help", action="store_true")
+
+    args, forwarded_args = parser.parse_known_args()
+
+    if args.help:
         print(__doc__)
         sys.exit(0)
 
-    print("[launcher] Locking 1 GPU for the test...")
-    devices = acquire_gpu_lock()
+    print("[launcher] Locking 1 GPU...")
+    devices = acquire_gpu_locks(num_devices=1)
     print(f"[launcher] GPU locked: {devices}")
     print(f"[launcher] CUDA_VISIBLE_DEVICES = {os.environ['CUDA_VISIBLE_DEVICES']}")
 
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "test_cond.py")
-    if not os.path.exists(script):
-        raise FileNotFoundError(f"test script not found: {script}")
-    print(f"[launcher] Running: test_cond.py {' '.join(sys.argv[1:])}\n")
+    if not os.path.exists(args.script):
+        raise FileNotFoundError(f"Test script not found: {args.script}")
 
-    # test_cond.py sees exactly the arguments given to this launcher.
-    sys.argv = [script] + sys.argv[1:]
+    print(f"[launcher] Running: {args.script} {' '.join(forwarded_args)}\n")
+
+    # Replace sys.argv so the test script sees its own args (no --script)
+    sys.argv = [args.script] + forwarded_args
 
     import runpy
-    runpy.run_path(script, run_name="__main__")
+    runpy.run_path(args.script, run_name="__main__")

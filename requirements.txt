@@ -56,10 +56,11 @@ mir_eval             # metrics.influence_family: mir_influence_metrics (conditio
 resampy              # required by torchvggish/vggish_input.py (FAD-VGGish)
 
 # Wav2CLIP: audio distilled INTO CLIP's embedding space. It is what makes the
-# IMAGE condition's influence row a number at all -- a CLIP image vector and a
-# CLAP audio vector live in unrelated spaces, so without it that row reads
-# "no audio->CLIP embedder". Only needed when 'image' is an active global
-# condition; nothing else in the pipeline imports it.
+# IMAGE condition's column of the Condition_influence table a number at all --
+# a CLIP image vector and a CLAP audio vector live in unrelated spaces, so
+# without it that column reads n/a ("no audio->CLIP embedder" in the log). Only
+# needed when 'image' is an active global condition; nothing else in the
+# pipeline imports it.
 wav2clip             # image influence — audio in CLIP space (conditions.py)
 
 # =============================================================================

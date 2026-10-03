@@ -926,8 +926,10 @@ class ClapAudioEmbedder:
     the generation: CLAP's audio and text encoders share one space, so the
     cosine between the audio embedding of a generation and the CLAP-text
     embedding that conditioned it (already stored in the dataset, L2-normalized)
-    is a direct text-adherence score. The influence is the delta of this score
-    between the with-text and the null-text generations.
+    is a direct text-adherence score. The training's Condition_influence table
+    shows its mean over the validation generations (`text/clap_sim`);
+    test_cond.py also reports the delta between the with-text and the
+    null-text generations.
 
     Lazily loaded; only instantiated when 'text' is an active global condition.
     """
@@ -1090,10 +1092,13 @@ class Wav2ClipAudioEmbedder:
     SMALL, and the reason is a double domain mismatch: Wav2CLIP is distilled on
     VGGSound (video frames of everyday sound events) while this corpus pairs
     music with album covers and paintings.
-    READ THE INFLUENCE ROW ACCORDINGLY: it is a PAIRED delta -- the same image
+    READ THE NUMBER ACCORDINGLY. The training's Condition_influence table shows
+    the ABSOLUTE cosine (`image/clip_sim`, the mean over the validation
+    generations): a value near 0.07 says little on its own, so read the column
+    across steps. test_cond.py also gives the PAIRED delta -- the same image
     scored against the conditioned and the null generation -- which is far more
     sensitive than the cross-class retrieval above, so a consistent positive
-    delta still means something. An absolute cosine near 0.07 does not.
+    delta still means something.
 
     Kept deliberately separate from ImageCondition: that class encodes the
     IMAGES (and is what the dataset's banks were built with), this one encodes

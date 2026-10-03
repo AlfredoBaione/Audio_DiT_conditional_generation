@@ -1112,7 +1112,10 @@ def check_ckpt_reinject_gate(ckpt: dict, where: str = "this checkpoint") -> None
 
     Called by every script that rebuilds a model from a checkpoint. Silent (the
     normal case) for `frame_reinject_every == 0`, where neither the projections
-    nor the gates exist, and for any checkpoint written since the gate.
+    nor the gates exist, and for any checkpoint written since the gate. Silent
+    too for a model with no frame condition: it builds neither, whatever the
+    stride, and an unconditioned run trained with the default stride of 1 is
+    stored with frame_reinject_every=1 and no re-injection tensor at all.
     """
     if ckpt_frame_reinject_every(ckpt) <= 0:
         return
@@ -1123,6 +1126,9 @@ def check_ckpt_reinject_gate(ckpt: dict, where: str = "this checkpoint") -> None
         return                      # nothing to inspect; let the load speak
     if any(k.startswith("frame_reinject_gate.") for k in sd):
         return                      # written after the gate: nothing to say
+    if not any(k.startswith("frame_reinject.") for k in sd):
+        return                      # no projections either: this model built
+                                    # no re-injection (no frame condition)
     raise RuntimeError(
         f"{where} was trained with model.frame_reinject_every="
         f"{ckpt_frame_reinject_every(ckpt)} BEFORE the per-condition gate on "

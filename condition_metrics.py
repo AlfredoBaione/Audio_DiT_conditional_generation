@@ -864,7 +864,6 @@ def format_influence_legend() -> str:
     )
 
 
-
 _EXTRACTOR_FNS = {
     "chroma": ChromaExtractor,
     "rhythm": RhythmExtractor,
@@ -1139,7 +1138,7 @@ class ConditionFidelityEvaluator:
         # curves answer "close HOW?" -- which is what the TensorBoard comparison
         # plots show. Kept for a handful of ids only: the re-extraction already
         # happens for every scored sample, so this costs no extra work, but
-        # holding every contour would grow with n_influence_samples.
+        # holding every contour would grow with the generations measured.
         # Set with keep_contours_for(); empty = keep nothing (the default, so
         # every existing caller is unaffected).
         self._keep_ids = set()
@@ -1277,6 +1276,32 @@ class ConditionFidelityEvaluator:
                     self._per_sample[key][sid] = float(v)
                 else:
                     self._non_finite[key] += 1
+
+    def export_state(self) -> dict:
+        """Everything add_sample has accumulated since the last reset(), as
+        plain dicts. Multi-GPU: what a rank sends to rank 0, whose evaluator
+        then merge_state()s it and ends up as if it had measured every sample
+        itself. The curves kept for the plots are not included."""
+        return {
+            "sums": dict(self._sums),
+            "counts": dict(self._counts),
+            "attempted": dict(self._attempted),
+            "non_finite": dict(self._non_finite),
+            "extract_errors": dict(self._extract_errors),
+            "cond_attempted": dict(self._cond_attempted),
+            "per_sample": {k: dict(v) for k, v in self._per_sample.items()},
+        }
+
+    def merge_state(self, state: dict):
+        """Add another evaluator's export_state() to this one. Their samples
+        must be different ones (the ids are positions in one list)."""
+        for name in ("sums", "counts", "attempted", "non_finite",
+                     "extract_errors", "cond_attempted"):
+            mine = getattr(self, "_" + name)
+            for k, v in (state.get(name) or {}).items():
+                mine[k] += v
+        for k, d in (state.get("per_sample") or {}).items():
+            self._per_sample[k].update(d)
 
     def coverage(self) -> dict:
         """Per metric key: how many samples actually contributed to the mean, and
