@@ -1,71 +1,7 @@
-"""
-probe_conditions.py -- out-of-the-box probe sets for EVERY condition:
-the frame ones (f0, energy, chroma, rhythm, chord) and the global ones (text,
-image).
-
-One module, one shape: a bank of elementary stimuli per condition, one
-synthesizer per condition, one builder, one plotter. Adding a condition means
-adding a bank, a synthesizer and (if its shape needs one) a branch in the
-plotter -- nothing else. The f0 material lived in probe_f0.py first and was
-moved here unchanged when the four were unified; text and image joined the same
-way, and the two families differ in exactly one place (the builder):
-
-    frame   synthesize a waveform  -> EXTRACT a (n_frames, dim) curve
-    image   draw a .png            -> ENCODE  a (dim,) CLIP vector
-    text    take the prompt itself -> ENCODE  a (dim,) CLAP vector
-
-Everything downstream is medium-agnostic: whichever conditions a run activates,
-each panel i is driven by the i-th stimulus of every active bank at once, so
-the probe presents the model with exactly the shape it was trained on.
-
-The TEXT bank is the one bank that depends on the dataset: the probe has to
-speak at the level of detail of the text the model is trained on. A dataset
-whose captions are single labels is probed with those labels and nothing else;
-one with richer captions, with TEXT_PROMPTS. See text_probe_bank.
-
-What makes a probe different from the validation rows:
-
-    The validation rows score the model against REAL recordings. That is the
-    honest test, but a hard one to read: a real energy envelope is jittery, a
-    real chromagram is smeared across neighbouring pitch classes, a real beat
-    grid may not exist at all on this material. A middling score there does not
-    separate "the conditioning is weak" from "the target was ambiguous".
-
-    A probe removes the ambiguity. A rising scale, a linear crescendo, a
-    sustained C major triad, a 120 bpm click grid: if the model does not follow
-    THOSE, the conditioning does not work. It is a proof of concept, NOT a substitute --
-    the stimuli are synthetic and far simpler than the training material, so a
-    good probe score is necessary but not sufficient.
-
-Every probe target is extracted with THE RUN'S OWN extractor (the registry
-instance, same configuration that produced the training targets), so the target
-lives in the same space as what the model was trained on. Nothing here
-re-implements an extractor.
-
-Cache contract, identical to probe_f0: built once per configuration under
-`probe_dir`, keyed by a fingerprint of the stimuli, the synthesis source, the
-chunk geometry and the extractor's parameters. Change any of them and the set
-rebuilds itself instead of being silently reused stale.
-
-Build one standalone to look at it before training:
-    python probe_conditions.py energy ./cache/probe_energy --n_frames 431
-    python probe_conditions.py f0     ./cache/f0_probe     --n_frames 431
-    python probe_conditions.py image  ./cache/probe_image
-    python probe_conditions.py text   ./cache/probe_text
-(the global banks take no --n_frames: one embedding does not depend on the
-chunk geometry. The standalone text build is always TEXT_PROMPTS: a training
-run picks its text bank from its dataset.)
-"""
+# Probe stimuli banks for the listening panels.
 
 import os
 
-# IRCAM: redirect the model caches (DAC, CREPE, beat_this, HuggingFace) onto
-# the machine-local disk instead of the NFS HOME, as preprocess_stream.py and
-# training_cond.py do -- this module also runs STANDALONE to build the probe
-# banks, and then nobody else has set them. TORCH_HOME is an assignment, not a
-# setdefault: the nodes export it into the shared, read-only conda env, and
-# torch.hub prefers it over XDG_CACHE_HOME. Guarded so the script stays
-# portable off-IRCAM.
 _IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
 if os.path.isdir(_IRCAM_LOCAL):
     _cache = os.path.join(_IRCAM_LOCAL, ".cache")
@@ -87,21 +23,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from conditions import DAC_SAMPLE_RATE, DAC_FRAMES_PER_S, CONDITION_CONFIG
-from condition_metrics import f0_norm_to_hz
+from typing import Optional
+
+import latent_codec as _lc
+from condition_metrics import f0_norm_to_hz, render_midi_events
 
 
-# ============================================================
-# THE STIMULI
-# ============================================================
-# Ordered from "trivially readable" to "slightly less so". A run takes the
-# whole bank, or a FIXED random subset of it when sampling.n_probe_panels asks
-# for fewer (probe_subset_indices); every stimulus it takes is drawn and
-# played, and nothing measured on the probes goes into the table.
-#
-# ---- f0 -----------------------------------------------------
-# Each melody is a list of (midi_note | None, duration_in_beats); None is a
-# rest. Moved here verbatim from probe_f0.py when the four banks were
-# unified -- the melodies themselves are unchanged.
 PROBE_MELODIES = [
     ("scale_up",        [(60, 1), (62, 1), (64, 1), (65, 1),
                          (67, 1), (69, 1), (71, 1), (72, 1)]),
@@ -135,10 +62,6 @@ PROBE_MELODIES = [
                          (62, 1), (None, 0.4), (62, 1)]),
 ]
 
-# ---- ENERGY -------------------------------------------------
-# Each entry is a list of (level, duration_in_beats) breakpoints; the envelope
-# is linearly interpolated between the levels and applied to broadband noise.
-# Levels are linear amplitude in [0, 1]. A `None` level is silence.
 ENERGY_SHAPES = [
     ("ramp_up",         [(0.02, 0), (1.0, 8)]),
     ("ramp_down",       [(1.0, 0), (0.02, 8)]),
@@ -164,13 +87,6 @@ ENERGY_SHAPES = [
     ("long_decay",      [(1.0, 0), (0.3, 2), (0.1, 3), (0.02, 3)]),
 ]
 
-# ---- CHROMA -------------------------------------------------
-# Each entry is a list of (pitch classes as MIDI note numbers, duration_in_beats)
-# segments, rendered as sustained additive chords. Pitch classes are what a
-# chromagram sees; the octave is chosen inside the tone generator.
-# An EMPTY note list is a rest. In the target a rest is a pale, diffuse column,
-# not a dark one: the chromagram scales every frame to a maximum of 1, silence
-# included.
 CHROMA_CHORDS = [
     ("C_major_triad",   [([60, 64, 67], 8)]),
     ("A_minor_cadence", [([57, 60, 64], 2), ([62, 65, 69], 2),
@@ -201,22 +117,7 @@ CHROMA_CHORDS = [
     ("cluster_then_triad", [([60, 61, 62, 63], 4), ([60, 64, 67], 4)]),
 ]
 
-# ---- RHYTHM -------------------------------------------------
-# Each entry is (bpm | (bpm_start, bpm_end) for a ramp, beats_per_bar). Rendered
-# as a click track: a short bright burst per beat, a brighter+louder one on the
-# downbeat, over a quiet sustained bed so the signal is not pure silence between
-# clicks (beat trackers are trained on music, not on isolated impulses).
 RHYTHM_GRIDS = [
-    # ORDER: the reliable stimuli come first. `beat_this` recovers 12 of these
-    # 16 grids at the intended tempo; the last four fall into the well-known
-    # tempo-OCTAVE ambiguity of beat tracking -- 60 bpm comes back as 120, 160
-    # and 180 come back halved, and the ritardando is not followed through the
-    # ramp. Those four are NOT broken probes: the target is whatever the run's
-    # own extractor produced, so the comparison image is still self-consistent.
-    # They are simply confusing to LOOK at, since the picture then disagrees
-    # with the name, so they sit at the end of the bank. (Measured on the
-    # 5 s / 431-frame geometry -- re-check the order if the chunk duration
-    # changes.)
     ("clicks_120_4",    (120, 4)),
     ("clicks_90_4",     (90, 4)),
     ("clicks_140_4",    (140, 4)),
@@ -229,29 +130,12 @@ RHYTHM_GRIDS = [
     ("clicks_95_4",     (95, 4)),
     ("clicks_70_4",     (70, 4)),
     ("accelerando",     ((80, 160), 4)),
-    # ---- below: recovered at a different metrical level (see the note above) --
     ("clicks_60_4",     (60, 4)),
     ("clicks_160_4",    (160, 4)),
     ("clicks_180_4",    (180, 4)),
     ("ritardando",      ((160, 80), 4)),
 ]
 
-# ---- TEXT (global, CLAP) ------------------------------------
-# Each entry is (name, prompt). The prompt IS the stimulus: unlike the frame
-# banks there is nothing to synthesize, because the condition is already born as
-# text -- the "synthesizer" hands the string straight to the run's CLAP text
-# encoder, exactly as a caption would be at inference time.
-#
-# WHICH TEXT BANK A RUN USES is decided by its dataset, not here: the probe
-# must say as much as the text the model is trained on, and no more. These
-# descriptions are for a dataset whose captions are RICHER than a single
-# label; a dataset of single labels is probed with its own labels
-# (text_probe_bank, below).
-#
-# The prompts are elementary and mutually distant on purpose, for the same
-# reason the f0 bank holds a scale and not a phrase of real music: an
-# unmistakable stimulus is what separates "the conditioning does not work" from
-# "the target was ambiguous". Ordered from the most unmistakable down.
 TEXT_PROMPTS = [
     ("pipe_organ",      "solo pipe organ in a large reverberant church"),
     ("choir",           "a cappella choir singing a slow hymn"),
@@ -271,26 +155,6 @@ TEXT_PROMPTS = [
     ("hand_percussion", "hand percussion with shakers and tambourine"),
 ]
 
-# ---- IMAGE (global, CLIP) -----------------------------------
-# Each entry is (name, spec); the spec is a dict read by synthesize_image, which
-# draws an ABSTRACT figure -- flat colour fields and stylized geometric forms.
-# Deliberately chosen: these are synthetic stimuli, generated by this file like
-# every other bank, with no external asset to ship, download or keep in sync.
-#
-# READ THE PROBE OF AN ABSTRACT BANK WITH THIS IN MIND. What reaches the
-# model is not the picture but CLIP's READING of it, and a colour field has no
-# musical meaning for CLIP to read: its embedding lands far from the paintings
-# and album covers the model was conditioned on in training. So the model is
-# being asked a question outside the distribution it was trained on, and a weak
-# image probe here does NOT by itself prove the image conditioning is broken --
-# unlike the f0 bank, where a rising scale is unambiguous and a failure is a
-# failure. The table's image column, on in-corpus validation images, carries
-# that verdict.
-# What this bank DOES establish, and what the build reports below measure, is
-# whether 16 distinct images produce 16 distinct embeddings, i.e. whether the
-# slot can carry information at all.
-# Swapping in real images later changes nothing but this list and the
-# synthesizer: the rest of the pipeline is medium-agnostic.
 IMAGE_SHAPES = [
     ("red_field",       {"kind": "solid",      "colors": [(200, 30, 30)]}),
     ("blue_field",      {"kind": "solid",      "colors": [(30, 60, 200)]}),
@@ -310,15 +174,6 @@ IMAGE_SHAPES = [
     ("noise_field",     {"kind": "noise",      "colors": [(0, 0, 0), (255, 255, 255)], "seed": 0}),
 ]
 
-# ---- CHORD --------------------------------------------------
-# The chord condition (crema's chord pitch classes) is probed with sustained
-# chords, rendered by the chroma synthesizer: a triad is exactly what a chord
-# recognizer is for. This is the list the chroma bank held before that bank was
-# given more movement, kept as it was so that the chord probe (and every chord
-# cache) did not change with it. The clusters and the whole-tone / quartal sets
-# fall outside crema's vocabulary; as with the rhythm grids, the target is
-# whatever the run's own extractor makes of them, so they still score a
-# self-consistent goal.
 CHORD_CHORDS = [
     ("C_major_triad",   [([60, 64, 67], 8)]),
     ("A_minor_triad",   [([57, 60, 64], 8)]),
@@ -342,6 +197,77 @@ CHORD_CHORDS = [
     ("cluster_then_triad", [([60, 61, 62, 63], 4), ([60, 64, 67], 4)]),
 ]
 
+_B8 = [0, 1, 2, 3, 4, 5, 6, 7]
+_BACKBEAT = ([(b, "kick") for b in (0, 2, 4, 6)]
+             + [(b, "snare") for b in (1, 3, 5, 7)])
+_EIGHTH_HATS = [(b / 2.0, "hihat_closed") for b in range(16)]
+MIDI_PATTERNS = [
+    ("C_major_scale",   {"beats": 8, "notes": [(b, 1, p) for b, p in zip(
+                             _B8, [60, 62, 64, 65, 67, 69, 71, 72])],
+                         "drums": []}),
+    ("C_major_chord",   {"beats": 8, "notes": [(0, 8, 60), (0, 8, 64),
+                                               (0, 8, 67)], "drums": []}),
+    ("arpeggio_up_down", {"beats": 8, "notes": [(b, 1, p) for b, p in zip(
+                             _B8, [60, 64, 67, 72, 67, 64, 60])],
+                          "drums": []}),
+    ("repeated_C",      {"beats": 8, "notes": [(b / 2.0, 0.4, 60)
+                                               for b in range(16)],
+                         "drums": []}),
+    ("melody_and_bass", {"beats": 8, "notes": [
+                             (0, 1, 64), (1, 1, 65), (2, 1, 67), (3, 1, 64),
+                             (4, 1, 65), (5, 1, 69), (6, 2, 67),
+                             (0, 2, 36), (2, 2, 43), (4, 2, 41), (6, 2, 43)],
+                         "drums": []}),
+    ("I_IV_V_I",        {"beats": 8, "notes": [
+                             (b, 2, p) for b, chord in ((0, (60, 64, 67)),
+                                                        (2, (65, 69, 72)),
+                                                        (4, (67, 71, 74)),
+                                                        (6, (60, 64, 67)))
+                             for p in chord], "drums": []}),
+    ("low_register",    {"beats": 8, "notes": [(b, 1, p) for b, p in zip(
+                             _B8, [28, 31, 33, 35, 36, 38, 39, 40])],
+                         "drums": []}),
+    ("high_register",   {"beats": 8, "notes": [(b, 1, p) for b, p in zip(
+                             _B8, [84, 86, 88, 89, 91, 93, 95, 96])],
+                         "drums": []}),
+    ("stabs_then_rest", {"beats": 8, "notes": [
+                             (b, 0.5, p) for b in (0, 1, 2, 3)
+                             for p in (62, 66, 69)], "drums": []}),
+    ("backbeat",        {"beats": 8, "notes": [], "drums": _BACKBEAT}),
+    ("rock_groove",     {"beats": 8, "notes": [],
+                         "drums": _BACKBEAT + _EIGHTH_HATS}),
+    ("open_hihat_offbeats", {"beats": 8, "notes": [],
+                             "drums": [(b, "kick") for b in (0, 2, 4, 6)]
+                             + [(b, "snare") for b in (1, 3, 5, 7)]
+                             + [(b + 0.5, "hihat_open") for b in _B8]
+                             + [(b, "hihat_closed") for b in _B8]}),
+    ("tom_fill_crash",  {"beats": 8, "notes": [],
+                         "drums": [(0, "crash"), (0, "kick"), (1, "snare"),
+                                   (2, "kick"), (3, "snare"),
+                                   (4, "tom_high"), (4.5, "tom_high"),
+                                   (5, "tom_mid"), (5.5, "tom_mid"),
+                                   (6, "tom_low"), (6.5, "tom_low"),
+                                   (7, "crash"), (7, "kick")]}),
+    ("groove_and_bass", {"beats": 8, "notes": [
+                             (b / 2.0, 0.45, p) for b, p in zip(
+                                 range(16), [36, 36, 48, 36, 40, 40, 52, 40,
+                                             43, 43, 55, 43, 41, 41, 53, 43])],
+                         "drums": _BACKBEAT + _EIGHTH_HATS}),
+    ("ride_walking_bass", {"beats": 8, "notes": [(b, 1, p) for b, p in zip(
+                               _B8, [36, 40, 43, 45, 47, 45, 43, 40])],
+                           "drums": [(b, "ride") for b in _B8]
+                           + [(b, "hihat_closed") for b in (1, 3, 5, 7)]}),
+    ("band_I_vi_IV_V",  {"beats": 8, "notes": [
+                             (b, 2, p) for b, chord in ((0, (60, 64, 67)),
+                                                        (2, (57, 60, 64)),
+                                                        (4, (53, 57, 60)),
+                                                        (6, (55, 59, 62)))
+                             for p in chord]
+                         + [(b, 2, p) for b, p in ((0, 36), (2, 33),
+                                                   (4, 29), (6, 31))],
+                         "drums": _BACKBEAT + _EIGHTH_HATS}),
+]
+
 PROBE_BANKS = {
     "f0": PROBE_MELODIES,
     "energy": ENERGY_SHAPES,
@@ -350,69 +276,22 @@ PROBE_BANKS = {
     "text": TEXT_PROMPTS,
     "image": IMAGE_SHAPES,
     "chord": CHORD_CHORDS,
+    "midi": MIDI_PATTERNS,
 }
 
-# Which banks are GLOBAL conditions (one vector per sample, AdaLN) rather than
-# frame-level ones (a curve per chunk). Read off CONDITION_CONFIG rather than
-# hardcoded here, so adding a third global condition to conditions.py does not
-# leave a stale list behind in this module.
 GLOBAL_PROBE_NAMES = set(CONDITION_CONFIG.get("global", {}))
 
 
 def is_global_probe(condition: str) -> bool:
-    """True when `condition` is a global condition, i.e. its probe stimulus is
-    encoded to ONE vector (image/text) instead of extracted to a per-frame
-    curve. The two differ in medium, in what a target looks like and in what a
-    degenerate bank means, and every branch in this file keys off this."""
     return str(condition) in GLOBAL_PROBE_NAMES
 
 
 def _slug(text) -> str:
-    """A label made safe for a stimulus NAME (meta.json, file stems): lower
-    case, every run of characters that are not letters or digits collapsed to
-    one '_'."""
     s = "".join(ch if ch.isalnum() else "_" for ch in str(text).lower())
     return "_".join(p for p in s.split("_") if p)[:40] or "caption"
 
 
 def text_probe_bank(caption_table=None, n_panels=None):
-    """
-    -> (bank, why): the TEXT probe bank for the dataset a run trains on, and
-    one line saying which bank was chosen and why.
-
-    `n_panels` is how many panels the run asks for
-    (sampling.n_probe_panels; None = as many as TEXT_PROMPTS, and
-    never more than that). It matters only for the single-label bank below,
-    which is CYCLED to exactly n_panels entries: a random
-    subset of the 16-long cycle could drop a label altogether (4 of 16 over
-    labels A, B, C, D can come out A, A, C, D), while cycling to n keeps every
-    label in turn. The descriptions bank is returned whole, and a smaller
-    n_panels takes its fixed random subset in build_condition_probe_set like
-    any other bank.
-
-    The probe has to speak at the level of detail of the text the model is
-    trained on. That level is written by the preprocessing, as `n_terms` in
-    global_conditions/text_labels.json (1 = the caption is the class alone):
-
-        n_terms == 1   the captions ARE single labels, so the probe uses those
-                       labels and nothing else, taken in turn until the bank is
-                       n_panels long (default: as long as TEXT_PROMPTS):
-                       labels A, B, C give the panels
-                       A, B, C, A, B, C, ... A repeated label is not a wasted
-                       panel: every panel starts from its own noise, so it is
-                       one more generation from the same text.
-        n_terms > 1    the captions are richer than a label: TEXT_PROMPTS.
-
-    A dataset with a text vector but no caption file can only predate that
-    file (the preprocessing writes it whenever it extracts text): TEXT_PROMPTS,
-    as before, and `why` says so.
-
-    `caption_table` is audio_dataset_cond.load_caption_table(...), passed in
-    rather than read here so that this module needs no knowledge of the dataset
-    layout. The labels are the strings the preprocessing gave to CLAP, verbatim
-    and in the table's order: no list of words lives in this file, and another
-    dataset is probed with its own.
-    """
     table = caption_table or {}
     labels = [str(c) for c in (table.get("captions_text")
                                or table.get("captions") or [])]
@@ -436,9 +315,6 @@ def text_probe_bank(caption_table=None, n_panels=None):
             f"turn: {', '.join(labels[:n])}{more}")
 
 
-# ============================================================
-# SYNTHESIS
-# ============================================================
 def _midi_to_hz(midi) -> float:
     return 440.0 * (2.0 ** ((float(midi) - 69.0) / 12.0))
 
@@ -477,7 +353,7 @@ def _normalize(out, amp=0.25):
     return out.astype(np.float32)
 
 
-def synthesize_energy(breakpoints, sr: int = DAC_SAMPLE_RATE,
+def synthesize_energy(breakpoints, sr: Optional[int] = None,
                       duration_s: float = 5.0, amp: float = 0.25,
                       seed: int = 12345) -> np.ndarray:
     """
@@ -492,6 +368,7 @@ def synthesize_energy(breakpoints, sr: int = DAC_SAMPLE_RATE,
     The noise is drawn from a FIXED seed so the stimulus is identical on every
     machine and the cached target stays valid.
     """
+    sr = _lc.active_sr(sr)
     n_total = int(round(duration_s * sr))
     rng = np.random.default_rng(seed)
     carrier = rng.standard_normal(n_total)
@@ -511,9 +388,10 @@ def synthesize_energy(breakpoints, sr: int = DAC_SAMPLE_RATE,
     return _normalize(carrier * env, amp)
 
 
-def synthesize_chroma(segments, sr: int = DAC_SAMPLE_RATE,
+def synthesize_chroma(segments, sr: Optional[int] = None,
                       duration_s: float = 5.0, amp: float = 0.25) -> np.ndarray:
     """Render a (midi list, beats) segment list as sustained additive chords."""
+    sr = _lc.active_sr(sr)
     n_total = int(round(duration_s * sr))
     out = np.zeros(n_total, dtype=np.float64)
     total_beats = sum(float(b) for _, b in segments) or 1.0
@@ -535,7 +413,7 @@ def synthesize_chroma(segments, sr: int = DAC_SAMPLE_RATE,
     return _normalize(out, amp)
 
 
-def synthesize_rhythm(grid, sr: int = DAC_SAMPLE_RATE, duration_s: float = 5.0,
+def synthesize_rhythm(grid, sr: Optional[int] = None, duration_s: float = 5.0,
                       amp: float = 0.25, seed: int = 54321) -> np.ndarray:
     """
     Render a (bpm, beats_per_bar) grid as a click track over a quiet bed.
@@ -549,6 +427,7 @@ def synthesize_rhythm(grid, sr: int = DAC_SAMPLE_RATE, duration_s: float = 5.0,
     sustained tone keeps the stimulus musical enough to be tracked while leaving
     the clicks as the only rhythmic information.
     """
+    sr = _lc.active_sr(sr)
     n_total = int(round(duration_s * sr))
     rng = np.random.default_rng(seed)
     bpm, per_bar = grid
@@ -596,7 +475,7 @@ def synthesize_rhythm(grid, sr: int = DAC_SAMPLE_RATE, duration_s: float = 5.0,
     return _normalize(out, amp)
 
 
-def synthesize_melody(notes, sr: int = DAC_SAMPLE_RATE, duration_s: float = 5.0,
+def synthesize_melody(notes, sr: Optional[int] = None, duration_s: float = 5.0,
                       n_harmonics: int = 6, amp: float = 0.25) -> np.ndarray:
     """
     Render a (midi, beats) note list to a float32 waveform of EXACTLY
@@ -614,6 +493,7 @@ def synthesize_melody(notes, sr: int = DAC_SAMPLE_RATE, duration_s: float = 5.0,
     a melody's note count sets its tempo and every probe is the same length as
     a training chunk.
     """
+    sr = _lc.active_sr(sr)
     total_beats = sum(float(d) for _, d in notes) or 1.0
     n_total = int(round(duration_s * sr))
     out = np.zeros(n_total, dtype=np.float64)
@@ -654,14 +534,45 @@ def synthesize_melody(notes, sr: int = DAC_SAMPLE_RATE, duration_s: float = 5.0,
     return out.astype(np.float32)
 
 
-# ============================================================
-# SYNTHESIS -- GLOBAL CONDITIONS
-# ============================================================
-# The four synthesizers above render a waveform, because a frame condition is
-# extracted FROM audio. A global condition is encoded from its own medium
-# instead, so these two produce that medium -- a string, an RGB image -- and the
-# builder hands it to the run's own CLAP/CLIP encoder. Same contract, different
-# material: one stimulus in, one target out.
+def midi_probe_events(spec, duration_s: float = 5.0):
+    """A MIDI_PATTERNS entry -> (pitched [(onset s, offset s, pitch)],
+    drums [(onset s, class index)]), beats scaled to fill duration_s."""
+    from conditions import MIDI_DRUM_CLASSES
+    names = [n for n, _ in MIDI_DRUM_CLASSES]
+    sec = float(duration_s) / (float(spec["beats"]) or 1.0)
+    pitched = [(float(b) * sec, (float(b) + float(d)) * sec, int(p))
+               for b, d, p in spec.get("notes", [])]
+    drums = [(float(b) * sec, names.index(c)) for b, c in spec.get("drums", [])]
+    return pitched, drums
+
+
+def midi_probe_notes(spec, duration_s: float = 5.0):
+    """The same events as (onset, offset, pitch, is_drum) notes -- the form
+    MidiExtractor.from_notes rolls, as it rolls a MIDI file. A drum hit
+    becomes its class's first General MIDI note (36 kick, 38 snare, ...),
+    which the roll folds back into the same class."""
+    from conditions import MIDI_DRUM_CLASSES
+    pitched, drums = midi_probe_events(spec, duration_s)
+    return ([(on, off, p, False) for on, off, p in pitched]
+            + [(on, on + 0.05, MIDI_DRUM_CLASSES[k][1][0], True)
+               for on, k in drums])
+
+
+def synthesize_midi(spec, sr: Optional[int] = None, duration_s: float = 5.0,
+                    amp: float = 0.25) -> np.ndarray:
+    """A MIDI_PATTERNS entry rendered to listen to: notes as decaying harmonic
+    tones, drum hits as class-coloured bursts (condition_metrics.
+    render_midi_events, the renderer that sonifies a midi condition). Only the
+    ear uses it: the probe's TARGET is the roll of the notes themselves
+    (SYMBOLIC_TARGETS), and the generation is transcribed, not this waveform."""
+    sr = _lc.active_sr(sr)
+    pitched, drums = midi_probe_events(spec, duration_s)
+    return render_midi_events(pitched, drums, sr,
+                              int(round(duration_s * sr)), amp=amp)
+
+
+SYMBOLIC_TARGETS = {"midi": midi_probe_notes}
+
 
 def synthesize_text(spec, **_ignored) -> str:
     """The stimulus IS the prompt. This exists so the banks stay uniform (every
@@ -785,28 +696,11 @@ SYNTHESIZERS = {
     "text": synthesize_text,
     "image": synthesize_image,
     "chord": synthesize_chroma,
+    "midi": synthesize_midi,
 }
 
 
-# ============================================================
-# THE PROBE SET
-# ============================================================
 class ConditionProbeSet:
-    """Built probe set for ONE condition: synthesized stimuli + their extracted
-    targets.
-
-    `targets[i]` is (n_frames, dim) for a frame condition -- exactly like a
-    dataset condition, so it can be fed to the sampler with no special-casing --
-    and (dim,) for a global one, which is the shape the AdaLN encoder takes. The
-    stimuli themselves stay on disk and are read on demand: only the handful
-    that get logged are ever loaded.
-
-    THE STIMULUS IS NOT ALWAYS AUDIO. A frame probe is a waveform (it has to be:
-    its target is EXTRACTED from audio); an image probe is a .png, and a text
-    probe is a string with no file at all. `specs` keeps the bank entry each
-    stimulus came from, which is what lets the text panels print the prompt that
-    conditioned a generation instead of just its slug."""
-
     def __init__(self, condition, directory, names, targets, sr, duration_s,
                  specs=None, tokens=None, tok_len=None):
         self.condition = str(condition)
@@ -816,11 +710,6 @@ class ConditionProbeSet:
         self.sr = int(sr)
         self.duration_s = float(duration_s)
         self.specs = list(specs) if specs is not None else []
-        # TEXT probes only: the prompts as TOKEN sequences, (n, L, ctx_dim)
-        # plus their true lengths. The pooled vector in `targets` is what the
-        # AdaLN slot takes and what the similarity metric scores; this is what
-        # a cross-attention can attend over. None on a set built before the
-        # cross-attention existed, and on every non-text condition.
         self.tokens = tokens
         self.tok_len = tok_len
         self.is_global = is_global_probe(condition)
@@ -849,26 +738,15 @@ class ConditionProbeSet:
         return self._stem(i) + ".png"
 
     def image(self, i: int) -> np.ndarray:
-        """(H, W, 3) uint8 -- the stimulus as CLIP saw it."""
         from PIL import Image
         return np.asarray(Image.open(self.image_path(i)).convert("RGB"))
 
     def text(self, i: int) -> str:
-        """The prompt of a text probe. For the other conditions there is no
-        prompt, so the stimulus NAME is returned: callers that label a panel
-        ('scale_up', 'clicks_120_4') then need no branch of their own."""
         if self.condition == "text" and i < len(self.specs):
             return str(self.specs[i])
         return self.names[i]
 
     def context(self, i: int):
-        """{'tokens': (1, L, ctx), 'mask': (1, L)} for stimulus i, batch-1 and
-        ready for the model -- or None when this set has no token sequences.
-
-        None means 'this probe cannot drive a cross-attention', and the caller
-        has to decide what that is worth; it must never be read as 'no text',
-        which is a different statement the model has a learned token for.
-        """
         if self.tokens is None or i >= len(self.tokens):
             return None
         tok = torch.from_numpy(np.asarray(self.tokens[i], dtype=np.float32))
@@ -878,40 +756,26 @@ class ConditionProbeSet:
         return {"tokens": tok.unsqueeze(0), "mask": mask.unsqueeze(0)}
 
     def label(self, i: int) -> str:
-        """What to write on a panel for stimulus i: the prompt itself when there
-        is one, the slug otherwise."""
         return self.text(i)
 
 
 def _synth_fingerprint(condition: str) -> dict:
-    """Identity of the SYNTHESIS: the hash of the generator's own source. Edit a
-    synthesizer and every cached set for that condition rebuilds, instead of
-    silently reusing targets produced by code that no longer exists."""
     src = inspect.getsource(SYNTHESIZERS[condition])
-    # The tone helpers belong to the AUDIO synthesizers only. Folding them into
-    # an image or text fingerprint would rebuild those banks -- and re-encode
-    # them through CLIP/CLAP -- every time an oscillator is touched, for a
-    # stimulus that contains no audio at all.
     helpers = "" if is_global_probe(condition) else "".join(
         inspect.getsource(f) for f in
         (_harmonic_tone, _fade, _normalize, _midi_to_hz))
+    if condition in SYMBOLIC_TARGETS:
+        helpers += "".join(inspect.getsource(f) for f in
+                           (midi_probe_events, SYMBOLIC_TARGETS[condition],
+                            render_midi_events))
     return {"synth_sha1": hashlib.sha1((src + helpers).encode()).hexdigest()}
 
 
 def _fingerprint(condition, n_probes, n_frames, sr, duration_s, extractor,
                  bank=None):
-    """Everything that would change the targets. The extractor's parameters are
-    read off the object with dir() -- NOT vars(), which sees only the instance
-    __dict__ and would drop a parameter carried as a class attribute, leaving a
-    stale cache reusable with no sign of it.
-
-    `bank` is the list actually built (None = the module's own), so a text bank
-    that follows the dataset rebuilds its cache when the dataset's labels
-    change. For the module's own bank the payload is byte-identical to what it
-    was before `bank` existed, and every cache on disk stays a hit."""
     ex = {}
     for k in sorted(dir(extractor)):
-        if k.startswith("_") or k == "device":   # device: speed, never values
+        if k.startswith("_") or k == "device":
             continue
         try:
             v = getattr(extractor, k)
@@ -924,10 +788,6 @@ def _fingerprint(condition, n_probes, n_frames, sr, duration_s, extractor,
             f"{condition} probe: the extractor exposes no scalar parameters, so "
             f"the cache fingerprint would not react to a configuration change. "
             f"Refusing to build a probe set that could later be reused stale.")
-    # A global target is ONE vector encoded from an image or a string: the chunk
-    # geometry played no part in producing it. Folding it in anyway would throw
-    # away a CLIP/CLAP re-encode of the whole bank on any change of duration_s
-    # -- a rebuild that could not change a single number.
     geometry = ({"n_frames": None, "sr": None, "duration_s": None}
                 if is_global_probe(condition) else
                 {"n_frames": int(n_frames), "sr": int(sr),
@@ -947,24 +807,6 @@ def _fingerprint(condition, n_probes, n_frames, sr, duration_s, extractor,
 
 def _build_global_probe_targets(condition, entries, synth, extractor,
                                 stim_path, tag, verbose):
-    """
-    Encode a global bank -> [(dim,) float32, ...], one L2-normalized embedding
-    per stimulus, and report whether the bank is USABLE.
-
-    The frame builder's diagnostic is "is this target flat?", because a flat
-    curve means the probe scores nothing. A global target is a single vector and
-    is never flat, so the failure mode is a different one: two stimuli that the
-    encoder maps to nearly the SAME embedding drive the model with the same
-    condition, and no panel between them can show a difference. So what is
-    reported here is how far apart the bank spreads -- the cosine of each
-    stimulus to its nearest neighbour, and the bank's mean pairwise cosine.
-
-    For an abstract image bank this is the number that says whether the slot can
-    carry information at all: CLIP was trained on photographs and illustrations,
-    and it is entitled to map sixteen flat colour fields into one small corner
-    of its space. Reading it before a run costs nothing and is the difference
-    between a probe panel that means something and one that cannot.
-    """
     targets = []
     if verbose:
         medium = "images" if condition == "image" else "prompts"
@@ -988,14 +830,8 @@ def _build_global_probe_targets(condition, entries, synth, extractor,
         targets.append(emb)
 
     if verbose and len(targets) > 1:
-        M = np.stack(targets)                      # (n, dim), already L2-normed
+        M = np.stack(targets)
         S = M @ M.T
-        # A bank may REPEAT a stimulus on purpose: a dataset of single labels
-        # cycles its few words over the panels (text_probe_bank). A repeat is
-        # the same condition by construction, not a collision, so the spread is
-        # measured between DIFFERENT stimuli only -- each entry is masked
-        # against itself and against its own repeats. With no repeats this is
-        # exactly the diagonal, i.e. the report is unchanged.
         keys = [json.dumps(spec, sort_keys=True) for _name, spec in entries]
         first = {}
         for i, k in enumerate(keys):
@@ -1029,28 +865,10 @@ def _build_global_probe_targets(condition, entries, synth, extractor,
     return targets
 
 
-# Seed of the probe SUBSET (fewer stimuli than a bank holds). A constant, not a
-# config key: the subset has to be the same at every metrics step and in every
-# run, or a probe curve would mix "the model improved" with "other stimuli were
-# drawn". Changing it changes which stimuli a smaller probe uses.
 PROBE_SUBSET_SEED = 0
 
 
 def probe_subset_indices(bank_size: int, n: int) -> list:
-    """-> the indices of the bank entries a probe of `n` stimuli uses, in bank
-    order.
-
-    n >= bank_size -> the whole bank, 0..bank_size-1: exactly what every run
-                      did before, so a full probe and its cache are unchanged.
-    n <  bank_size -> n entries drawn at random WITHOUT replacement, from a
-                      generator seeded with PROBE_SUBSET_SEED: random, so a
-                      small probe is not stuck with the head of a bank that is
-                      ordered by kind (the first 4 f0 stimuli are all scales,
-                      arpeggios and leaps); FIXED, so it is the same subset at
-                      every step and in every run. The banks of one run share
-                      one size, hence one subset of positions.
-
-    A local generator: the global numpy / torch streams are not touched."""
     bank_size = int(bank_size)
     n = max(1, min(int(n), bank_size))
     if n >= bank_size:
@@ -1061,36 +879,10 @@ def probe_subset_indices(bank_size: int, n: int) -> list:
 
 def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
                               n_probes: int = 16, duration_s: float = 5.0,
-                              sr: int = DAC_SAMPLE_RATE, force: bool = False,
+                              sr: Optional[int] = None, force: bool = False,
                               verbose: bool = True,
                               bank=None) -> ConditionProbeSet:
-    """
-    Build (or load from cache) the out-of-the-box probe set for `condition`
-    ("f0" | "energy" | "chroma" | "rhythm" | "chord" | "text" | "image").
-
-    `bank`, when given, replaces PROBE_BANKS[condition] -- same list of
-    (name, spec) -- and is how the text bank follows the dataset
-    (text_probe_bank). None = the module's own bank, as always.
-
-    `extractor` is the RUN'S extractor for that condition --
-    registry.frame_extractors[condition] for a frame condition,
-    registry.global_extractors[condition] for a global one -- so the targets are
-    produced by the exact configuration that produced the training targets.
-    Nothing here re-implements one.
-
-    The two families differ only in medium, and the difference is confined to
-    this function:
-        frame  -> synthesize a waveform, EXTRACT a (n_frames, dim) curve
-        image  -> draw a .png,           ENCODE  a (dim,) CLIP vector
-        text   -> take the prompt,       ENCODE  a (dim,) CLAP vector
-    `n_frames`, `sr` and `duration_s` are ignored for the global conditions:
-    nothing about a single embedding depends on the chunk geometry.
-
-    `n_probes` below the bank's size takes a FIXED random subset of it
-    (probe_subset_indices); above it, the whole bank, and it says so. The
-    subset is what gets built, cached and fingerprinted, so changing
-    n_probes rebuilds the cache and the full bank keeps every existing one.
-    """
+    sr = _lc.active_sr(sr)
     if condition not in PROBE_BANKS:
         raise ValueError(f"no probe bank for condition '{condition}'. "
                          f"Available: {sorted(PROBE_BANKS)}.")
@@ -1101,19 +893,10 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
     if int(n_probes) > len(bank) and verbose:
         print(f"{tag} asked for {int(n_probes)} stimuli, the bank holds "
               f"{len(bank)} -> using all {len(bank)}")
-    # From here on `bank` IS the stimuli used: the whole bank, or its fixed
-    # random subset, in bank order.
     full_size = len(bank)
     bank = [bank[i] for i in probe_subset_indices(full_size, n_probes)]
     n_probes = len(bank)
     probe_dir = str(probe_dir)
-    # A subset gets a folder of its own next to the full bank's: two runs
-    # sharing one cache_dir with different probe sizes would otherwise rebuild
-    # each other's cache at every start (the fingerprint differs), and could
-    # write the same files at once. The full bank stays where it always was.
-    # Measured against the module's bank as well, because a text bank that
-    # follows the dataset arrives already cycled to the size asked for
-    # (text_probe_bank) and is then "whole" by its own length.
     if n_probes < max(full_size, len(PROBE_BANKS[condition])):
         probe_dir = os.path.join(probe_dir, f"subset_{n_probes:02d}")
     os.makedirs(probe_dir, exist_ok=True)
@@ -1123,8 +906,6 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
                       bank)
     names = [name for name, _ in bank[:n_probes]]
     specs = [spec for _, spec in bank[:n_probes]]
-    # The stimulus file, per medium. A text probe has none: the prompt lives in
-    # meta.json, so there is nothing on disk to check for or to go missing.
     ext = {"image": ".png"}.get(condition, None if condition == "text" else ".wav")
 
     def _stim_path(i):
@@ -1139,12 +920,6 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
                 targets = [data[f"probe_{i:02d}"] for i in range(n_probes)]
                 tok = data["tok"] if "tok" in data.files else None
                 tlen = data["tok_len"] if "tok_len" in data.files else None
-                # A TEXT cache written before the token sequences existed is
-                # treated as a MISS, not as a set with no tokens: the
-                # fingerprint cannot see the difference, and a silent hit
-                # would leave a cross-attention run driving every probe with
-                # the null token. Rebuilding costs one pass of CLAP over the
-                # prompts.
                 stale_text = (condition == "text" and tok is None)
                 if stale_text and verbose:
                     print(f"{tag} cache predates the token sequences "
@@ -1169,14 +944,10 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
 
     synth = SYNTHESIZERS[condition]
 
-    # ---- GLOBAL conditions: one embedding per stimulus ----
     if is_global_probe(condition):
         targets = _build_global_probe_targets(
             condition, bank[:n_probes], synth, extractor, _stim_path, tag,
             verbose)
-        # The same prompts, a second time, as TOKEN sequences. Not a
-        # duplicate: one vector cannot be attended over, so the pooled targets
-        # above and these are the two halves of the same condition.
         tok = tlen = None
         if condition == "text" and hasattr(extractor, "encode_tokens"):
             try:
@@ -1196,9 +967,6 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump({"fingerprint": fp, "condition": condition,
                        "names": names,
-                       # The prompts are kept here as well as in the bank, so a
-                       # cached set can label its own panels without importing
-                       # the bank that built it.
                        "prompts": ([str(s) for s in specs]
                                    if condition == "text" else None),
                        "dim": int(targets[0].shape[0]) if targets else 0},
@@ -1209,24 +977,24 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
                                  duration_s, specs=specs, tokens=tok,
                                  tok_len=tlen)
 
-    # ---- FRAME conditions: synthesize audio, extract a curve ----
     import soundfile as sf
     if verbose:
         print(f"{tag} building {n_probes} elementary stimuli "
               f"({duration_s:.1f}s each) and extracting their targets...")
 
     targets = []
+    symbolic = SYMBOLIC_TARGETS.get(condition)
     for i, (name, spec) in enumerate(bank[:n_probes]):
         y = synth(spec, sr=sr, duration_s=duration_s)
         sf.write(os.path.join(probe_dir, f"probe_{i:02d}_{name}.wav"), y, sr)
-        tgt = np.asarray(extractor.extract(y, sr, n_frames), dtype=np.float32)
+        if symbolic is not None:
+            tgt = np.asarray(extractor.from_notes(symbolic(spec, duration_s),
+                                                  n_frames), dtype=np.float32)
+        else:
+            tgt = np.asarray(extractor.extract(y, sr, n_frames),
+                             dtype=np.float32)
         targets.append(tgt)
         if verbose:
-            # A degenerate target means the probe would be scoring nothing.
-            # Report it rather than let a meaningless row appear in the panel.
-            # f0 is reported as VOICED COVERAGE, which is its real failure mode:
-            # a contour extracted as almost entirely unvoiced would have the
-            # probe scoring silence, and its std would look perfectly healthy.
             if condition == "f0":
                 voiced = float((tgt[:, 0] > 0).mean())
                 flag = ("  <-- almost all unvoiced, check fmin/fmax and "
@@ -1251,13 +1019,7 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
                              duration_s)
 
 
-# ============================================================
-# PLOTS
-# ============================================================
 def _fig_to_tensor(fig) -> torch.Tensor:
-    """matplotlib figure -> (3, H, W) float tensor in [0,1] for add_image.
-    dpi is taken from the FIGURE, not hardcoded: a fixed dpi=100 here is what
-    used to make these plots microscopic."""
     from PIL import Image
     buf = BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=fig.dpi)
@@ -1285,47 +1047,10 @@ def _title(condition, kind, label, step, prefix, guidance, score):
 
 def plot_f0_comparison(target, generated, kind="valid", label="",
                        step=None, prefix=None, guidance=None, corr=None,
-                       fps: float = DAC_FRAMES_PER_S,
+                       fps: Optional[float] = None,
                        pad_octaves: float = 1.0,
                        corr_name: str = "corr") -> torch.Tensor:
-    """
-    "<target> vs f0_gen": the conditioning contour and the contour re-extracted
-    from the generation it conditioned, OVERLAID on one log-Hz axis, with a thin
-    voicing ribbon underneath.
-
-    `kind` names the target in the title and in the legend: "probe" -> f0_probe
-    (an elementary synthetic melody), "test" -> f0_test (a real recording of
-    the test split, the training's listening panels), "valid" -> f0_valid (a
-    real validation recording). `label` says WHICH one ('scale up',
-    'sample #12').
-    `corr` is the sample's score and `corr_name` the metric it is, printed as
-    `<corr_name>=<corr>` in the title: "corr" with the project's own metrics,
-    a mir_eval name (overall_accuracy) with metrics.influence_family set to
-    mir_influence_metrics.
-
-    Design notes:
-      * OVERLAID, not side by side: the quantity of interest is the DIFFERENCE
-        between the two curves, and on shared axes that difference is a vertical
-        distance you read directly instead of estimating across a gap.
-      * y is Hz on a LOG scale. Pitch is perceived logarithmically, so on a
-        linear axis the same musical interval looks bigger up high than down low.
-      * the y window comes from the TARGET only, padded by `pad_octaves` on each
-        side and clamped to the extractor's [fmin, fmax]. From the target only
-        because the target never changes: the window is therefore identical at
-        every step and the plots read as a time series, which an autoscaled axis
-        would destroy by silently rescaling as the model improves.
-      * unvoiced frames are BREAKS in the line (NaN), never a drop to 0 Hz. A
-        line diving to the floor would draw a pitch glide that was never
-        predicted; a gap says "nothing here", which is what 0 means.
-      * voicing lives in its own RIBBON under the plot, NOT as shading across it.
-        Shading every frame where the two disagree used to flood the whole figure
-        when the generation was mostly unvoiced -- which is exactly what an
-        untrained model produces, so the plot went unreadable precisely when it
-        had the most to say.
-      * the voiced-frame counts are printed on the figure. "The orange curve is
-        missing" and "the orange curve is off-scale" are different failures and
-        must not look the same.
-    """
+    fps = _lc.active_fps(fps)
     kw = CONDITION_CONFIG.get("frame_level", {}).get("f0", {}).get("kwargs", {})
     fmin = float(kw.get("fmin", 50.0))
     fmax = float(kw.get("fmax", 1000.0))
@@ -1343,7 +1068,6 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
     t_plot = np.where(tv, t_hz, np.nan)
     g_plot = np.where(gv, g_hz, np.nan)
 
-    # Main axis + voicing ribbon, sharing the time axis.
     fig = plt.figure(figsize=(7.2, 3.9), dpi=120)
     gs = fig.add_gridspec(2, 1, height_ratios=[7, 1], hspace=0.12)
     ax = fig.add_subplot(gs[0])
@@ -1354,12 +1078,11 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
     ax.plot(time, g_plot, color=C_GEN, lw=2.0, alpha=0.95,
             label="f0_gen  (re-extracted from the generation)")
 
-    # ---- y window: from the target, so it never moves between steps ----
     if tv.any():
         lo = max(fmin, float(t_hz[tv].min()) / (2.0 ** pad_octaves))
         hi = min(fmax, float(t_hz[tv].max()) * (2.0 ** pad_octaves))
     else:
-        lo, hi = fmin, fmax          # nothing voiced in the target: show it all
+        lo, hi = fmin, fmax
     if not (hi > lo):
         lo, hi = fmin, fmax
 
@@ -1374,7 +1097,6 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
 
-    # ---- title: what is being compared, then the run coordinates ----
     head = f"{tgt_name}  vs  f0_gen"
     if label:
         head += f"   —   {label}"
@@ -1393,7 +1115,6 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
         ax.text(0.5, 1.012, "   ·   ".join(sub), transform=ax.transAxes,
                 ha="center", va="bottom", fontsize=11, color="#555555")
 
-    # ---- voiced coverage + off-scale count, spelled out ----
     n_tv, n_gv = int(tv.sum()), int(gv.sum())
     off = int((gv & ((g_hz < lo) | (g_hz > hi))).sum())
     info = (f"{tgt_name}: {n_tv}/{n} voiced      "
@@ -1406,7 +1127,6 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
             bbox=dict(boxstyle="round,pad=0.28", fc="white", ec="none",
                       alpha=0.80))
 
-    # ---- voicing ribbon: two rows, no flooding of the main plot ----
     axv.fill_between(time, 0.55, 1.45, where=tv, step="mid",
                      color=C_TGT, lw=0, alpha=0.85)
     axv.fill_between(time, -0.45, 0.45, where=gv, step="mid",
@@ -1422,9 +1142,6 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
         axv.spines[s].set_visible(False)
     axv.set_ylabel("voiced", fontsize=10, color="#777777", labelpad=8)
 
-    # Legend UNDER the figure: in any corner of the axes it would sooner or
-    # later sit on top of the curves, and the y window is fixed by the target,
-    # so there is no corner guaranteed to stay empty.
     fig.legend(*ax.get_legend_handles_labels(), loc="lower center", ncol=2,
                frameon=False, fontsize=11.5, bbox_to_anchor=(0.5, -0.16))
 
@@ -1433,36 +1150,71 @@ def plot_f0_comparison(target, generated, kind="valid", label="",
     return img
 
 
+def plot_midi_comparison(target, generated, kind="valid", label="", step=None,
+                         prefix=None, guidance=None, score=None,
+                         fps: Optional[float] = None, dpi: int = 130,
+                         score_name: str = None) -> torch.Tensor:
+    fps = _lc.active_fps(fps)
+    from matplotlib.colors import ListedColormap
+    from conditions import MIDI_N_KEYS, MIDI_LOWEST_KEY, MIDI_DRUM_CLASSES
+    n, d0 = MIDI_N_KEYS, 2 * MIDI_N_KEYS
+    nd = len(MIDI_DRUM_CLASSES)
+    tgt = np.asarray(target, dtype=np.float32)
+    gen = np.asarray(generated, dtype=np.float32)
+    m = min(len(tgt), len(gen))
+    tgt, gen = tgt[:m], gen[:m]
+
+    used = np.flatnonzero((tgt[:, :n] > 0.5).any(0) | (gen[:, :n] > 0.5).any(0))
+    lo = max(0, int(used.min()) - 3) if used.size else 39 - 12
+    hi = min(n, int(used.max()) + 4) if used.size else 39 + 12
+
+    cmap = ListedColormap(["#ffffff", "#9ecae1", "#08306b", "#d62728"])
+    t_end = m / float(fps)
+    ticks = [k for k in range(lo, hi) if (k + MIDI_LOWEST_KEY) % 12 == 0]
+    names = ["C%d" % ((k + MIDI_LOWEST_KEY) // 12 - 1) for k in ticks]
+    fig, axes = plt.subplots(
+        4, 1, figsize=(10, 8.0), dpi=dpi, sharex=True,
+        gridspec_kw={"height_ratios": [4, 1.3, 4, 1.3], "hspace": 0.08})
+    for (ax_k, ax_d), r, what in (((axes[0], axes[1]), tgt, "target (MIDI)"),
+                                  ((axes[2], axes[3]), gen,
+                                   "generated (YourMT3+)")):
+        keys = np.where(r[:, n:d0] > 0.5, 2, np.where(r[:, :n] > 0.5, 1, 0))
+        ax_k.imshow(keys[:, lo:hi].T, aspect="auto", origin="lower",
+                    cmap=cmap, vmin=0, vmax=3, interpolation="nearest",
+                    extent=[0, t_end, lo - 0.5, hi - 0.5])
+        ax_k.set_yticks(ticks)
+        ax_k.set_yticklabels(names, fontsize=7)
+        ax_k.set_ylabel(what, fontsize=9)
+        drums = np.where(r[:, d0:] > 0.5, 3, 0)
+        ax_d.imshow(drums.T, aspect="auto", origin="lower", cmap=cmap,
+                    vmin=0, vmax=3, interpolation="nearest",
+                    extent=[0, t_end, -0.5, nd - 0.5])
+        ax_d.set_yticks(range(nd))
+        ax_d.set_yticklabels([c for c, _ in MIDI_DRUM_CLASSES], fontsize=6)
+        ax_d.set_facecolor("#f4f4f4")
+    axes[3].set_xlabel("time (s)")
+    head = _title("midi", kind, label, step, prefix, guidance, score)
+    if score_name:
+        head = head.replace("score=", f"{score_name}=")
+    axes[0].set_title(head, fontsize=10)
+    fig.subplots_adjust(left=0.12, right=0.98, top=0.93, bottom=0.07)
+    img = _fig_to_tensor(fig)
+    plt.close(fig)
+    return img
+
+
 def plot_condition_comparison(condition, target, generated, kind="valid",
                               label="", step=None, prefix=None, guidance=None,
-                              score=None, fps: float = DAC_FRAMES_PER_S,
+                              score=None, fps: Optional[float] = None,
                               dpi: int = 130,
                               score_name: str = None) -> torch.Tensor:
-    """
-    Target vs re-extracted condition, as one image, in the form that suits the
-    condition's shape:
-
-      energy (T,1)  -> two curves on one axis. The question is whether the
-                       generated envelope follows the target's SHAPE, so both
-                       are drawn on the same axis and the eye compares them
-                       directly.
-      rhythm (T,2)  -> two stacked axes, beat and downbeat probability, each
-                       with target and generated overlaid: a model can follow
-                       the beat and miss the bar, and one axis would hide it.
-      chroma (T,12) -> two stacked heatmaps, target above generated, sharing the
-                       colour scale. Twelve overlaid curves are unreadable; the
-                       question here is whether the same pitch classes light up
-                       at the same times, which is a picture, not a plot. chord
-                       (T,12) takes the same branch.
-    """
+    fps = _lc.active_fps(fps)
+    if condition == "midi":
+        return plot_midi_comparison(target, generated, kind=kind, label=label,
+                                    step=step, prefix=prefix,
+                                    guidance=guidance, score=score, fps=fps,
+                                    dpi=dpi, score_name=score_name)
     if condition == "f0":
-        # f0 has its own rendering and keeps it: a log-Hz axis (pitch is
-        # perceived logarithmically), unvoiced frames as BREAKS rather than a
-        # dive to 0 Hz, and voicing in a ribbon under the plot instead of
-        # shading that floods the figure when the generation is mostly
-        # unvoiced. None of that generalizes to a curve or a heatmap.
-        # `score_name` names the score in its title: the f0 metric depends on
-        # metrics.influence_family (the other titles say `score=` as before).
         return plot_f0_comparison(target, generated, kind=kind, label=label,
                                   step=step, prefix=prefix, guidance=guidance,
                                   corr=score, fps=fps,
@@ -1527,9 +1279,6 @@ def plot_condition_comparison(condition, target, generated, kind="valid",
     return img
 
 
-# ============================================================
-# CLI
-# ============================================================
 def main():
     import argparse
     from conditions import ConditionRegistry
@@ -1545,9 +1294,15 @@ def main():
                          "is one embedding and does not depend on the geometry.")
     ap.add_argument("--n_probes", type=int, default=16)
     ap.add_argument("--duration_s", type=float, default=5.0)
+    ap.add_argument("--codec", choices=list(_lc.CODEC_NAMES),
+                    default=_lc.DEFAULT_CODEC,
+                    help="the dataset's codec (its dataset_meta.json): the "
+                         "synthesis sample rate and the extractors' frame "
+                         "grid follow it, as in the training")
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
+    _lc.activate(args.codec)
 
     global_probe = is_global_probe(args.condition)
     if not global_probe and args.n_frames is None:

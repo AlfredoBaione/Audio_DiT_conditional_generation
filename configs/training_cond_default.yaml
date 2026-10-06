@@ -1,0 +1,90 @@
+# Training of the conditioned DiT (training_cond.py). Every key can be
+# overridden on the command line, e.g. training.lr=2e-4.
+
+model:
+  kind: 'S'                  # S | B | G | L | XL
+  duration_s: 5.0
+  drop: 0.0                  # FFN dropout, 0 = off
+  frame_reinject_every: 1    # 0 = frame conditions at the input only; N = re-injected every N blocks
+  text_cross_every: 0        # 0 = off; N = text cross-attention every N blocks
+  attention: standard        # standard | differential (DIFF Transformer)
+
+data:
+  train_batch_size: 8
+  val_batch_size: 16
+  grad_accum: 1
+  num_val_batches: 89
+  validation_shuffle: true
+  validation_seed: 12345
+  num_workers: 4             # 0 on Windows
+
+training:
+  num_steps: 1000001
+  lr: 1.0e-4
+  seed: 42
+  strict_conditions: true    # false = missing conditions zero-filled (debug only)
+  weight_decay: 0.0
+  grad_clip:    0.0          # 0 = off
+  use_amp:      false
+  t_sampler: logit_normal    # logit_normal | truncated_logit (truncated logit-normal shifted towards the noise, as Stable Audio 3)
+  warmup_steps: 5000
+  decay_start_frac: 0.8
+  use_ema:    true
+  ema_decay:  0.9999
+  ema_start:  5000
+
+intervals:
+  val:     1000
+  audio:   25000
+  metrics: 50000
+  ckpt:    50000
+  keep_last_n_ckpts: 5
+
+sampling:
+  euler_steps: 100
+  t_min: 0.001
+  t_max: 0.999
+  t_schedule: uniform        # uniform | logsnr_uniform (steps equally spaced in log-SNR, crowded at the noise, as Stable Audio 3 with euler_steps: 50)
+  n_audio_samples: 4
+  n_test_panels: 8
+  n_probe_panels: 8
+  n_metrics_samples: 512
+  validation_text_from_caption: true
+  influence_subsets: []      # [] = off | ["all", "loo"] | ["all", "loo", "singletons"] | [["f0"], ["f0", "energy"]]
+  metrics_uncond: false      # true = also FD / KL / FAD of the generations without conditions
+  metrics_samples_per_forward: 1   # 0 = serial sampler; N = N samples per forward
+  n_fad_samples: 512
+
+metrics:
+  enabled: ["fd_dac", "kl_dac", "fad_vggish"]
+  seed: 0
+  fidelity_device: "cuda"    # cuda | cpu
+  influence_family: "influence_metrics"   # influence_metrics (ours) | mir_influence_metrics (mir_eval)
+  mir_threshold: 0.5
+  dac_device: "cpu"          # cpu | cuda
+  fad_device: "cuda"
+  fad_reference: "wav"       # wav (real test/val audio) | decoded (real latents through the codec)
+
+conditioning:
+  p_drop_all:    0.10
+  p_drop_frame:  0.05
+  p_drop_global: 0.05
+  p_drop_each_frame: 0.0     # > 0 = each frame condition also dropped on its own (partial subsets)
+  guidance_scale: 3.0
+  text_source: caption       # audio (chunk's CLAP audio vector) | caption (CLAP text of its caption) | mix
+  text_mix_p: 0.5            # mix only: probability of the caption
+  enabled_frame:  ["f0"]     # f0, chroma, rhythm, energy, chord, midi
+  enabled_global: []         # text, image
+
+paths:
+  dataset_root:   "./dataset_ready_cond/latents"
+  wav_root:       "./dataset_ready_cond/wav"
+  condition_root: "./dataset_ready_cond/conditions"
+  splits_path:    null       # null = <dataset>/splits.json
+  image_root:     "./Museart_2_reduced/Images"
+  runs_dir:       "./runs"
+  cache_dir:      "./cache"
+  f0_probe_dir:   null
+  run_name:       null
+  resume_from:    null
+  init_from:      null       # warm start from these weights (new layers only); not with resume_from

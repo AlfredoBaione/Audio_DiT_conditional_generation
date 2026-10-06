@@ -1,23 +1,7 @@
-# =============================================================================
-# Conditioned Audio DiT — Python dependencies
-#
-# Versions are intentionally left unpinned: PyTorch must match the CUDA
-# toolkit available on each machine (IRCAM servers differ), and the rest floats
-# with it. After you have a working environment, run `pip freeze > requirements.lock.txt`
-# to pin an exact, reproducible set for that specific server.
-#
-# Install order:
-#   1) PyTorch stack matching your CUDA (see README — do NOT rely on the plain
-#      `pip install torch` line below on GPU servers).
-#   2) pip install -r requirements.txt
-#
-# This installs the FULL conditioning stack (every extractor), not just the
-# conditions currently enabled in the config: the extractors are imported
-# lazily, so having them installed costs nothing at runtime and means switching
-# `conditioning.enabled_frame` never requires touching the environment.
-# =============================================================================
+# Install PyTorch matching the server's CUDA first, e.g.
+#   pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu121
+# then: pip install -r requirements.txt
 
-# ---- core numerics / audio I/O ----
 numpy
 scipy
 soundfile
@@ -25,48 +9,22 @@ librosa
 tqdm
 matplotlib
 omegaconf
-tensorboard         # torch.utils.tensorboard SummaryWriter (training/test logging)
+tensorboard
 
-# ---- PyTorch stack ----
-# On a GPU server install these matching your CUDA FIRST, e.g.:
-#   pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu121
-# The bare names below are a CPU/fallback default only.
 torch
 torchaudio
 torchvision
 
-# ---- DAC codec (imported in code as `dac`) ----
 descript-audio-codec
+torchcrepe
+beat_this @ git+https://github.com/CPJKU/beat_this.git
+mido
+lightning
+deprecated
+transformers==4.45.1   # pinned: YourMT3+ (midi) breaks with 4.46+
+Pillow
+mir_eval
+resampy
+wav2clip
 
-# ---- conditioning extractors (frame-level) ----
-torchcrepe           # f0     — monophonic pitch contour (CREPE)
-                     #     python -c "import dac; print('dac ok')"
-beat_this @ git+https://github.com/CPJKU/beat_this.git   # rhythm — beat/downbeat (not on PyPI)
-
-# ---- conditioning encoders (global) ----
-transformers         # CLAP (text) + CLIP (image) global conditions
-Pillow               # image loading for the CLIP image condition
-
-# ---- evaluation metrics ----
-mir_eval             # metrics.influence_family: mir_influence_metrics (condition_metrics.py)
-# VGGish is loaded via torch.hub (harritaylor/torchvggish) — no pip package,
-# but its hubconf.py declares dependencies ['torch','numpy','resampy',
-# 'soundfile'] and torch.hub REFUSES to load the repo if one is missing:
-# without resampy, enabling metrics.enabled=[... 'fad_vggish'] dies at startup.
-resampy              # required by torchvggish/vggish_input.py (FAD-VGGish)
-
-# Wav2CLIP: audio distilled INTO CLIP's embedding space. It is what makes the
-# IMAGE condition's column of the Condition_influence table a number at all --
-# a CLIP image vector and a CLAP audio vector live in unrelated spaces, so
-# without it that column reads n/a ("no audio->CLIP embedder" in the log). Only
-# needed when 'image' is an active global condition; nothing else in the
-# pipeline imports it.
-wav2clip             # image influence — audio in CLIP space (conditions.py)
-
-# =============================================================================
-# NOT installable via this file (environment-specific):
-#   * manage_gpus  — IRCAM-internal GPU-lock package, used ONLY by the two
-#                    launchers, launch_training_cond.py and launch_test_cond.py,
-#                    on IRCAM servers. Run training_cond.py / test_cond.py
-#                    directly elsewhere.
-# =============================================================================
+# not on pip: manage_gpus (IRCAM), used only by the two launchers

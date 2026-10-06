@@ -1,27 +1,4 @@
-# audio_dataset_npy.py
-#
-# Dataset for DAC latents pre-computed in .npy (unconditional training).
-# No patching — every frame DAC is a token for the transformer.
-#
-# Auto-detection of the file .npy length:
-#   -  30s → 2584 frame → 6 chunk of 5s
-#   -  5s  → 431 frame  → 1 chunk of 5s
-#   -  10s → 862 frame  → 2 chunk of 5s
-#   - ecc.
-#
-# SPLIT-LESS layout (produced by preprocess_stream.py): the dataset mirrors the
-# source class tree and has NO train/val/test directories on disk. The split is
-# DECIDED AT PREPROCESSING TIME and read back here from <dataset_root>/../
-# splits.json (load_source_split below): assigned over the source files
-# (leakage-safe), stratified by class, seeded, and never reshuffled once written.
-#
-# compute_split() below is the OLD in-code split. It is kept for exactly one
-# purpose: preprocess_stream.py --import_legacy_split calls it to reproduce the
-# assignment a pre-existing dataset was trained against and freeze it into
-# splits.json. Nothing on the training path computes a split any more.
-#
-#   dataset_root/
-#       latents/<class...>/*.npy   ← shape (72, T), dtype float32
+# Latent dataset and normalizer.
 
 import json
 import random
@@ -33,43 +10,20 @@ from collections import defaultdict
 from torch.utils.data import Dataset
 from typing import Optional, Tuple, List, Dict
 
+import latent_codec as lc
 
-# ============================================================
-# CONSTANTS
-# ============================================================
+
 DAC_SAMPLE_RATE  = 44100
-DAC_LATENT_DIM   = 72      # 9 codebook * 8 = latents DAC PRE-quantizzazione (continui).
-                           # Lo z del decoder e' 1024-d: ci si torna con
-                           # quantizer.from_latents() dentro decode_latents().
+DAC_LATENT_DIM   = 72
 DAC_HOP_LENGTH   = 512
-DAC_FRAMES_PER_S = DAC_SAMPLE_RATE / DAC_HOP_LENGTH   # ~86.13
+DAC_FRAMES_PER_S = DAC_SAMPLE_RATE / DAC_HOP_LENGTH
 
-# Upper bound for RoPE precomputation in the network.
-# It does not limit the real length of the files — it pre-allocates
-# positional frequencies in the transformer.
 MAX_FRAMES = 4096
 
 SUPPORTED_EXTS   = {".npy"}
 
 
 def frames_per_chunk(latent_root, duration_s: float) -> int:
-    """
-    The latent length (frames per chunk) to use for sub-chunking.
-
-    Prefers the REAL DAC frame count recorded by preprocess_stream.py in
-    dataset_meta.json (`latent_frames_per_chunk`, e.g. 431 for 5 s), so training
-    uses the exact geometry of the latents on disk instead of the truncating
-    estimate int(duration_s * DAC_FRAMES_PER_S) (which gives 430 and drops one
-    frame). Falls back to that estimate for legacy datasets without the field.
-
-    `duration_s` (model.duration_s) is CHECKED against the dataset's own chunk
-    length rather than ignored:
-      * equal            -> the recorded real T (the normal case);
-      * shorter          -> the estimate: training on sub-windows of each chunk;
-      * longer           -> hard error: the latents simply do not contain that
-                            much audio, and silently training on 5 s while the
-                            config says 10 s would be invisible in every log.
-    """
     meta_path = Path(latent_root).parent / "dataset_meta.json"
     meta = {}
     if meta_path.exists():
@@ -80,6 +34,7 @@ def frames_per_chunk(latent_root, duration_s: float) -> int:
 
     real_T = meta.get("latent_frames_per_chunk")
     chunk_s = meta.get("chunk_duration_s")
+    fps = lc.get_spec(lc.codec_from_meta(meta)).frames_per_s
 
     if chunk_s and duration_s > float(chunk_s) + 1e-6:
         raise RuntimeError(
@@ -92,13 +47,9 @@ def frames_per_chunk(latent_root, duration_s: float) -> int:
     if real_T:
         if chunk_s is None or abs(duration_s - float(chunk_s)) <= 1e-6:
             return int(real_T)
-        # duration_s < chunk_duration_s -> deliberate sub-window training
-        return int(duration_s * DAC_FRAMES_PER_S)
-    return int(duration_s * DAC_FRAMES_PER_S)
+        return int(duration_s * fps)
+    return int(duration_s * fps)
 
-# ============================================================
-# LAZY DAC LOADER
-# ============================================================
 _dac_model = None
 
 def get_dac_model(device: str = "cpu"):
@@ -115,31 +66,23 @@ def get_dac_model(device: str = "cpu"):
     return _dac_model
 
 
-# ============================================================
-# DECODING
-# ============================================================
 @torch.no_grad()
 def decode_latents(latents: torch.Tensor, device: str = "cpu") -> torch.Tensor:
-    # latents pre-quant di DAC (9*8 = 72 dim, continui) -> waveform.
-    # Il decoder DAC accetta SOLO lo z quantizzato a 1024-d, quindi proiettiamo e
-    # quantizziamo i 72-d in z con quantizer.from_latents() -- esattamente cio' che
-    # DAC fa internamente quando codifica audio vero.
-    # from_latents ritorna (z_q, z_p, codes); ci serve z_q (1024-d).
+    if lc.active().name != "dac_44khz":
+        model = lc.load_model(lc.active().name, device)
+        if latents.dim() == 2:
+            latents = latents.unsqueeze(0)
+        return lc.decode(model, latents.to(device)).squeeze(0)
     model = get_dac_model(device)
     if latents.dim() == 2:
-        latents = latents.unsqueeze(0)                      # (1, 72, T)
+        latents = latents.unsqueeze(0)
     latents = latents.to(device)
-    z_q, _, _ = model.quantizer.from_latents(latents)       # (1, 1024, T)
+    z_q, _, _ = model.quantizer.from_latents(latents)
     waveform = model.decode(z_q)
     return waveform.squeeze(0)
 
 
-# ============================================================
-# NORMALIZER
-# ============================================================
-
 class LatentNormalizer:
-
     def __init__(self):
         self.mean: Optional[torch.Tensor] = None
         self.std:  Optional[torch.Tensor] = None
@@ -151,24 +94,12 @@ class LatentNormalizer:
         device: Optional[str] = None,
         batch_accum: int = 50,
         io_workers: int = 16,
+        latent_dim: Optional[int] = None,
     ):
-        """
-        Compute mean and std per-channel with parallel Welford batched.
-
-          - Single-pass (not two: it uses Welford online)
-          - Accelerated GPU (float64 for stability)
-          - Batch accumulation before updating the stats
-          - PARALLEL READS: the chunks of each batch are loaded by a thread pool.
-            The fit is I/O-bound, not compute-bound -- the Welford update itself
-            is microseconds on 72 channels, while each np.load is a network round
-            trip. Reading them one at a time makes a multi-million-chunk corpus
-            take hours; `io_workers` threads cut that by roughly that factor
-            (np.load releases the GIL during I/O). The arithmetic is UNCHANGED:
-            the pool returns the block in input order, so the accumulated batches
-            are exactly the ones the serial version would have built.
-        """
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
+        if latent_dim is None:
+            latent_dim = lc.active().latent_dim
 
         n_chunks = len(chunks)
         print(f"[Normalizer] Welford batched on {n_chunks:,} chunk "
@@ -179,34 +110,26 @@ class LatentNormalizer:
         from concurrent.futures import ThreadPoolExecutor
 
         def _read(item):
-            """Read ONE chunk slice, or return a reason string if it is unusable.
-
-            Validation happens HERE, before the values reach the statistics: a
-            single latent containing NaN/Inf turns mean and std into NaN, and
-            every subsequent normalize() silently produces NaN for the whole
-            training. The per-sample checks in the dataset run only later, at
-            __getitem__ time, which is far too late to protect the normalizer.
-            """
             path, start = item
             try:
                 z = np.load(str(path), mmap_mode="r")[:, start:start + n_frames]
                 z = np.ascontiguousarray(z, dtype=np.float32)
             except Exception:
                 return "unreadable"
-            if z.ndim != 2 or z.shape[0] != DAC_LATENT_DIM:
+            if z.ndim != 2 or z.shape[0] != latent_dim:
                 return "bad_shape"
             if z.shape[1] != n_frames:
-                return "short"          # short/odd chunk -> skipped, as before
+                return "short"
             if not np.isfinite(z).all():
                 return "non_finite"
             return z
 
-        mean_acc = None   # (dim, 1) float64
-        m2_acc   = None   # (dim, 1) float64
-        n_total  = 0      # frames accumulated
-        n_used   = 0      # chunks that actually contributed
-        rejected = {}     # reason -> count
-        rejected_paths = []   # first few offenders, to make them fixable
+        mean_acc = None
+        m2_acc   = None
+        n_total  = 0
+        n_used   = 0
+        rejected = {}
+        rejected_paths = []
 
         with ThreadPoolExecutor(max_workers=max(1, io_workers)) as ex:
             with tqdm(total=n_chunks, desc="Normalizer fit", unit="chunk") as pbar:
@@ -225,7 +148,6 @@ class LatentNormalizer:
                         continue
                     n_used += len(arrs)
 
-                    # Concatenate on time: (dim, sum_of_frames)
                     batch = torch.from_numpy(np.concatenate(arrs, axis=1)).to(
                         device=device, dtype=torch.float64)
                     n_new = batch.shape[1]
@@ -235,7 +157,6 @@ class LatentNormalizer:
                         mean_acc = torch.zeros(dim, 1, dtype=torch.float64, device=device)
                         m2_acc   = torch.zeros(dim, 1, dtype=torch.float64, device=device)
 
-                    # Welford parallel (Chan et al., 1979)
                     n_total_new = n_total + n_new
                     batch_mean  = batch.mean(dim=1, keepdim=True)
                     delta       = batch_mean - mean_acc
@@ -256,8 +177,6 @@ class LatentNormalizer:
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        # A non-finite normalizer would silently turn EVERY normalized batch into
-        # NaN, so refuse it here rather than train on it.
         if not (torch.isfinite(self.mean).all() and torch.isfinite(self.std).all()):
             raise RuntimeError(
                 "Normalizer produced non-finite mean/std. The latents feeding it "
@@ -268,10 +187,6 @@ class LatentNormalizer:
         if rejected:
             print(f"[Normalizer] rejected chunks: {rejected} "
                   f"-- these did NOT contribute to mean/std")
-            # Print the paths, not just the counts: the same files are still in
-            # the split, and the dataset will hard-fail on them at __getitem__
-            # during training. Knowing WHICH ones lets you fix or remove them now
-            # instead of discovering it mid-run.
             for p in rejected_paths:
                 print(f"             {p}")
             if sum(rejected.values()) > len(rejected_paths):
@@ -291,12 +206,6 @@ class LatentNormalizer:
         return z * self.std.to(z.device) + self.mean.to(z.device)
 
     def save(self, path: str):
-        # Publish ATOMICALLY: torch.save writes in place, so an interruption
-        # (SIGTERM, node crash, full disk) leaves a TRUNCATED normalizer.pt on
-        # disk. The next run sees the file exists, tries to load it, and fails --
-        # every time, until someone deletes it by hand. Writing to a temp file in
-        # the same directory and then os.replace() means the destination either
-        # holds the previous content or the complete new one, never a fragment.
         import os as _os
         path = str(path)
         tmp = f"{path}.tmp"
@@ -311,11 +220,6 @@ class LatentNormalizer:
                 f"{path} is not a valid normalizer file (missing mean/std). "
                 f"Delete it and let the training recompute it.")
         mean, std = ckpt["mean"], ckpt["std"]
-        # Validate the CONTENT, not just the fingerprint of the dataset it came
-        # from. A cache written by a version without the NaN check (or by a run
-        # that saw a corrupt latent) can hold NaN mean/std: loading it silently
-        # turns every normalized batch into NaN, and the training would look like
-        # it is running while learning nothing. Refuse it instead.
         if mean.shape != std.shape:
             raise RuntimeError(
                 f"{path}: mean{tuple(mean.shape)} and std{tuple(std.shape)} "
@@ -334,24 +238,13 @@ class LatentNormalizer:
         print(f"[Normalizer] loaded from {path}")
 
 
-# ============================================================
-# SPLIT (stratified by class, grouped by source, deterministic,
-# persisted test) -- shared with audio_dataset_cond.py
-# ============================================================
 def _class_of_file(npy_path: Path) -> str:
-    """Class label = the leaf directory containing the latent (matches the class
-    folders of the raw dataset and the leaf key used for global conditions)."""
     return npy_path.parent.name
 
 
 def _source_group_of(npy_path: Path, latent_root: Path) -> str:
-    """
-    Leakage-safe source id: the file's directory (relative to latents/) plus the
-    source stem, with the channel/chunk suffix stripped. All chunks and BOTH
-    stereo channels of one source share this key, so they never split apart.
-    """
     rel_parent = npy_path.parent.relative_to(latent_root)
-    stem = npy_path.stem.split("__")[0]          # before __ch{n}/__c{idx}
+    stem = npy_path.stem.split("__")[0]
     return (rel_parent / stem).as_posix()
 
 
@@ -361,17 +254,11 @@ def _split_hash(params: dict) -> str:
 
 
 def _seed_for(seed: int, key: str) -> int:
-    """Deterministic per-class RNG seed (independent of PYTHONHASHSEED)."""
     h = hashlib.sha1(f"{seed}:{key}".encode("utf-8")).hexdigest()
     return int(h, 16) % (2 ** 32)
 
 
 def _allocate_three(n: int, ratios: Tuple[float, float, float]) -> Tuple[int, int, int]:
-    """
-    Split n groups into (train, val, test) by ratios, with small-class guards:
-    guarantee >=1 in test (then val) when the ratio is > 0 and there are enough
-    groups; n==1 -> all train (cannot hold out).
-    """
     r_tr, r_val, r_te = ratios
     if n <= 0:
         return (0, 0, 0)
@@ -384,7 +271,7 @@ def _allocate_three(n: int, ratios: Tuple[float, float, float]) -> Tuple[int, in
     if r_val > 0 and n_val == 0 and (n - n_te) >= 2:
         n_val = 1
     n_tr = n - n_te - n_val
-    if n_tr < 0:                                  # tiny class over-allocated
+    if n_tr < 0:
         over = -n_tr
         take = min(over, n_val); n_val -= take; over -= take
         if over > 0:
@@ -394,7 +281,6 @@ def _allocate_three(n: int, ratios: Tuple[float, float, float]) -> Tuple[int, in
 
 
 def _split_two(remaining: List[str], r_tr: float, r_val: float) -> Tuple[List[str], List[str]]:
-    """Split the non-test groups into (train, val), renormalizing tr:val."""
     n = len(remaining)
     if n == 0:
         return [], []
@@ -410,23 +296,6 @@ SPLITS_NAME = "splits.json"
 
 
 def load_source_split(latent_root, splits_path=None) -> dict:
-    """Read the split DECIDED AT PREPROCESSING TIME (<dataset>/splits.json).
-
-    The split is no longer recomputed here. preprocess_stream.py assigns it over
-    the SOURCE FILES before anything is encoded and writes it down, so it is a
-    property of the dataset rather than of whoever happens to load it: two runs
-    over the same latents cannot disagree about what the test set was, and the
-    file survives the dataset growing (new sources are added to the recorded
-    split, never reshuffled into it).
-
-    Same return shape as compute_split(), so nothing downstream had to change.
-
-    A latent whose source has no recorded assignment is a HARD ERROR: silently
-    dropping it would shrink the training set invisibly, and silently sending it
-    to train would put a held-out source back into training. It means splits.json
-    is older than the latents -- re-run preprocess_stream.py (even --split_only)
-    to assign the new sources.
-    """
     latent_root = Path(latent_root)
     p = Path(splits_path) if splits_path else latent_root.parent / SPLITS_NAME
     if not p.exists():
@@ -488,22 +357,11 @@ def compute_split(
     save_test_manifest: bool = True,
     manifest_dir: Optional[str] = None,
 ) -> dict:
-    """
-    Returns:
-        {
-          "splits":  {"train": [Path...], "val": [Path...], "test": [Path...]},
-          "classes": [sorted class names],
-          "file_counts": {"train": n, "val": n, "test": n},
-          "manifest_path": str or None,
-          "params": {...},
-        }
-    """
     latent_root = Path(latent_root)
     all_files = sorted(latent_root.rglob("*.npy"))
     if not all_files:
         raise FileNotFoundError(f"No .npy latents under {latent_root}")
 
-    # group files (leakage-safe unit)
     groups: Dict[str, dict] = {}
     for f in all_files:
         gk = _source_group_of(f, latent_root) if group_by_source else f.as_posix()
@@ -512,7 +370,6 @@ def compute_split(
 
     classes = sorted({g["class"] for g in groups.values()})
 
-    # stratification buckets: per-class, or one global bucket
     buckets: Dict[str, List[str]] = defaultdict(list)
     for gk, g in groups.items():
         buckets[g["class"] if stratify_by_class else "__all__"].append(gk)
@@ -527,7 +384,6 @@ def compute_split(
     manifest_dir = Path(manifest_dir)
     manifest_path = manifest_dir / f"test_split_{_split_hash(params)}.json"
 
-    # honor a persisted test set if present
     fixed_test = None
     if manifest_path.exists():
         try:
@@ -557,7 +413,6 @@ def compute_split(
         val_g += cls_val
         test_g += cls_test
 
-    # persist the test set (once) so it is stable across dataset growth / re-runs
     if fixed_test is None and save_test_manifest:
         manifest_dir.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(json.dumps(
@@ -572,10 +427,6 @@ def compute_split(
 
     splits = {"train": _files(train_g), "val": _files(val_g), "test": _files(test_g)}
 
-    # Report #3: a class with a single source group goes entirely to train
-    # (leakage-safe), so on tiny/imbalanced datasets val or test can end up empty
-    # even though their ratio is > 0 -> a later val_dataset[0] would IndexError.
-    # Fail early and clearly, but allow an intentionally-zero ratio.
     for _name, _r in (("val", r_val), ("test", r_te)):
         if _r > 0 and len(splits[_name]) == 0:
             raise RuntimeError(
@@ -593,19 +444,10 @@ def compute_split(
     }
 
 
-# Cap on how many chunks the normalizer fit reads. None = use EVERY chunk of the
-# train split (the default): the statistics then describe the actual training
-# distribution, with no sampling decision baked into them. Set an integer only if
-# you deliberately want a bounded, faster fit on a very large corpus.
 NORMALIZER_MAX_CHUNKS = None
 
 
 def _meta_latent_frames(latent_root) -> Optional[int]:
-    """`latent_frames_per_chunk` from dataset_meta.json, or None if unavailable.
-
-    preprocess_stream.py writes fixed-length chunks, so this single number
-    describes EVERY .npy in the dataset -- which is what lets _chunks_from_files
-    skip opening them one by one."""
     p = Path(latent_root).parent / "dataset_meta.json"
     if not p.exists():
         return None
@@ -620,33 +462,12 @@ def _chunks_from_files(files: List[Path], n_frames: int,
                        uniform_frames: Optional[int] = None,
                        max_chunks: Optional[int] = None,
                        seed: int = 0) -> List[Tuple[Path, int]]:
-    """Build (path, start) sub-chunks for the normalizer, from a file list.
-
-    `uniform_frames` (from dataset_meta.json) is the length EVERY latent has.
-    When it is available the chunk list is computed ARITHMETICALLY instead of
-    opening each .npy to read its shape: that scan is O(n_files) network round
-    trips with the GPU idle -- ~3 hours for a 5.8M-file split on NFS, which is
-    how a job gets killed before the fit even starts. The assumption is verified
-    on a spread sample of files; if any of them disagrees, the exact per-file
-    scan is used instead.
-
-    The sampled check is a fast path, not a proof: a lone odd-length file can
-    slip past it. That is safe because fit_from_chunks re-reads each chunk and
-    SKIPS any slice whose width != n_frames, so a stale (path, start) pair is
-    dropped at read time rather than corrupting the statistics. The probe exists
-    to catch a systematically wrong meta, not every individual outlier.
-
-    `max_chunks` caps how many chunks are returned (deterministically, from
-    `seed`), so the fit stays bounded on huge corpora. Whole files are selected,
-    which also keeps reads sequential per file.
-    """
     n_files = len(files)
     if n_files == 0:
         return []
 
     per_file = 0
     if uniform_frames and uniform_frames >= n_frames:
-        # verify the uniform-length assumption on up to 64 spread files
         probe = sorted({int(round(i)) for i in
                         np.linspace(0, n_files - 1, min(64, n_files))})
         ok = True
@@ -667,25 +488,20 @@ def _chunks_from_files(files: List[Path], n_frames: int,
                   "(slower).")
 
     if per_file > 0:
-        # arithmetic path: no per-file open at all
         sel = files
         if max_chunks and n_files * per_file > max_chunks:
             keep = max(1, max_chunks // per_file)
             idx = random.Random(seed).sample(range(n_files), min(keep, n_files))
-            sel = [files[i] for i in sorted(idx)]   # sorted -> sequential reads
+            sel = [files[i] for i in sorted(idx)]
             print(f"[normalizer] fitting on {len(sel):,} of {n_files:,} files "
                   f"({min(len(sel) * per_file, max_chunks):,} chunks, "
                   f"seed={seed}): a per-channel mean/std does not need the full "
                   f"corpus.")
         out = [(f, k * n_frames) for f in sel for k in range(per_file)]
-        # Whole files are kept for read locality, so the count can overshoot when
-        # max_chunks < per_file (a file yields several chunks and at least one
-        # file is always kept). Truncate so the cap is a real cap.
         if max_chunks and len(out) > max_chunks:
             out = out[:max_chunks]
         return out
 
-    # exact path (legacy datasets, or non-uniform lengths): open every file
     chunks = []
     for f in files:
         try:
@@ -702,17 +518,7 @@ def _chunks_from_files(files: List[Path], n_frames: int,
     return chunks
 
 
-# ============================================================
-# DATASET
-# ============================================================
-
 class AudioLatentDataset(Dataset):
-    """
-    Dataset that loads chunks from a given list of .npy latent files (one split).
-    Self-detection of the file length (assumes uniform duration). No patching:
-    every DAC frame is a token. label_to_idx is GLOBAL (shared across splits).
-    """
-
     def __init__(
         self,
         files:        List[Path],
@@ -722,7 +528,7 @@ class AudioLatentDataset(Dataset):
         duration_s:   float = 5.0,
         normalizer:   Optional[LatentNormalizer] = None,
         device:       str   = "cpu",
-        preload:      bool  = False,   # default False to avoid OOM
+        preload:      bool  = False,
     ):
         self.files       = [Path(f) for f in files]
         self.split       = split
@@ -731,20 +537,18 @@ class AudioLatentDataset(Dataset):
         self.duration_s  = duration_s
         self.preload     = preload
 
-        # Number of frames per chunk
         self.n_frames = frames_per_chunk(latent_root, duration_s)
+        self.codec = lc.get_spec(lc.dataset_codec(latent_root)) if latent_root             else lc.active()
+        self.latent_dim = self.codec.latent_dim
 
-        # GLOBAL label mapping (identical across train/val/test)
         self.label_to_idx = dict(label_to_idx)
         self.idx_to_label = {i: c for c, i in self.label_to_idx.items()}
 
-        # Every sample: (npy_path, start_frame, label_idx)
         self.samples: List[Tuple[Path, int, int]] = []
-        self._actual_file_frames = None  # self-detected
+        self._actual_file_frames = None
 
         self._build_samples()
 
-        # Per-file dense cache, only if preload=True: {npy_path_str: tensor (72, T)}.
         self._cache: dict = {}
         if preload:
             self._preload_all()
@@ -752,25 +556,23 @@ class AudioLatentDataset(Dataset):
         chunks_per_file = self._actual_file_frames // self.n_frames if self._actual_file_frames else "?"
         print(f"[Dataset/{split}] duration_s={duration_s}s → "
               f"n_frames={self.n_frames} (= token sequence) | "
-              f"token_dim={DAC_LATENT_DIM} | "
+              f"token_dim={self.latent_dim} | "
               f"file_frames={self._actual_file_frames} | "
               f"chunks per file={chunks_per_file} | "
               f"tot samples={len(self.samples)} | "
               f"preload={'ON' if preload else 'OFF'}")
 
     def _detect_file_frames(self) -> int:
-        """Detect the frame count from the first readable .npy in the file list."""
         for f in self.files:
             if f.suffix.lower() in SUPPORTED_EXTS:
                 z = np.load(str(f), mmap_mode='r')
                 n_frames = z.shape[1]
                 print(f"[Dataset/{self.split}] Self-detected: {n_frames} frame per file "
-                      f"({n_frames / DAC_FRAMES_PER_S:.1f}s) from {f.name}")
+                      f"({n_frames / self.codec.frames_per_s:.1f}s) from {f.name}")
                 return n_frames
         raise FileNotFoundError(f"No .npy file in the {self.split} split file list")
 
     def _build_samples(self):
-        """Build (npy_path, start, label_idx) samples from the file list."""
         if not self.files:
             print(f"[Dataset/{self.split}] WARNING: no files for this split")
             self._actual_file_frames = 0
@@ -790,7 +592,7 @@ class AudioLatentDataset(Dataset):
                 continue
             label_idx = self.label_to_idx.get(_class_of_file(f))
             if label_idx is None:
-                continue   # class not in the global mapping (should not happen)
+                continue
             try:
                 file_frames = np.load(str(f), mmap_mode="r").shape[1]
             except Exception:
@@ -809,30 +611,17 @@ class AudioLatentDataset(Dataset):
         return torch.from_numpy(z)
 
     def _load_slice_mmap(self, npy_path: Path, start: int) -> torch.Tensor:
-        """Default low-RAM path: memory-map the .npy (float32 on disk), read ONLY
-        the requested chunk, then RELEASE the mmap so its file descriptor is
-        closed immediately. The OS page cache still caches the file content
-        (shared and reclaimable), so resident RAM stays low even when the dataset
-        does not fit in memory (e.g. museart), with NO loss of precision, while
-        open descriptors stay near zero. Caching the mmap instead (one live handle
-        per distinct file) leaks one fd per file and makes large one-chunk-per-file
-        datasets (e.g. birds/instrumental) hit 'Too many open files' (Errno 24)."""
-        arr = np.load(str(npy_path), mmap_mode="r")    # float32 on disk, lazy paging
+        arr = np.load(str(npy_path), mmap_mode="r")
         try:
-            # np.array(..., copy=True) materialises an INDEPENDENT contiguous copy
-            # of just the slice, so it stays valid after the mmap is closed.
             sl = np.array(arr[:, start : start + self.n_frames], dtype=np.float32)
         finally:
             mm = getattr(arr, "_mmap", None)
             if mm is not None:
-                mm.close()                             # release the fd deterministically
+                mm.close()
             del arr
         return torch.from_numpy(sl)
 
     def _preload_all(self):
-        """Optional DENSE preload, in FLOAT32, of every unique .npy into RAM.
-        Use only when the whole dataset comfortably fits in RAM (small datasets);
-        otherwise keep preload=False and rely on the mmap path above."""
         unique_paths = set(str(p) for p, _, _ in self.samples)
         print(f"[Dataset/{self.split}] Preloading {len(unique_paths)} files in RAM (float32)...")
         from tqdm import tqdm
@@ -864,16 +653,12 @@ class AudioLatentDataset(Dataset):
         if z.shape[0] != self.n_frames:
             raise RuntimeError(
                 f"Sample {npy_path.name} @ start={start}: "
-                f"expected shape ({self.n_frames}, {DAC_LATENT_DIM}), obtained {tuple(z.shape)}. "
+                f"expected shape ({self.n_frames}, {self.latent_dim}), obtained {tuple(z.shape)}. "
                 f"The file has less frames than expected."
             )
 
         return z, label_idx
 
-
-# ============================================================
-# BUILD DATASETS
-# ============================================================
 
 def build_datasets(
     latent_root:     str,
@@ -881,25 +666,12 @@ def build_datasets(
     device:          str   = "cpu",
     normalizer_path: Optional[str] = None,
     preload:         bool  = False,
-    # ---- split configuration (leakage-safe defaults) ----
     split_ratios:    Tuple[float, float, float] = (0.8, 0.1, 0.1),
     split_seed:      int = 42,
     group_by_source: bool = True,
     stratify_by_class: bool = True,
     save_test_manifest: bool = True,
 ):
-    """
-    Split-less UNCONDITIONAL dataset builder. Still computes the split in code:
-    it belongs to the unconditional project, which has no preprocess_stream.py
-    splits.json to read. The conditioned path (audio_dataset_cond) reads the
-    recorded split instead -- see load_source_split.
-    Computes the split (stratified, source-grouped, seeded, with a persisted
-    test manifest) and the normalizer.
-
-    NOTE: the return shape changed from the old 4-tuple to
-        (train, val, test, normalizer, label_to_idx, split_info)
-    to match build_conditioned_datasets. Update any uncond caller accordingly.
-    """
     latent_root = str(latent_root)
 
     split = compute_split(
@@ -952,9 +724,6 @@ def build_datasets(
     return train_dataset, val_dataset, test_dataset, normalizer, label_to_idx, split_info
 
 
-# ============================================================
-# QUICK TEST
-# ============================================================
 if __name__ == "__main__":
     import sys
 

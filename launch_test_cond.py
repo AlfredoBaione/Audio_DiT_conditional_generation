@@ -1,22 +1,15 @@
+# IRCAM launcher of test_cond.py: GPU locks (manage_gpus), --num-gpus N.
 """
 launch_test_cond.py
 
 GPU-lock wrapper for IRCAM servers, dedicated to the TEST of a conditioned
 checkpoint. The twin of launch_training_cond.py.
 
-Locks the GPU BEFORE importing torch, then runs test_cond.py forwarding
-all the remaining CLI arguments to it. The test runs on one device, so the
-launcher always locks ONE GPU (there is no --num-gpus).
-
-Note:
-    This launcher relies on the IRCAM-internal `manage_gpus` package and on
-    POSIX `fcntl`. It is therefore meant for the IRCAM Linux servers only.
-    On other systems (e.g. the Windows VM at CAIS LAB) launch the test
-    script directly:
-        python test_cond.py --ckpt <ckpt> [--config ...] [overrides]
+Locks GPU(s) BEFORE importing torch, then runs test_cond.py forwarding
+all the remaining CLI arguments to it.
 
 Use:
-    # All defaults (configs/test_cond.yaml)
+    # All defaults (1 GPU, configs/test_cond.yaml)
     python launch_test_cond.py \\
         --ckpt runs/cond_A/checkpoints/checkpoint_step50000.pt
 
@@ -31,20 +24,26 @@ Use:
     python launch_test_cond.py --ckpt <ckpt> \\
         sampling.n_test_panels=4 metrics.dac_device=cuda
 
-The only argument the launcher consumes is --script.
-Everything else is passed verbatim to test_cond.py.
+    # Multi-GPU (only --num-gpus is interpreted by the launcher;
+    #  everything else goes to test_cond.py)
+    python launch_test_cond.py --num-gpus 2 --ckpt <ckpt> --metrics_samples all
+
 """
 
 import os
 import sys
+import time
 import fcntl
+import socket
+import signal
 import argparse
 import platform
+import subprocess
 
 
-# ============================================================
-# PARALLEL LOCK
-# ============================================================
+CHILD_RANK_ENV = "LAUNCH_TEST_COND_RANK"
+
+
 class ParallelLock:
     def __init__(self, path=None):
         if path is None:
@@ -62,11 +61,7 @@ class ParallelLock:
         self.fd.close()
 
 
-# ============================================================
-# GPU LOCKING
-# ============================================================
 def acquire_gpu_locks(num_devices=1):
-    """Locks num_devices GPUs using IRCAM lock system."""
     if 'torch' in sys.modules:
         raise RuntimeError(
             "torch has been imported BEFORE locking the GPU. "
@@ -123,13 +118,115 @@ def acquire_gpu_locks(num_devices=1):
         return devices
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def retrieve_parent_gpu_locks(rank):
+    if 'torch' in sys.modules:
+        raise RuntimeError(
+            f"[rank {rank}] torch was imported before the GPU locks were "
+            f"retrieved from the launcher.")
+    import manage_gpus as mgp
+    devices = mgp.retrieve_my_gpu_locks()
+    if not devices:
+        raise RuntimeError(
+            f"[rank {rank}] no GPU lock inherited from the launcher "
+            f"(pid {os.getppid()}): this process would run on a GPU it does "
+            f"not hold.")
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not cuda_visible:
+        raise RuntimeError(
+            f"[rank {rank}] CUDA_VISIBLE_DEVICES not set after retrieving "
+            f"the locks.")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+        sorted(cuda_visible.split(",")))
+    return devices
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _child_setup():
+    os.setpgrp()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _stop(procs, grace_s=30.0):
+    for p in procs:
+        if p.poll() is None:
+            try:
+                p.send_signal(signal.SIGTERM)
+            except OSError:
+                pass
+    t_end = time.time() + grace_s
+    for p in procs:
+        while p.poll() is None and time.time() < t_end:
+            time.sleep(0.5)
+    for p in procs:
+        if p.poll() is None:
+            try:
+                p.kill()
+            except OSError:
+                pass
+
+
+def run_distributed(script, forwarded_args, world_size):
+    port = _free_port()
+    procs = []
+    for rank in range(world_size):
+        env = dict(os.environ)
+        env.update({
+            CHILD_RANK_ENV: str(rank),
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+        })
+        cmd = [sys.executable, os.path.abspath(__file__), "--script", script] \
+            + list(forwarded_args)
+        procs.append(subprocess.Popen(
+            cmd, env=env,
+            preexec_fn=_child_setup if os.name == "posix" else None))
+    print(f"[launcher] {world_size} test processes started "
+          f"(pids {[p.pid for p in procs]}, rendezvous 127.0.0.1:{port})",
+          flush=True)
+
+    def _on_signal(signum, _frame):
+        print(f"[launcher] signal {signum}: stopping the test processes",
+              file=sys.stderr, flush=True)
+        _stop(procs, grace_s=10.0)
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    rc = 0
+    while True:
+        alive = [p for p in procs if p.poll() is None]
+        failed = [(r, p.returncode) for r, p in enumerate(procs)
+                  if p.poll() is not None and p.returncode != 0]
+        if failed:
+            r, code = failed[0]
+            print(f"[launcher] rank {r} exited with code {code}: stopping "
+                  f"the others", file=sys.stderr, flush=True)
+            _stop(procs)
+            rc = code
+            break
+        if not alive:
+            break
+        time.sleep(1.0)
+    return rc
+
+
 if __name__ == "__main__":
-    # Parse only --script; everything else is forwarded to test_cond.py.
-    # No --num-gpus: the test runs on one device, so one GPU is locked.
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--num-gpus", type=int, default=1,
+                        help="Number of GPUs to lock (default: 1)")
     parser.add_argument("--script", type=str, default="test_cond.py",
                         help="Test script to run "
                               "(default: test_cond.py)")
@@ -141,17 +238,29 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(0)
 
-    print("[launcher] Locking 1 GPU...")
-    devices = acquire_gpu_locks(num_devices=1)
-    print(f"[launcher] GPU locked: {devices}")
-    print(f"[launcher] CUDA_VISIBLE_DEVICES = {os.environ['CUDA_VISIBLE_DEVICES']}")
+    if CHILD_RANK_ENV in os.environ:
+        _rank = int(os.environ[CHILD_RANK_ENV])
+        retrieve_parent_gpu_locks(_rank)
+        sys.argv = [args.script] + forwarded_args
+        import runpy
+        runpy.run_path(args.script, run_name="__main__")
+        sys.exit(0)
+
+    print(f"[launcher] Locking {args.num_gpus} GPU(s)...", flush=True)
+    devices = acquire_gpu_locks(num_devices=args.num_gpus)
+    print(f"[launcher] GPU locked: {devices}", flush=True)
+    print(f"[launcher] CUDA_VISIBLE_DEVICES = {os.environ['CUDA_VISIBLE_DEVICES']}",
+          flush=True)
 
     if not os.path.exists(args.script):
         raise FileNotFoundError(f"Test script not found: {args.script}")
 
-    print(f"[launcher] Running: {args.script} {' '.join(forwarded_args)}\n")
+    print(f"[launcher] Running: {args.script} {' '.join(forwarded_args)}\n",
+          flush=True)
 
-    # Replace sys.argv so the test script sees its own args (no --script)
+    if len(devices) > 1:
+        sys.exit(run_distributed(args.script, forwarded_args, len(devices)))
+
     sys.argv = [args.script] + forwarded_args
 
     import runpy

@@ -3,12 +3,15 @@
 Conditioned audio generation with **Rectified Flow** and a **Diffusion Transformer
 (DiT)** operating in **DAC (44.1 kHz) pre-quantizer latent space**, with
 classifier-free guidance. Frame-level conditions (f0, chroma, rhythm, energy,
-chord) are concatenated on the feature dimension (JASCO-style) and can optionally be
+chord, midi) are concatenated on the feature dimension (JASCO-style) and can optionally be
 **re-injected in depth** (`model.frame_reinject_every`), scaled by a
 per-condition gate that depends on the denoising step; global conditions
 (CLAP-text, CLIP-image) are injected via AdaLN, and the text can
 additionally be **cross-attended as a token sequence**
-(`model.text_cross_every`, PixArt-alpha order).
+(`model.text_cross_every`, PixArt-alpha order). The self-attention can be the
+DIFF Transformer's **differential attention** (`model.attention`), the
+training timesteps can follow **Stable Audio 3's recipe** (`training.t_sampler`),
+and so can the Euler steps of every generation (`sampling.t_schedule`).
 
 The pipeline is: **stream-encode audio → latents (+ conditions) → train → sample/edit**.
 Preprocessing is a streaming encoder that never materialises full WAVs to disk;
@@ -24,8 +27,9 @@ it (there are still no split folders on disk).
 |------|------|
 | `preprocess_stream.py` | Streaming preprocessing: chunk → DAC-encode on the fly → save latents (+ optional per-split WAV / conditions). **Decides the train/val/test split** (`splits.json`). Incremental, acoustic rules, parallel workers, batched DAC. Driven by flags or `--config`. |
 | `configs/preprocess_default.yaml` | Preprocessing config: every long flag as a key. Precedence: defaults < file < CLI. |
-| `conditions.py` | Condition registry + extractors (f0/chroma/rhythm/energy/chord, CLAP-text, CLIP-image) and the `FrameConditionEncoder`. |
+| `conditions.py` | Condition registry + extractors (f0/chroma/rhythm/energy/chord/midi, CLAP-text, CLIP-image) and the `FrameConditionEncoder`. |
 | `crema_chord.py` + `crema_chord_weights.npz` | PyTorch port of crema's chord model, with its original weights: the backbone of the `chord` condition (see §1, *The `chord` condition*). |
+| `midi_transcriber.py` | YourMT3+ (audio → MIDI notes), the re-extraction of the `midi` condition from generated audio; downloads its code and checkpoint on first use (see §1, *The `midi` condition*). `--selftest` checks a machine. |
 | `audio_dataset_npy.py` | Unconditional latent dataset **and** the split reader (`load_source_split`). `compute_split` is the old in-code split, kept for `--import_legacy_split` and the unconditional builder. |
 | `audio_dataset_cond.py` | Conditioned dataset + `build_conditioned_datasets` (reads the recorded split). |
 | `network_cond.py` | The `ConditionedAudioDiT` model. |
@@ -36,7 +40,7 @@ it (there are still no split folders on disk).
 | `metrics.py`, `condition_metrics.py` | FD-DAC/KL/FAD + per-condition fidelity (f0/energy correlation, chroma/chord cosine, …). |
 | `probe_conditions.py` | Out-of-the-box probe sets for **every condition** — frame (f0, energy, chroma, rhythm) *and* global (text, image): elementary synthetic stimuli, targets produced by the run's own extractor/encoder, cached behind a fingerprint, plus the comparison plots. One bank + one synthesizer per condition. |
 | `launch_training_cond.py` | IRCAM-only GPU-lock wrapper around `training_cond.py`; with `--num-gpus N` > 1 it runs one training process per GPU (see "Several GPUs"). |
-| `launch_test_cond.py` | IRCAM-only GPU-lock wrapper around `test_cond.py`, the twin of `launch_training_cond.py` (always one GPU). |
+| `launch_test_cond.py` | IRCAM-only GPU-lock wrapper around `test_cond.py`, the twin of `launch_training_cond.py`; with `--num-gpus N` > 1 it runs one test process per GPU (see §4). |
 | `configs/cond_default.yaml` | Default training configuration. |
 | `configs/test_cond.yaml` | Test configuration: how many test samples are measured, how many panels and uncond generations are shown. |
 
@@ -75,6 +79,14 @@ run still trains on the image condition, and the `image/clip_sim` column reads
 pip install wav2clip
 ```
 
+`transformers` is pinned to **4.45.1**: YourMT3+, the transcriber of the `midi`
+condition, subclasses transformers' internal T5 classes, which 4.46+ changed
+(under 4.57.6 it dies with a TypeError in its decoder). The pin changes nothing
+else: CLAP text vectors, CLAP token sequences and CLAP audio vectors are
+bit-identical under 4.45.1 and 4.57.6, CLIP image vectors within 1.8e-7. On an
+existing environment: `pip install transformers==4.45.1 lightning deprecated mido`,
+then `python midi_transcriber.py --selftest`.
+
 ### 3. ffmpeg (only for `--acoustic_rules`)
 
 The acoustic treatment (silence trim + loudness normalization + stereo split) shells
@@ -105,9 +117,10 @@ the config stored in the checkpoint and layers `configs/test_cond.yaml` on top
 
 ## 1) Preprocessing — `preprocess_stream.py`
 
-For each source file: load → mono → resample (44.1 kHz) → (optional acoustic
-rules) → fixed-length chunking → **DAC-encode each chunk immediately** → save the
-latent `(72, T)`. Full WAVs are never written to disk.
+For each source file: load → mono → resample (the codec's rate: 44.1 kHz for
+DAC, 32 kHz for EnCodec) → (optional acoustic rules) → fixed-length chunking →
+**encode each chunk immediately** → save the latent `(D, T)` (`D` = 72 for DAC,
+128 for EnCodec). Full WAVs are never written to disk.
 
 ```bash
 python preprocess_stream.py <SRC> <OUT> --device cuda \
@@ -120,7 +133,8 @@ Output (no split folders, mirrors the source class tree):
 
 ```
 OUT/
-  latents/<class...>/*.npy            # (72, T) float32, pre-quant DAC
+  latents/<class...>/*.npy            # (D, T) float32: 72-d pre-quant DAC,
+                                      #   or 128-d EnCodec (--codec)
   conditions/<class...>/*.npz         # per-CHUNK conditions: --conditions
                                       #   and/or the per-chunk half of --global
   wav/<class...>/*.wav                # only with --save_wav (per split)
@@ -142,11 +156,48 @@ OUT/
                                       #   (--label_source, see below)
 ```
 
-Useful flags: `--sr 44100` (required for the 44 kHz DAC), `--chunk_duration`,
-`--chunk_overlap`, `--global_conds text,image` (+ `--image_root`), `--label_source`
-(where the class comes from, see below), `--num_workers` (parallel CPU work; keep
-**0 on Windows**), `--batch_size` (DAC batch), `--force`, and `--config` to keep
-all of it in a YAML instead.
+Useful flags: `--codec` (see below), `--chunk_duration`, `--chunk_overlap`,
+`--global_conds text,image` (+ `--image_root`), `--label_source` (where the class
+comes from, see below), `--num_workers` (parallel CPU work; keep **0 on
+Windows**), `--batch_size` (encoder batch), `--force`, and `--config` to keep all
+of it in a YAML instead. `--sr` follows the codec and is best left unset.
+
+### Which autoencoder makes the latents — `--codec`
+
+| `--codec` | sample rate | latent | frames/s | 5 s | 10 s | 30 s |
+|---|---|---|---|---|---|---|
+| `dac_44khz` (default) | 44.1 kHz, mono | 72-d, the DAC's pre-quantizer latents, decoded by re-quantizing them | 86.13 | 431 | 862 | ~2584 |
+| `encodec_32khz` | 32 kHz, mono | 128-d, EnCodec's **continuous** encoder output (MusicGen's model, `facebook/encodec_32khz`), decoded by its decoder without the quantizer | 50 | 250 | 500 | 1500 |
+
+```bash
+python preprocess_stream.py <SRC> <OUT_ENCODEC> --device cuda --codec encodec_32khz     --conditions f0,chroma,energy,rhythm --chunk_duration 10
+```
+
+- **The codec is part of the dataset**: recorded in `dataset_meta.json`
+  (`codec`, `latent_dim`, `sr`), one OUT dir holds one codec, and a re-run with
+  another codec into it is refused. A dataset written before the field existed
+  is DAC. **An incremental run on an EnCodec dataset (adding a condition, with
+  or without `--skip_dac`) must repeat `--codec encodec_32khz`**, like every
+  other parameter the dataset was built with; forgetting it stops the run with
+  that instruction, before anything is loaded.
+- **Everything after reads it back, nothing assumes it.** The conditions are
+  extracted on the codec's frame grid (chroma / energy hop = the codec's hop,
+  chord / midi at its frame rate); the training reads the codec from the
+  dataset, sizes the model's tokens from it (72 or 128), decodes with it, and
+  writes it into the checkpoint; `test_cond.py`, `sampling_cond.py` and the
+  `compare_*.py` scripts read it from the checkpoint, and `test_cond.py` refuses
+  a test dataset of another codec. A resume or a warm start across codecs is
+  refused.
+- **Latent metrics are per codec.** FD and KL are measured in the codec's
+  latent space: the TensorBoard tags read `Fd_dac_*` on DAC runs (unchanged)
+  and `Fd_encodec_*` on EnCodec runs, and the two are not comparable. FAD and
+  the condition metrics are measured on the audio and compare across codecs.
+- **Reconstruction** (6 Oct 2026, 24 instruments_v2 clips of 5 s, encode →
+  decode, metrics at 32 kHz): DAC SI-SDR 13.2 dB, log-mel L1 0.182; EnCodec
+  continuous 10.1 dB / 0.272; EnCodec through its 4 codebooks 7.0 dB / 0.291 —
+  hence the continuous latents.
+- The EnCodec weights are downloaded from HuggingFace the first time
+  (`transformers`, already a requirement), like the DAC's.
 
 ### Where the class of a source comes from — `--label_source`
 
@@ -434,6 +485,77 @@ in PyTorch and loads the **original weights unchanged** from
   look at what the condition is made of (frame-wise: crema's own HMM smoothing
   is not applied).
 
+### The `midi` condition — the dataset's own MIDI
+
+`midi` is the one frame condition that is **not computed from the audio**. For a
+dataset that carries its MIDI — renders of MIDI files (Lakh through
+`render_midi.py`, Slakh) or any audio with a MIDI aligned to it — it gives the
+model the notes being played, per frame, as 185 values 0/1: 88 keys **sounding**
+(A0–C8), 88 **note starts** (24% of Lakh's notes restart on the same key within
+one frame, invisible to "sounding" alone) and 9 **drum classes** (Magenta's:
+kick, snare, closed / open hi-hat, low / mid / high tom, crash, ride). The
+instruments are merged and velocity is not kept.
+
+- **Where the MIDI goes.** Next to its audio, with the same name:
+  `rock/song.mp3` + `rock/song.mid` (or `.midi`, any case). Its time 0 must be
+  the start of the audio, as it is for a render. No flag:
+  ```bash
+  python preprocess_stream.py <SRC> <OUT> --device cuda --conditions midi
+  ```
+  Every source is checked before anything is written: an audio file without its
+  MIDI, or with two, stops the run with the list. Each chunk gets the MIDI
+  window that starts where the chunk starts in the original file — the
+  `--acoustic_rules` trim included — never inferred from the chunk index (which
+  counts the chunks that survived the gates).
+- **Adding it to a dataset that already exists** (Lakh on the server): put each
+  `.mid` next to the audio file the dataset was built from — `render_midi.py`
+  mirrored the tree, so the relative paths already match —
+  ```bash
+  robocopy <Lakh_midi> <Lakh_mp3> *.mid /S                                 # Windows
+  rsync -a --include='*/' --include='*.mid' --exclude='*' <Lakh_midi>/ <Lakh_mp3>/   # Linux
+  ```
+  then re-run on the **same SRC** with the **same parameters** the dataset was
+  built with (a different one stops the run, see `dataset_meta.json`):
+  ```bash
+  python preprocess_stream.py <SRC> <OUT> --conditions midi --skip_dac
+  ```
+  The latents are not touched (`--skip_dac` reads T from them), the other
+  conditions stay, only the `midi` key is added. On a 1551-chunk Lakh subset:
+  15 s; latents, wavs and chroma bit-identical before and after; the stored roll
+  equal to the MIDI's at the chunk's start in 1551/1551 chunks (1004/1004 with
+  `--acoustic_rules`, trims up to 3 s). Disk: ~1.7 KB per chunk (~1.2 GB for
+  757k chunks).
+- **Timing.** The MIDI is read with mido, which applies the tempo changes of
+  every track as a player does (pretty_midi reads track 0 only and drifts on
+  2.5% of Lakh's files). Against the renders, the onsets a transcriber finds in
+  the audio sit 0.0 ms (median) from the stored roll.
+- **Re-extraction: YourMT3+** (`midi_transcriber.py`). A generated chunk has no
+  MIDI: its notes are transcribed back with YourMT3+ (Chang et al., IEEE MLSP
+  2024; checkpoint *YPTF.MoE+Multi (noPS)*), polyphonic and with drums, on
+  `metrics.fidelity_device`, and rolled with the same function as the dataset's
+  MIDI. Code and checkpoint (~0.6 GB) are downloaded on first use from the
+  authors' HuggingFace Space at a pinned revision into the HuggingFace cache —
+  nothing of it is in this repository (its GitHub LICENSE is GPL-3.0). It needs
+  **transformers 4.45.x** (see Installation); check a machine with
+  `python midi_transcriber.py --selftest`. It is loaded at startup, so a run
+  that cannot transcribe stops before training.
+- **Its ceiling.** On the real Lakh renders against their own MIDI (200 chunks
+  of 50 pieces): note F1 0.53, drum F1 0.59 (kick 0.80, snare 0.70, closed
+  hi-hat 0.57, crash 0.53, ride 0.40, toms 0.26–0.30, open hi-hat 0.21). The
+  midi rows of a run cannot go above that; read them against these numbers, not
+  against 1. YourMT3+ reads audio in 2.048 s segments, so the last 0.9 s of a 5 s
+  chunk sits in a mostly zero-padded one: recall there 0.39 instead of ~0.45
+  (drums 0.45 instead of ~0.57).
+- **Cost.** 1.2 s per 5 s chunk on a laptop RTX 5050 (0.8 GB), 4.3 s on CPU;
+  every metrics step transcribes 2 × `n_metrics_samples` generations (with and
+  without the condition): ~20 min for 512 on that GPU. Several GPUs split it.
+- **Table rows** (see *influence_family* below): ours `cosine` (sounding keys,
+  per frame), `onset_corr`, `drum_corr`; mir_eval `note_precision`,
+  `note_recall`, `note_f1`, `drum_precision`, `drum_recall`, `drum_f1`.
+- `extract_conditions.py` refuses `midi` (it never sees the sources and their
+  MIDI); `sampling_cond.py` with a reference audio gets the `midi` condition by
+  transcribing it (it does not read a `.mid`).
+
 ---
 
 ## 2) Train/val/test split (decided at preprocessing time)
@@ -561,7 +683,7 @@ python launch_training_cond.py --num-gpus 2 --config configs/cond_default.yaml [
 - **On the servers** the locks are SOFT from the second GPU on (LAB rules,
   "GPU lock levels"): a user with hard-lock authority can take one, and then
   the whole run stops — resume from the last periodic checkpoint.
-- `test_cond.py` stays on one GPU.
+- The test too: `launch_test_cond.py --num-gpus N` (see §4).
 
 ### How strongly the frame conditions are followed
 
@@ -725,6 +847,137 @@ On material where CREPE returns mostly unvoiced (musique concrète, heavily
 processed sound), the f0 curve is close to noise and no amount of re-injection or
 guidance recovers a control signal that is not in the `.npz` to begin with.
 
+### Self-attention — `model.attention`
+
+| value | every block's self-attention |
+|---|---|
+| `standard` (default) | the RoPE attention of `network.py`: 16 heads × 72 on `XL`. Every run before 6 Oct 2026; bit-identical to the code before the option existed |
+| `differential` | the **DIFF Transformer** of Ye et al. 2024 ([arXiv 2410.05258](https://arxiv.org/abs/2410.05258)), as in its reference code (`microsoft/unilm`, `Diff-Transformer/multihead_diffattn.py`) |
+
+**What the differential attention computes.** Half the heads; each has two
+query/key pairs over the same values:
+
+```
+A1 = softmax(q1 k1ᵀ / √d)      A2 = softmax(q2 k2ᵀ / √d)
+o  = (A1 − λ·A2) v             λ = exp(λq1·λk1) − exp(λq2·λk2) + λ_init
+o  = RMSNorm(o) · (1 − λ_init)
+```
+
+The weight a position receives is the difference of two maps: what both spread
+alike over the sequence cancels, what `A1` puts above `A2` survives, and the
+rows sum to `1 − λ`, not 1. `λ` is learned, one per block, starting from
+`λ_init = 0.8 − 0.6·exp(−0.3·block)` (0.20 in block 0, 0.80 in the deep blocks of
+`XL`). In the paper's retrieval test the attention given to irrelevant context
+drops from 0.49–0.54 (Transformer) to 0.01–0.02.
+
+- **The per-head RMSNorm is part of the method.** λ changes with the depth and
+  during training, and the two maps cancel more or less from head to head, so
+  each head's output has a scale of its own; the norm brings them to one, and
+  `(1 − λ_init)` puts it back where a standard head's output sits. Paper,
+  Table 6 (1.4B models, validation loss): 3.062 with it, 3.122 without — worse
+  than the standard Transformer's 3.087. Stable Audio 3 uses a variant without it
+  (λ fixed at 1) in its medium and large models, with no published ablation.
+- **Same parameters and FLOPs.** The qkv / proj matrices keep their shapes and are
+  read differently (on `XL`: 16 query/key maps of width 72, two per head, and 8
+  values of width 144); the extra parameters are the four λ vectors and the norm's gain,
+  `6 × head_dim` per block (12k on `XL`). Same RoPE.
+- **Numbers outside language:** DiT-S/2 on ImageNet 256 (400k steps, batch 256):
+  FID 67.2 → 63.9 ([arXiv 2511.00833](https://arxiv.org/abs/2511.00833)). Nothing
+  published on audio.
+- **It changes the state_dict and what the weights compute**, so it is checked on
+  `--resume` like `model.kind`, and neither `--resume` nor `paths.init_from` can
+  switch it: a different attention is a new run. `sampling_cond.py`,
+  `test_cond.py` and `compare_guidance.py` read it off the checkpoint's
+  **weights** (`network_cond.ckpt_attention`: a block with `attn.lambda_q1` is
+  differential); checkpoints written before the option read back as `standard`.
+- `python network_cond.py` checks the module against an explicit, step-by-step
+  computation of the formula above, and that λ and the norm receive gradient in
+  every block.
+
+### Where the training puts its timesteps — `training.t_sampler`
+
+`t = 0` is pure noise, `t = 1` the data.
+
+| value | how the training draws `t` | below 0.1 | above 0.8 | median |
+|---|---|---|---|---|
+| `logit_normal` (default) | logit-normal (0, 1), SD3's `lognorm(0.00, 1.00)`; every run before 6 Oct 2026 | 1.4% | 8.3% | 0.50 |
+| `sa3` | Stable Audio 3's pre-training recipe ([arXiv 2605.17991](https://arxiv.org/abs/2605.17991)), for 431 frames | 9.9% | 2.3% | 0.34 |
+
+`sa3` is the two steps of their code, mirrored into this repo's convention (SA3
+has `t = 1` = noise): the logit-normal (0, 1) **truncated at 0.075 and rescaled**
+(`truncated_logistic_normal_rescaled`), then **shifted towards the noise** by an
+amount that grows with the sequence length (`DistributionShift`, the one their
+released models ship with): `logit(t') = logit(t) − μ`, `μ` linear from 0.5 at
+256 tokens to 1.15 at 4096 — 0.53 for our 431 frames, `α = e^μ = 1.70`. Checked
+against their code run as is: 4M draws each, largest gap between the two CDFs
+0.0005.
+
+**Why.** Measured on 6 Oct 2026 on XL SHS 200k and XL chord Lakh 50k, from the
+model's own estimate of the final latent along the Euler trajectory,
+`x̂₁ = x_t + (1 − t)·v`: the content of the whole clip — each channel's mean over
+the 431 frames — is 90% fixed by `t = 0.12`, where `logit_normal` puts 2.4% of
+the examples and `sa3` 13%; above `t = 0.7` every time scale is already ≥ 99%
+fixed, and `logit_normal` puts 20% of the examples there, `sa3` 7%. Below
+`t = 0.01` a 200k-step run with batch 16 has seen about 7 examples in all, and
+there the model treats the noise as if it were already content.
+
+- **Training only.** The network does not change and every checkpoint samples
+  the same way. It may differ on a resume: pass it on the command line, since the
+  checkpoint's stored config is merged over the YAML.
+- **The validation loss is untouched:** it keeps its own fixed `t`, drawn once
+  from the logit-normal (0, 1), so it stays comparable across samplers and with
+  every earlier run.
+- The startup log says where the draws go: `Training t sampler: sa3 (...) | draws
+  with t < 0.1 (noise end): 9.9%, t > 0.8 (data end): 2.3%`.
+- Above `t = 0.7` the latent changes by less than 1%, but small latent errors can
+  change the DAC codes at decoding: fewer examples there is a trade-off to listen
+  for.
+
+### Where the Euler steps go — `sampling.t_schedule`
+
+`t = 0` is pure noise, `t = 1` the data. The option places the
+`sampling.euler_steps` of **every** generation of the run: the metrics step, the
+panels, the uncond cards.
+
+| value | where the steps go | steps | evaluated below t = 0.1 | below t = 0.12 | last evaluation |
+|---|---|---|---|---|---|
+| `uniform` (default) | equal steps from `t_min` to `t_max`; every run before 6 Oct 2026 | 100 | 10 | 12 | t = 0.989 |
+| `sa3` | Stable Audio 3's inference grid ([arXiv 2605.17991](https://arxiv.org/abs/2605.17991), §4) | 50 | 25 | 26 | t = 0.862 |
+
+`sa3` is their `build_schedule` with the `LogSNRShift(rate=0)` their
+`models/diffusion.py` uses when a model config sets no sampling shift (their
+released `-base` configs set none): the step boundaries equally spaced in
+log-SNR, `log(t / (1 − t))`, from −6.2 to 2.0, the first at `t = 0` and the last
+at `t = 1`, the same grid for every length; `t_min` / `t_max` do not apply to
+it. Checked against their code run as is: largest gap 9e-8 (their float32).
+Their base model (flow matching only, like ours) is sampled on it with 50 Euler
+steps (CFG 7 in their paper); their post-trained model uses 8 ping-pong steps,
+which needs their distillation and adversarial post-training.
+
+```bash
+python training_cond.py ... sampling.t_schedule=sa3 sampling.euler_steps=50
+```
+
+- **Sampling only.** The weights do not depend on it: any checkpoint, older ones
+  included, can be generated either way.
+- **A YAML without the key** (the server's, if not updated) reads `uniform`, and
+  the command-line override still works: the key is put in at startup. On a
+  resume the checkpoint's value is kept unless the command line says otherwise.
+- **Who reads it.** `test_cond.py`, `sampling_cond.py` and `compare_guidance.py`
+  take the checkpoint's (`uniform` for a checkpoint older than the option);
+  `sampling.t_schedule=sa3` on the test's command line and `--t_schedule sa3`
+  for the other two override it. `compare_schedules.py --schedules uniform sa3`
+  generates the two from the same noise.
+- **An edit** (`sampling_cond.py edit --strength s`) starts at `t = 1 − s`: the
+  same log-SNR spacing from there to 2.0 (past `t = 0.881`, i.e. `s` below 0.12,
+  equal steps). SA3's own code would put the second step at more noise than the
+  first, which an Euler step cannot do.
+- The metric curves of two runs are comparable only with the same
+  `euler_steps` and `t_schedule`. The startup log says which:
+  `Sampling t schedule: sa3 (...) | 50 Euler steps, 25 of them at t < 0.1 (noise end), the last at t=0.862`.
+- **`uniform` generates what it did before, bit for bit**: the same times and
+  step sizes, with the same arithmetic.
+
 ### Which metrics are computed
 
 `metrics.enabled` selects the distributional metrics, mirroring the unconditional
@@ -770,6 +1023,7 @@ standard MIR metrics, so the numbers are comparable with the literature.
 | f0 | `mir_eval.melody`: `raw_pitch_accuracy` (50 cents), `raw_chroma_accuracy`, `voicing_recall`, `voicing_false_alarm` (↓ lower is better), `overall_accuracy` |
 | chroma, chord | `mir_eval.multipitch`, on the pitch classes ON in each frame: `chroma_precision`, `chroma_recall`, `chroma_accuracy`, `chroma_miss_error` (↓), `chroma_false_alarm_error` (↓, can exceed 1) |
 | rhythm | `mir_eval.beat`, on the beat instants read off the curves with beat_this's own rule (maximum within ±60 ms, probability > 0.5): `beat_f_measure`, `beat_cemgil`, `beat_p_score`, `beat_cmlt`, `beat_amlt`, `downbeat_f_measure` |
+| midi | `mir_eval.transcription`, onsets within ±50 ms on the same key (offsets ignored): `note_precision`, `note_recall`, `note_f1`; the same for drum hits on the same class: `drum_precision`, `drum_recall`, `drum_f1`. Ours: `cosine` (sounding keys), `onset_corr`, `drum_corr` |
 | energy, text, image | always ours (mir_eval has no counterpart) |
 
 The target is the reference and the generation the estimate, on the shared DAC
@@ -1074,8 +1328,40 @@ recording) once per board, at step 0, the generation at every metrics step.
 Every `intervals.audio` steps in between, only the uncond cards are refreshed —
 by the same function, from the same noise draws, so the slider of `uncond_NN`
 walks one generation through training. Nothing conditioned is generated between
-metrics steps. Every generation of a panel is also written to
-`runs/<run>/audio/step_<step>/test/` and `.../probe/`.
+metrics steps.
+
+ON DISK, `runs/<run>/audio/` holds what the Audio window shows, and nothing
+else:
+
+```
+audio/
+├── test/test_00/                a test panel
+│   ├── real.wav                 the recording (as the DAC decodes its latent)
+│   ├── cond_f0.wav …            each frame condition, sonified
+│   ├── conditions.npz           every array / vector the model received
+│   ├── text.txt                 the sentence the model received (text runs)
+│   ├── image.<ext>              the picture the model received (image runs)
+│   ├── info.json                which test sample, guidance, noise draw
+│   └── step_0050000_EMA.wav …   its generation at every metrics step
+├── probe/probe_00/              a probe panel: the same, without real.wav
+├── uncond/uncond_00/            step_0025000_EMA.wav … only
+└── ground_truth/                real_test_XX.wav, in a run without conditions
+```
+
+A panel's conditions are the same at every step: its folder holds one copy of
+them (rewritten at each metrics step) and one generation per step, named by the
+step and the weights (`EMA` / `Model`); with `sampling.influence_subsets`, also
+`step_<step>_<EMA|Model>_<subset>.wav`. `conditions.npz` holds the frame
+conditions by name, `text` / `image` (the vectors), and `text_tokens` /
+`text_mask` when the model has the cross-attention. `text.txt` is the exact
+sentence CLAP encoded: always for a probe (its prompt); for a test sample, its
+caption when the text slot received the caption's vector — otherwise a line
+saying the slot received the CLAP audio embedding of the chunk, which no
+sentence produced; with the cross-attention it also names the caption whose
+tokens the model read. Files are at their real level; only the TensorBoard
+cards are peak-normalized. The validation generations the table is computed on
+are not written to disk (`sampling.n_val_save` is gone since 5 Oct 2026; a
+config still holding it gets one log line).
 
 A run conditioned ONLY on globals — no frame condition, so no waveform to put
 beside the recording — has blocks with just the recording and the generation:
@@ -1134,11 +1420,13 @@ listening and looking material only: they have no rows in the table.
 | chroma | one sustained triad; simple cadences (I-IV-V, i-iv-V-i in A minor, a tritone resolving to G); a moving pitch class, fifths, clusters, whole-tone and quartal sets; two with rests, one repeated chord | a waveform |
 | rhythm | click grids at fixed tempi, downbeat every N, accelerando | a waveform |
 | chord | sustained triads, I-IV-V, single pitch class, clusters (the chroma bank's earlier list, kept as its own) | a waveform |
+| midi | scale, sustained chord, arpeggio, a repeated note, melody + bass, I-IV-V-I, low and high register, stabs then rest; drums alone (backbeat, rock groove, open hi-hats, tom fill); drums with bass / walking bass / a small band | **notes**: the target is their roll; the waveform is only to listen to |
 | **text** | chosen by the dataset (see below): its own labels, in turn, when its captions are single labels (`drum`, `guitar`, `piano`, `violin`, `drum`, …); otherwise 16 instrument/style descriptions ("solo pipe organ in a large reverberant church", "fast electronic dance beat…") | a **string**, CLAP-encoded |
 | **image** | 16 abstract figures — colour fields, stripes, checkerboard, rings, gradient, noise | a **.png**, CLIP-encoded |
 
 The two families differ only in medium. A frame target is a `(n_frames, dim)`
-curve **extracted** from a waveform; a global target is a `(dim,)` vector
+curve **extracted** from a waveform (midi excepted: its target is **rolled** from
+the stimulus's notes, the way the dataset's MIDI is); a global target is a `(dim,)` vector
 **encoded** from a string or a picture, by the run's own CLAP/CLIP — so the
 probe drives the model in exactly the space it was conditioned in. Nothing
 re-extracts a picture from audio, so a global probe has no "target vs
@@ -1241,6 +1529,8 @@ python probe_conditions.py energy ./cache/probe_energy --n_frames 431
 python probe_conditions.py chroma ./cache/probe_chroma --n_frames 431
 python probe_conditions.py rhythm ./cache/probe_rhythm --n_frames 431
 python probe_conditions.py chord  ./cache/probe_chord  --n_frames 431
+# an EnCodec dataset: its codec and its frame count (250 for 5 s)
+python probe_conditions.py f0     ./cache/f0_probe_enc --n_frames 250 --codec encodec_32khz
 # the global banks: --n_frames does not apply (one embedding, no chunk geometry)
 python probe_conditions.py text   ./cache/probe_text    # always the descriptions
 python probe_conditions.py image  ./cache/probe_image
@@ -1310,8 +1600,8 @@ serial path runs anyway when guidance ≤ 1 or no condition is active.
 "Same numbers" includes the Condition_influence table, which is computed on the
 conditioned generations alone. The fused sampler also gets the generations
 without conditions for free out of the CFG math (they feed `metrics_uncond` and
-the `uncond.wav` of the dump); the serial one generates them only when
-`metrics_uncond` asks for them.
+the null column of the table); the serial one generates them only when the
+table or `metrics_uncond` needs them.
 
 The value does **not** change which samples are generated (the noise is drawn per
 sample), so the metric values are the same for any setting. Batching does change
@@ -1329,8 +1619,10 @@ to TensorBoard, minus the loss.
 ```bash
 python test_cond.py --ckpt runs/<run>/checkpoints/best_model_step<N>.pt
 # on an IRCAM GPU server, through the test's own GPU-lock wrapper
-# (the twin of launch_training_cond.py: same arguments, one GPU):
+# (the twin of launch_training_cond.py: same arguments):
 python launch_test_cond.py --ckpt <ckpt>
+# the same on N GPUs (see "Several GPUs" below):
+python launch_test_cond.py --num-gpus 2 --ckpt <ckpt> --metrics_samples all
 ```
 
 (Checkpoints are named `best_model_step<N>.pt`, `checkpoint_step<N>.pt`, and
@@ -1354,6 +1646,10 @@ The command line wins over both: dotlist overrides as for the training (e.g.
 `sampling.n_metrics_samples=all metrics.dac_device=cuda`), plus the shortcuts
 `--metrics_samples N|all`, `--n_samples` (= `n_test_panels`), `--steps`,
 `--guidance`, `--seed`, `--duration_s`. A key that does not exist stops the test.
+The Euler grid is the checkpoint's `sampling.t_schedule` (`uniform` for a
+checkpoint older than the option): e.g. `--steps 50 sampling.t_schedule=sa3`
+tests it on Stable Audio 3's grid; the JSON records `euler_steps` and
+`t_schedule`.
 
 **What it writes**, at the checkpoint's training step, to `runs/<run>/test_logs/`:
 
@@ -1374,7 +1670,9 @@ is on), a probe the stimulus of `probe_conditions.py`. An unconditional
 checkpoint gets no table and no panels: the metrics on a single axis, the uncond
 cards, the real test recordings (`ground truth/real_test_XX`) and the config.
 
-The generations go to `runs/<run>/test_outputs/` as .wav, the numbers to
+What the Audio window shows goes to `runs/<run>/test_outputs/`, laid out as the
+training's `audio/` folder (`test/`, `probe/`, `uncond/`, `ground_truth/` for an
+unconditional checkpoint; one generation per tested checkpoint), the numbers to
 `runs/<run>/test_outputs/metrics_<checkpoint>_<N|all>.json`. To keep the panel
 of every checkpoint tested on the slider: `tensorboard --logdir runs/<run>/test_logs --samples_per_plugin text=0`.
 The cost is the generation: hours for a full test split with 100 Euler steps;
@@ -1388,6 +1686,37 @@ stops at startup saying so. Either add them (re-run `preprocess_stream.py` on th
 same output dir with `--save_wav test`: it does not re-encode the latents), or run
 the test with `metrics.fad_reference=decoded` (the real test latents decoded
 through DAC; not comparable with published FAD values).
+
+**Several GPUs — `launch_test_cond.py --num-gpus N`**, the twin of the
+training's ("Several GPUs" in §3: the launcher locks the N GPUs, starts one
+process per GPU, stays alive as their parent and stops them all if one dies).
+
+- **One GPU does not change.** `python test_cond.py ...` and `--num-gpus 1`
+  run the test in a single process, as before: none of the multi-GPU code runs
+  (checked on 5 Oct 2026: the old and the new code give the same JSON numbers,
+  panels, cards and TensorBoard values, byte for byte).
+- **Split over the GPUs:** the metrics step, as in the training — test sample
+  j of the `n_metrics_samples` is generated, decoded and measured on GPU
+  j mod N, from the SAME starting noise it has on one GPU — and the references
+  of the real test data (FD-DAC, FAD). GPU 0 adds up what the others measured
+  and computes FD-DAC, KL, FAD and the table: the numbers of one GPU up to
+  floating-point rounding (the same sums, added in another order). The JSON
+  records how many GPUs (`gpus`). Checked on 5 Oct 2026 with 2 processes on
+  the CPU against 1: the 73 numbers of the JSON within 3e-15 (relative), the
+  panels and the cards byte for byte. NCCL on real GPUs cannot run on the
+  laptop: the first multi-GPU test on a server is the first run of that path.
+- **GPU 0 alone:** TensorBoard, `test_outputs/`, the console; the probe banks,
+  the panels and the uncond cards, while the others wait (time-out 180 min,
+  `DIST_TIMEOUT_MIN` in `training_cond.py`). The other processes write their
+  console to `runs/<run>/test_logs/rank<R>_<checkpoint>.log`; their errors still
+  reach the launcher's console.
+- **Panels only** (`n_metrics_samples: 0`): nothing to split — GPU 0 makes the
+  panels, the other processes exit at once.
+- **Stopping:** Ctrl+C or a kill stops every process at once. A test writes its
+  numbers at the end, so there is nothing to save half-way.
+- The checkpoint is opened memory-mapped (on one GPU too): only the weights go
+  to the GPU, not the optimizer state, and the N processes share one copy of
+  the file in memory.
 
 **Generate / edit:** `sampling_cond.py` takes the checkpoint and the mode as
 **positional** arguments (`checkpoint` then `generate`|`edit`):
@@ -1404,6 +1733,8 @@ python sampling_cond.py <ckpt> edit --source in.wav \
 
 If a checkpoint requires conditions and you omit them, the script stops unless you
 pass `--allow_null_frame_conditions` / `--allow_null_global_conditions`.
+`--steps` (default 50) and `--t_schedule uniform|sa3` (default: the checkpoint's
+`sampling.t_schedule`) set the Euler steps and where they go.
 
 ---
 
@@ -1414,7 +1745,8 @@ pass `--allow_null_frame_conditions` / `--allow_null_global_conditions`.
   python launch_training_cond.py --num-gpus 1 --config configs/cond_default.yaml [overrides]
   ```
   Elsewhere (e.g. a local Windows box) run `python training_cond.py` directly.
-- Launch a test through its own wrapper, the twin of the training's (one GPU):
+- Launch a test through its own wrapper, the twin of the training's
+  (`--num-gpus N` for N GPUs, see §4):
   ```bash
   python launch_test_cond.py --ckpt <ckpt> [--config configs/test_cond.yaml] [overrides]
   ```
@@ -1429,7 +1761,8 @@ pass `--allow_null_frame_conditions` / `--allow_null_global_conditions`.
       paths.cache_dir=/data2/anasynth_nonbp/baione/cache
   ```
 - Several GPUs: `python launch_training_cond.py --num-gpus N ...` (see
-  "Several GPUs" in §3). With `--num-gpus 1` nothing changes.
+  "Several GPUs" in §3) and `python launch_test_cond.py --num-gpus N ...`
+  (§4). With `--num-gpus 1` nothing changes.
 
 ---
 

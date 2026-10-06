@@ -1,3 +1,4 @@
+# IRCAM launcher of training_cond.py: GPU locks (manage_gpus), --num-gpus N.
 """
 launch_training_cond.py
 
@@ -6,13 +7,6 @@ GPU-lock wrapper for IRCAM servers, dedicated to the CONDITIONED training.
 Locks GPU(s) BEFORE importing torch, then runs training_cond.py forwarding
 all the remaining CLI arguments to it. Mirrors the unconditional launcher
 in the sister repository.
-
-Note:
-    This launcher relies on the IRCAM-internal `manage_gpus` package and on
-    POSIX `fcntl`. It is therefore meant for the IRCAM Linux servers only.
-    On other systems (e.g. the Windows VM at CAIS LAB) launch the training
-    script directly:
-        python training_cond.py [--config ...] [--run_name ...] [overrides]
 
 Use:
     # All defaults (1 GPU, configs/cond_default.yaml)
@@ -33,35 +27,6 @@ Use:
     #  everything else goes to training_cond.py)
     python launch_training_cond.py --num-gpus 2 training.lr=2e-4
 
-The only arguments the launcher consumes are --num-gpus and --script.
-Everything else is passed verbatim to training_cond.py.
-
-ONE GPU (--num-gpus 1, the default): the training runs INSIDE this process,
-exactly as it always has.
-
-SEVERAL GPUs (--num-gpus N, N > 1): this process locks the N GPUs and then
-starts N training processes, one per GPU (PyTorch DistributedDataParallel),
-and stays alive as their parent for the whole run: the locks belong to it.
-Each child takes the parent's locks over with retrieve_my_gpu_locks() BEFORE
-importing torch (LAB rules, "Sharing GPU locks with sub-processes"), then runs
-training_cond.py with RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR /
-MASTER_PORT in its environment -- the same variables torchrun sets, which is
-how training_cond.py knows it is one of N. If one process dies, the others are
-stopped: a distributed training cannot continue with a missing member, and a
-survivor would otherwise sit on its GPU waiting for it.
-  * Only rank 0 writes: TensorBoard, checkpoints, the dumps, the console. The
-    other ranks write their console to runs/<run>/rank<R>.log.
-  * data.train_batch_size is PER GPU: the batch of one optimizer step is
-    train_batch_size x grad_accum x N.
-  * If fewer GPUs than asked are obtained, the run goes on with those (a
-    warning says how many); with one, it is the ordinary single-GPU run.
-  * From the second GPU on the locks are SOFT (LAB rules, "GPU lock levels"):
-    a user with hard-lock authority can interrupt them, and the whole run then
-    stops (the last periodic checkpoint is the one to resume from).
-  * Ctrl+C: rank 0 writes checkpoint_last, as a single-GPU run does, then the
-    other processes are stopped; a second Ctrl+C stops everything at once.
-    A kill (SIGTERM) stops every process at once, without checkpoint_last,
-    as it does a single-GPU run.
 """
 
 import os
@@ -75,14 +40,9 @@ import platform
 import subprocess
 
 
-# Set by the parent on every training process it starts: their rank. Its
-# presence is what tells this file it is running as one of those processes.
 CHILD_RANK_ENV = "LAUNCH_TRAINING_COND_RANK"
 
 
-# ============================================================
-# PARALLEL LOCK
-# ============================================================
 class ParallelLock:
     def __init__(self, path=None):
         if path is None:
@@ -100,11 +60,7 @@ class ParallelLock:
         self.fd.close()
 
 
-# ============================================================
-# GPU LOCKING
-# ============================================================
 def acquire_gpu_locks(num_devices=1):
-    """Locks num_devices GPUs using IRCAM lock system."""
     if 'torch' in sys.modules:
         raise RuntimeError(
             "torch has been imported BEFORE locking the GPU. "
@@ -162,10 +118,6 @@ def acquire_gpu_locks(num_devices=1):
 
 
 def retrieve_parent_gpu_locks(rank):
-    """A training process started by this launcher: take over the parent's
-    locks BEFORE torch is imported, and order CUDA_VISIBLE_DEVICES exactly as
-    the parent did, so that cuda:<LOCAL_RANK> names the same physical GPU in
-    every process and no two ranks share one."""
     if 'torch' in sys.modules:
         raise RuntimeError(
             f"[rank {rank}] torch was imported before the GPU locks were "
@@ -187,38 +139,25 @@ def retrieve_parent_gpu_locks(rank):
     return devices
 
 
-# ============================================================
-# MULTI-GPU: one training process per GPU
-# ============================================================
 def _free_port():
-    """A free TCP port on this machine for the rendezvous of the ranks."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-# After a Ctrl+C, how long the launcher waits for rank 0 to write the last
-# checkpoint and exit before it stops every process anyway.
 INTERRUPT_WAIT_S = 30 * 60
 
 
 def _child_setup():
-    """Linux, in each training process just before it starts:
-      * its own process group, so the Ctrl+C of the terminal reaches the
-        launcher alone, which hands it to rank 0 only (run_distributed);
-      * SIGTERM when the launcher dies (PR_SET_PDEATHSIG), so no training
-        process is ever left running on a GPU whose lock is gone."""
     os.setpgrp()
     try:
         import ctypes
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)
     except Exception:
         pass
 
 
 def _stop(procs, grace_s=30.0):
-    """SIGTERM every running process, SIGKILL whatever is still alive after
-    `grace_s` (a process that does not die on SIGTERM)."""
     for p in procs:
         if p.poll() is None:
             try:
@@ -238,9 +177,6 @@ def _stop(procs, grace_s=30.0):
 
 
 def run_distributed(script, forwarded_args, world_size):
-    """Start `world_size` training processes and supervise them. Returns the
-    exit code of the run: 0 if every rank ended cleanly, else the first
-    failure's."""
     port = _free_port()
     procs = []
     for rank in range(world_size):
@@ -262,15 +198,6 @@ def run_distributed(script, forwarded_args, world_size):
           f"(pids {[p.pid for p in procs]}, rendezvous 127.0.0.1:{port})",
           flush=True)
 
-    # CTRL+C. Rank 0 alone gets it, and does what a single-GPU run does: it
-    # leaves the training loop and writes checkpoint_last. If it is waiting
-    # inside a collective at that moment, the collective still completes,
-    # because the other ranks did not get the signal and keep going. They are
-    # stopped once rank 0 has exited: they have nothing to save. Handing the
-    # signal to every rank, as the terminal would, can leave rank 0 waiting in
-    # a collective for ranks that have already left -- and never saving. A
-    # second Ctrl+C stops every process at once (the last checkpoint can then
-    # be lost).
     interrupt = {"count": 0, "since": None}
 
     def _on_sigint(_signum, _frame):
@@ -291,9 +218,6 @@ def run_distributed(script, forwarded_args, world_size):
             _stop(procs, grace_s=5.0)
             sys.exit(130)
 
-    # SIGTERM (kill): every process stops now, as a single-GPU run killed the
-    # same way does -- no last checkpoint, the run resumes from the last
-    # periodic one.
     def _on_sigterm(signum, _frame):
         print(f"[launcher] signal {signum}: stopping the training processes",
               file=sys.stderr, flush=True)
@@ -307,8 +231,6 @@ def run_distributed(script, forwarded_args, world_size):
     while True:
         alive = [p for p in procs if p.poll() is None]
         if interrupt["count"]:
-            # After a Ctrl+C only rank 0 matters: wait for it, then stop the
-            # others (they may be waiting for it inside a collective).
             if (procs[0].poll() is not None
                     or time.time() - interrupt["since"] > INTERRUPT_WAIT_S):
                 if procs[0].poll() is None:
@@ -334,12 +256,7 @@ def run_distributed(script, forwarded_args, world_size):
     return rc
 
 
-# ============================================================
-# MAIN
-# ============================================================
 if __name__ == "__main__":
-    # Parse only --num-gpus and --script; everything else is forwarded
-    # to training_cond.py
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--num-gpus", type=int, default=1,
                         help="Number of GPUs to lock (default: 1)")
@@ -354,7 +271,6 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(0)
 
-    # ---- one of the N training processes started by run_distributed ----
     if CHILD_RANK_ENV in os.environ:
         _rank = int(os.environ[CHILD_RANK_ENV])
         retrieve_parent_gpu_locks(_rank)
@@ -378,7 +294,6 @@ if __name__ == "__main__":
     if len(devices) > 1:
         sys.exit(run_distributed(args.script, forwarded_args, len(devices)))
 
-    # Replace sys.argv so the training script sees its own args (no --num-gpus)
     sys.argv = [args.script] + forwarded_args
 
     import runpy

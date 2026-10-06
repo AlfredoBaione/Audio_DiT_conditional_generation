@@ -1,65 +1,29 @@
-# ============================================================
-# PREPROCESSING CONFIG  (preprocess_stream.py --config <this file>)
-# ============================================================
-# Every key here is one long CLI flag, without the leading '--'.
-#
-# PRECEDENCE:  built-in defaults  <  this file  <  what you type on the CLI.
-# So the file is the memory of how a dataset is built, and a flag typed on the
-# command line always wins for a one-off. The run prints which keys the file
-# applied and which ones the command line overrode.
-#
-# An UNKNOWN key here is a hard error, not a silent no-op: a typo in the file
-# that records how a dataset was built must never look like a setting that did
-# nothing.
-#
-# What CANNOT be changed on an existing OUT dir: every parameter that decides
-# the audio bytes, which chunks survive, or the latent geometry. Those are
-# recorded in OUT/dataset_meta.json and a re-run that disagrees is refused --
-# use a fresh OUT dir instead. The split has the same protection in
-# OUT/splits.json (see --resplit).
+# Preprocessing (preprocess_stream.py). Every key is also a command-line flag
+# with the same name, which wins over this file.
 
-
-# ============================================================
-# PATHS
-# ============================================================
-# Both can also be given positionally: preprocess_stream.py SRC OUT
 source_dir: "./Entire_music_reduced"
 output_dir: "./dataset_ready_cond"
 
+# chunking (part of the dataset identity)
+codec:           "dac_44khz"   # dac_44khz (72-d, 86.13 frames/s) | encodec_32khz (128-d, 50 frames/s)
+sr:              null          # null = the codec's own rate
+chunk_duration:  5.0
+chunk_overlap:   0.0
+duration:        null          # trim each source to N seconds
+min_duration:    null          # drop sources shorter than this
+pad_last_chunk:  false
+keep_num_chunks_per_file: null
 
-# ============================================================
-# CHUNKING  (part of the dataset identity -- fixed once, forever)
-# ============================================================
-sr:              44100    # MUST be 44100: the DAC is the 44khz model
-chunk_duration:  5.0      # seconds per chunk
-chunk_overlap:   0.0      # seconds of overlap between consecutive chunks
-duration:        null     # trim each source to N seconds before chunking
-min_duration:    null     # drop sources shorter than this
-pad_last_chunk:  false    # keep the tail chunk, zero-padded
-keep_num_chunks_per_file: null   # keep only N chunks per source (linspace centers)
-
-
-# ============================================================
-# FILE / CHUNK GATES  (also part of the dataset identity)
-# ============================================================
-# Per-FILE: decide which sources are dropped entirely.
+# file / chunk gates
 silence_threshold: null
 max_silence_ratio: null
 peak_threshold:    1.0
 max_peak_ratio:    null
 no_clip:           false
-# Per-CHUNK: decide which chunks survive. Surviving chunks are RENUMBERED, so
-# changing these makes the same file name hold different audio.
 chunk_min_rms:     null
 chunk_min_peak:    null
 
-
-# ============================================================
-# ACOUSTIC TREATMENT  (off by default = supervisor-style loading)
-# ============================================================
-# ON = silence edge-trim + constant-gain loudness normalization + stereo split.
-# Switching it changes the latent statistics: the normalizer and the FD-DAC
-# reference must be refit in a FRESH cache dir.
+# acoustic treatment: true = silence trim + loudness normalization + stereo split
 acoustic_rules:   false
 target_lufs:      -18.0
 target_tp:        -1.0
@@ -69,191 +33,34 @@ silence_thresh_db: -60.0
 no_stereo_split:  false
 min_chunk_sec:    null
 
-
-# ============================================================
-# TRAIN / VAL / TEST SPLIT
-# ============================================================
-# Decided HERE, over the SOURCE FILES, and written to OUT/splits.json. The
-# training reads that file; it no longer computes a split of its own.
-#
-# Ratios apply per class (stratified) and must sum to 1.0. A class with a single
-# source goes entirely to train -- that is what keeps the split leakage-safe.
+# split (written once to OUT/splits.json)
 split_ratios: "0.8,0.1,0.1"
 split_seed:   42
-no_stratify:  false      # true = one global bucket instead of per-class balance
-
-# A re-run NEVER reassigns a source that already has a split; it only places the
-# new ones. Set resplit: true ONLY to deliberately redecide everything -- it
-# reshuffles train/val/test and invalidates every evaluation of a checkpoint
-# trained against the old assignment.
-resplit: false
-
-# Metadata-only modes (no decoding, no models loaded):
-#   split_only          -> just create/extend splits.json and exit
-#   import_legacy_split -> reproduce the split the TRAINING used to compute
-#                          in-code, for datasets built before the split moved
-#                          here (keeps runs already in flight reproducible)
-split_only:          false
+no_stratify:  false            # true = one global bucket instead of per-class balance
+resplit: false                 # true = redecide the whole split
+split_only:          false     # true = only create/extend splits.json
 import_legacy_split: false
 
-
-# ============================================================
-# OUTPUTS
-# ============================================================
-# Which splits get their per-chunk WAV written under wav/<class>/:
-#   "none" (default) | "all" | any subset of train,val,test  e.g. "val"
-#
-# These wavs are the REAL source audio -- they never pass through the DAC. They
-# are what a standard FAD reference is built from (metrics.fad_reference: "wav"
-# on the training side), which is why "val" is usually all you need: it costs
-# roughly a tenth of the disk of "all".
-save_wav: "none"
-
-# Frame conditions to extract into conditions/<class>/<chunk>.npz.
-# null = none. Example: "f0,energy,chroma". Adding one later is incremental:
-# the latents are NOT re-encoded, only the missing condition is extracted.
-conditions: null
-
-# Global conditions: "text", "image", or "text,image".
-# The flag is --global_conds, the same name as this key, like every other
-# option here. (--global is still accepted as an alias: it was the only
-# spelling until 14 Sept 2026 and it is in commands already written down.)
-#
-# INDEPENDENT of `conditions` above: either can be used alone, both together,
-# and each takes any subset. Adding one later is incremental in the same way --
-# no latent is re-encoded and no condition already on disk is dropped.
-#
-# The two are NOT written to the same place, because their values do not come
-# from the same thing:
-#   text  -> PER CHUNK, from that chunk's own audio (its CLAP embedding), so it
-#            lands in the SAME .npz as f0 and is extracted and resumed exactly
-#            like it. It is NOT the embedding of the class name.
-#            Also writes global_conditions/text_vocab.{npy,json}: the phrase
-#            list the validation panels use to put words next to a stored
-#            vector (a nearest-phrase retrieval, shown with its cosine -- CLAP
-#            cannot be run backwards).
-#   image -> PER CLASS, from image_root, into
-#            global_conditions/image/<class>.npy plus a .json naming the files
-#            in row order. EVERY picture of a class is encoded: the training
-#            draws one at random per epoch, so a cap here would silently cap
-#            that augmentation for every run that ever reads the dataset.
-#
-# COST: 'text' runs the CLAP audio encoder on EVERY chunk, so it wants the GPU
-# -- which it gets from `device` below (cond_device only needs setting if you
-# want the conditions on a different device from the DAC).
-global_conds: null
-image_root:   null        # image_root/<class>/*.jpg, for the image condition
-# Optional text file, one phrase per line, replacing the built-in label
-# vocabulary (conditions.py TEXT_LABEL_VOCAB, 52 phrases). Encoded once into
-# the dataset; editing it later re-labels every panel without re-touching audio.
-text_vocab:   null
-
-# How many TERMS the per-chunk text description carries, the class included:
-#   1 = the class alone        ("Sound_Violin")
-#   2 = class + nearest phrase ("Sound_Violin · \"a bowed tremolo\" (+0.31)")
-#   3 = class + the two nearest, and so on up to the vocabulary length.
-# With --global_conds text this is written for EVERY chunk into
-#   global_conditions/text_labels.jsonl      one row per chunk
-#   global_conditions/text_labels_cos.npy    the FULL cosine table, same order
-#   global_conditions/text_labels.json       what it was built from
-# and, for the DISTINCT captions only (with --global_conds text, which is what loads
-# the CLAP text tower):
-#   global_conditions/text_labels_emb.npy      their pooled CLAP TEXT embedding
-#   global_conditions/text_labels_tok.npy      the same captions as TOKEN
-#                                              sequences, (n, L, 768) float16
-#   global_conditions/text_labels_tok_len.npy  how many tokens of each are real
-#
-# WHAT READS WHAT. The pooled embeddings are the vector the AdaLN text slot
-# takes under conditioning.text_source = caption|mix, and what
-# sampling.validation_text_from_caption substitutes. The token sequences are
-# what model.text_cross_every attends over -- a pooled vector is a single key,
-# which is a learned bias and not an attention. A training run that asks for the
-# cross-attention on a dataset without them REFUSES TO START.
-#
-# DISTINCT ON THE ENCODED STRING, not on the human one: `drum · "edm" (+0.54)`
-# and the same phrase at (+0.53) are one input to CLAP and one row here, while
-# the per-chunk .jsonl keeps each chunk's own cosines.
-#
-# RE-RUNNING JUST FOR THESE. Point the same command at the same output dir: the
-# sources whose outputs are complete are skipped (no audio read, no latent
-# re-encoded) and only the sidecar is rewritten. It is rewritten whenever one of
-# the files above is missing, so a dataset built before they existed does NOT
-# need --force -- which would redo the whole pipeline.
-#
-# The .npy is why this number is not a commitment: another N is re-derived from
-# it without re-reading a single .npz. The training does NOT decide how many
-# phrases a panel shows -- it reads the caption the dataset carries.
-# The class is exact (the chunk's folder); the phrases are a closed-vocabulary
-# retrieval over the stored CLAP vector and are always shown with their cosine.
-# NB it also decides how much the text channel can carry: with 1 the caption IS
-# the class name, so under text_source=caption the slot becomes a label with as
-# many distinct values as there are classes.
-text_labels_n: 2
-
-# Flatten every source into one class directory.
+# outputs
+save_wav: "none"               # "none" | "all" | splits, e.g. "val"
+conditions: null               # e.g. "f0,chroma,rhythm,energy,chord,midi" (midi: song.mid next to the audio)
+global_conds: null             # "text" | "image" | "text,image"
+image_root:   null             # image_root/<class>/*.jpg
+text_vocab:   null             # phrase file, one per line; null = built-in vocabulary
+text_labels_n: 2               # terms of the per-chunk text: 1 = class, 2 = class + nearest phrase, ...
 single_class: false
 class_name:   null
+label_source: "dir"            # "dir" (class = folder) | "csv"
+label_csv:    null             # for label_source: csv
 
-
-# ============================================================
-# WHERE THE CLASS OF A SOURCE COMES FROM
-# ============================================================
-# The class is the OUTPUT FOLDER a source is encoded into, and everything
-# downstream reads it back from there: the stratified split, `_class_of_file`
-# in the training dataset, the per-class image bank, the panel captions.
-#
-#   dir  (default)  the source's own subdirectory, as it has always been.
-#                   SRC/rock/song.mp3 -> latents/rock/
-#   csv             a metadata file says which class each source is, and THAT
-#                   becomes its output folder. For corpora that ship one flat
-#                   audio folder plus a CSV -- the layout that has no directory
-#                   to read a class from. The raw audio is never moved: only the
-#                   encoded output is grouped by class.
-#
-# The CSV has one file column (named `file` or `filename`) and one label column
-# (`label` or `class`), case-insensitive, and every source file must have a row.
-# Two candidates for the same role is an error, not a guess: rename one. Rows are matched by path relative to source_dir, then by
-# bare file name, then by either of those case-insensitively. A bare name
-# claimed by two rows with DIFFERENT labels is a hard stop, and so is a source
-# with no row: the CSV is a text file under your control, so those are mistakes
-# to fix there rather than policies to choose per run.
-#
-# The label is used VERBATIM as the folder name, and it is also what a text
-# encoder is handed when the `text` condition is active -- so name classes as
-# plain words (`violin`, not `Sound_Violin`). Measured with clap-htsat-unfused:
-# mean cosine between four classes sharing a `Sound_` prefix 0.883, between the
-# bare nouns 0.103.
-#
-label_source: "dir"          # "dir" | "csv"
-label_csv:    null           # the metadata file, for label_source: csv
-
-
-# ============================================================
-# DEVICES / THROUGHPUT
-# ============================================================
-device:      "cuda"       # owns the DAC batch (main process)
-cond_device: null         # GPU-capable conditions (f0, rhythm); null = follow device
-skip_dac:    false        # everything except the DAC encode
-
-num_workers:       4      # CPU workers: load, chunk, CPU conditions, WAV writing
-batch_size:        16     # chunks per DAC forward
-loader_batch_size: 8      # chunks per worker IPC batch
-prefetch_factor:   1      # batches prefetched by EACH worker
+# execution
+device:      "cuda"
+cond_device: null              # null = same as device
+skip_dac:    false             # true = everything but the codec encode
+num_workers:       4
+batch_size:        16
+loader_batch_size: 8
+prefetch_factor:   1
 worker_start_method: "spawn"
-
-
-# ============================================================
-# RE-RUN BEHAVIOUR
-# ============================================================
-# A re-run is incremental by default and now also SKIPS ENTIRELY any source
-# whose outputs are all already present -- it is not even decoded. That check
-# reads the source manifest plus file headers, never the audio.
-#
-# force: recompute the chunks this run encounters (same parameters only). It is
-#        NOT a rebuild: outputs this run no longer produces are left in place.
-force: false
-
-# prune_orphans: delete the outputs of sources that no longer exist on disk.
-# Without it they keep feeding the normalizer and the training while
-# corresponding to nothing.
-prune_orphans: false
+force: false                   # true = recompute the chunks this run meets
+prune_orphans: false           # true = delete outputs of sources no longer on disk

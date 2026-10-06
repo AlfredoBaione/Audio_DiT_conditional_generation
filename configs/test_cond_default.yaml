@@ -1,0 +1,8 @@
+# Test of a checkpoint (test_cond.py). Layered on top of the checkpoint's own
+# training config; the command line wins over both.
+
+sampling:
+  n_metrics_samples: 512     # a number | all | 0 (panels only)
+  n_test_panels: 8           # 0 = none
+  n_probe_panels: 8          # 0 = none
+  n_audio_samples: 4

@@ -1,43 +1,4 @@
-# conditions.py
-#
-# Modular conditioning system for the Audio DiT.
-#
-# Design:
-#   - Centralised CONDITION_CONFIG: single source of truth for which
-#     conditions are active and how they are configured.
-#   - Every script (extract, dataset, training, sampling) reads from this
-#     config: change it in one place to change everything.
-#
-# To add a new condition:
-#   1. Write a class extending FrameConditionExtractor or GlobalConditionExtractor
-#   2. Add it to CONDITION_CONFIG
-#   3. Done -- dataset, training and sampling will use it automatically
-#
-# Two condition families:
-#
-#   FRAME-LEVEL (time-aligned, injected by CONCATENATION on the feature
-#   dimension at the model input, JASCO-style -- see network_cond.py):
-#     - chroma: chromagram CQT (12 pitch classes) -- harmony.
-#     - rhythm: per-frame beat + downbeat probability curves (2 channels)
-#               from beat_this (Music ControlNet-style rhythm control).
-#     - chord:  per-frame chord pitch classes (12) from crema's chord model
-#               (PyTorch port, crema_chord.py) -- harmony as a chord
-#               recognizer hears it, rather than raw pitch-class energy.
-#     [extensible: mfcc, spectral_centroid, ...]
-#
-#   GLOBAL (single vector per sample, injected via AdaLN as in the official
-#   DiT class label -- modulates every block) -- continuous only:
-#     - text:  CLAP text encoder
-#     - image: CLIP (from an image of the same class)
-#     [extensible: mood embedding, tempo embedding, ...]
-#
-# NB: LabelCondition was REMOVED. The `text` modality with CLAP (fed by the
-# class name) takes its place and will later allow free-form prompts without
-# any architecture change.
-#
-# Requirements:
-#   pip install librosa scipy transformers Pillow
-#   pip install beat_this            # beat/downbeat tracker (PyTorch, ISMIR 2024)
+# Conditions: registry and extractors (f0, chroma, rhythm, energy, chord, midi, text, image).
 
 import torch
 import torch.nn as nn
@@ -50,27 +11,14 @@ from typing import Dict, List, Optional
 from abc import ABC, abstractmethod
 
 
-# ============================================================
-# DAC CONSTANTS (consistent with audio_dataset_npy)
-# ============================================================
 DAC_SAMPLE_RATE  = 44100
 DAC_HOP_LENGTH   = 512
 DAC_FRAMES_PER_S = DAC_SAMPLE_RATE / DAC_HOP_LENGTH
 
+import latent_codec as _lc
 
-# ============================================================
-# BASE CLASSES
-# ============================================================
 
 class FrameConditionExtractor(ABC):
-    """
-    Extracts a frame-level condition from audio.
-    Output shape: (n_frames, dim)
-
-    Used by extract_conditions.py to pre-compute the conditions and save them
-    to disk (.npz), so that training is fast.
-    """
-
     @property
     @abstractmethod
     def name(self) -> str:
@@ -83,14 +31,6 @@ class FrameConditionExtractor(ABC):
 
     @abstractmethod
     def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
-        """
-        Args:
-            audio: (T,) waveform mono
-            sr:    sample rate
-            n_frames: target number of frames (alignment with DAC latents)
-        Returns:
-            (n_frames, self.dim) float32
-        """
         ...
 
     @staticmethod
@@ -106,26 +46,9 @@ class FrameConditionExtractor(ABC):
 
 
 def _projection_dim_from_config(model_name: str) -> Optional[int]:
-    """The width of a HuggingFace checkpoint's projected embedding, read off its
-    CONFIG -- a small JSON -- without building the model.
-
-    WHY IT EXISTS. `dim` is asked for in places that never encode anything: the
-    training reads it to size the AdaLN input projection, and the probe-cache
-    fingerprint reads it through dir(). Answering by instantiating the model
-    put the CLAP text tower on the TRAINING GPU (measured: 0.56 GB) and left it
-    there for the whole run, to obtain an integer that is written in the config
-    file. Every caller that actually encodes still loads the weights the usual
-    way, so nothing else changes.
-
-    Returns None when the config does not declare it (the caller then falls back
-    to loading the model, which is the answer of last resort but always right).
-    """
     try:
         from transformers import AutoConfig
         cfg = AutoConfig.from_pretrained(model_name)
-        # Composite configs (ClapConfig, CLIPConfig) carry projection_dim at the
-        # top level AND on each tower; the single-tower configs carry only their
-        # own. Take the first that answers -- they agree, and this works for both.
         for obj in (cfg,
                     getattr(cfg, "text_config", None),
                     getattr(cfg, "vision_config", None),
@@ -139,13 +62,6 @@ def _projection_dim_from_config(model_name: str) -> Optional[int]:
 
 
 class GlobalConditionExtractor(ABC):
-    """
-    Encodes a global condition (one continuous vector per sample).
-
-    NB: with LabelCondition removed, all global conditions are now continuous.
-    No categorical branch -> no Embedding lookup.
-    """
-
     @property
     @abstractmethod
     def name(self) -> str:
@@ -154,17 +70,10 @@ class GlobalConditionExtractor(ABC):
     @property
     @abstractmethod
     def dim(self) -> int:
-        """Embedding dimensionality."""
         ...
 
 
-# ============================================================
-# FRAME-LEVEL: CHROMAGRAM
-# ============================================================
-
 class ChromaExtractor(FrameConditionExtractor):
-    """Chromagram CQT. Output: (n_frames, 12) -> distribution over 12 pitch classes."""
-
     @property
     def name(self): return "chroma"
     @property
@@ -172,51 +81,17 @@ class ChromaExtractor(FrameConditionExtractor):
 
     def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
         import librosa
-        # tuning=0.0 -- chroma_cqt defaults to tuning=None, which makes librosa
-        # ESTIMATE the tuning of every chunk (estimate_tuning -> piptrack -> a
-        # numba gufunc that segfaults on the IRCAM nodes, in the worker and in
-        # the main process alike). 0.0 means A440, which is also what
-        # librosa.cqt itself defaults to -- so crema (crema_chord.py) never
-        # took that path and needs no change.
         chroma = librosa.feature.chroma_cqt(
             y=audio, sr=sr, tuning=0.0,
-            hop_length=DAC_HOP_LENGTH, n_chroma=12,
+            hop_length=_lc.active().hop_length, n_chroma=12,
         ).T
         return self._resample_to_frames(chroma, n_frames).astype(np.float32)
 
 
-# ============================================================
-# FRAME-LEVEL: RHYTHM (beat + downbeat, beat_this)
-# ============================================================
-
 class RhythmExtractor(FrameConditionExtractor):
-    """
-    Music ControlNet-style rhythm control: two per-frame probability curves,
-    one for beats and one for downbeats.
+    BEAT_THIS_FPS = 50.0
 
-    Backbone: beat_this (CPJKU, ISMIR 2024 -- "Beat This! Accurate Beat
-    Tracking Without DBN Postprocessing"). It is the modern, pip-installable,
-    PyTorch replacement for madmom's beat/downbeat tracker (madmom is pinned to
-    Python < 3.10 on PyPI and is painful to install on recent setups). beat_this
-    is from the same lab as madmom and needs no DBN/madmom postprocessing.
-
-    Pipeline:
-      1. beat_this Audio2Frames returns FRAMEWISE beat and downbeat LOGITS at
-         50 fps (its mel spectrogram uses sr=22050, hop=441 -> 22050/441 = 50).
-      2. sigmoid(logits) -> per-frame probabilities in [0, 1] (the continuous
-         beat/downbeat curves, as in Music ControlNet -- not hard impulses).
-      3. The two curves are stacked to (T_native, 2) and linearly interpolated
-         on the time axis to n_frames (DAC-aligned), then clamped to [0, 1].
-
-    Output: (n_frames, 2) float32 -- channel 0 = beat prob, channel 1 = downbeat prob.
-
-    Null rhythm = all zeros (no beats / no downbeats), consistent with the CFG
-    dropout and make_null_frame_conditions.
-    """
-
-    BEAT_THIS_FPS = 50.0  # beat_this framewise rate (22050 / 441)
-
-    _model = None  # process-wide singleton
+    _model = None
 
     def __init__(self, checkpoint: str = "final0", device: str = "cpu"):
         self.checkpoint = checkpoint
@@ -246,70 +121,23 @@ class RhythmExtractor(FrameConditionExtractor):
     def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
         model = self._get_model(self.checkpoint, self._device)
 
-        # beat_this accepts a numpy/torch signal directly and resamples to
-        # 22050 internally (via soxr). Returns framewise logits at 50 fps.
         beat_logits, downbeat_logits = model(audio.astype(np.float32), sr)
 
-        beat = torch.sigmoid(beat_logits.detach().float()).cpu().numpy()       # (T_native,)
-        downbeat = torch.sigmoid(downbeat_logits.detach().float()).cpu().numpy()  # (T_native,)
+        beat = torch.sigmoid(beat_logits.detach().float()).cpu().numpy()
+        downbeat = torch.sigmoid(downbeat_logits.detach().float()).cpu().numpy()
 
-        curves = np.stack([beat, downbeat], axis=-1)                           # (T_native, 2)
+        curves = np.stack([beat, downbeat], axis=-1)
         curves = self._resample_to_frames(curves, n_frames)
         return np.clip(curves, 0.0, 1.0).astype(np.float32)
 
 
-# ============================================================
-# FRAME-LEVEL: ENERGY / DYNAMICS (frequency-weighted spectral energy in dB)
-# ============================================================
-
 class EnergyExtractor(FrameConditionExtractor):
-    """
-    Music ControlNet-style "dynamics" control: a single per-frame curve that
-    tracks the perceived loudness / dynamics of the music (forte vs piano,
-    crescendo / diminuendo), NOT the per-note onset transients.
-
-    Convergent recipe across the controllable-music-generation literature
-    (Music ControlNet, Wu et al. 2024; MuseControlLite 2025; Audio ControlNet
-    2026; Controllable Video-to-Music 2025):
-
-      1. Frequency-weighted SPECTRAL ENERGY. We take the STFT power spectrogram
-         (hop = DAC_HOP_LENGTH, so frames align with the DAC latents like the
-         chroma) and weight the frequency bins BEFORE summing them, so the curve
-         reflects PERCEIVED intensity rather than raw sample energy:
-           - a high-pass cutoff (`fmin`) zeroes DC and sub-audible rumble
-             (relevant on classical recordings with room/handling noise);
-           - optional A-weighting (`weighting="A"`) applies the standard
-             perceptual loudness contour (librosa.A_weighting).
-         The weighted power is summed over frequency -> per-frame energy.
-
-      2. dB SCALE. The weighted power is averaged over frequency, square-rooted
-         to an amplitude-like RMS, and converted to ABSOLUTE dB (20*log10(rms+eps),
-         dBFS-like) -- NOT relative to the clip maximum. This keeps the dynamics
-         comparable across clips (absolute level is roughly equalised by the
-         loudnorm in preprocessing) and lets silence map to the floor.
-
-      3. SMOOTHING. A Savitzky-Golay filter over a ~`smooth_sec` window removes
-         the fast onset spikes, leaving the slow dynamic envelope.
-
-      4. NORMALISATION [-top_db, 0] dB -> [0, 1]: silence -> 0, full-scale -> 1.
-         This keeps the same non-negative range as the other frame conditions
-         and, crucially, makes the NULL condition (all zeros, used by CFG dropout
-         and make_null_frame_conditions) read as "silence", consistent with the
-         zeros-mean-absence convention of chroma / rhythm.
-
-    Output: (n_frames, 1) float32 in [0, 1].
-
-    Adherence is evaluated (in condition_metrics.py) with Pearson correlation
-    between the input curve and the one re-extracted from the generation, exactly
-    as Music ControlNet evaluates dynamics control.
-    """
-
     def __init__(self,
                  n_fft: int = 2048,
-                 weighting: str = "A",      # "A" (perceptual) or "none"
-                 fmin: float = 40.0,        # high-pass cutoff (Hz); 0 disables
-                 top_db: float = 80.0,      # dynamic range below the per-clip max
-                 smooth_sec: float = 1.0,   # Savitzky-Golay window (seconds)
+                 weighting: str = "A",
+                 fmin: float = 40.0,
+                 top_db: float = 80.0,
+                 smooth_sec: float = 1.0,
                  polyorder: int = 3):
         self.n_fft = int(n_fft)
         self.weighting = weighting
@@ -317,7 +145,7 @@ class EnergyExtractor(FrameConditionExtractor):
         self.top_db = float(top_db)
         self.smooth_sec = float(smooth_sec)
         self.polyorder = int(polyorder)
-        self._freq_gain = None      # cached linear power gain per FFT bin
+        self._freq_gain = None
         self._freq_gain_sr = None
 
     @property
@@ -329,126 +157,72 @@ class EnergyExtractor(FrameConditionExtractor):
         return 1
 
     def _frequency_gain(self, sr: int) -> np.ndarray:
-        """Per-FFT-bin multiplicative gain applied to the POWER spectrogram.
-        Cached per (sr, params). High-pass mask * (optional) A-weighting."""
         if self._freq_gain is not None and self._freq_gain_sr == sr:
             return self._freq_gain
         import librosa
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=self.n_fft)  # (n_fft//2+1,)
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=self.n_fft)
         gain = np.ones_like(freqs, dtype=np.float64)
         if self.weighting == "A":
-            # A_weighting returns dB; convert to a LINEAR POWER gain (10^(dB/10)).
-            # At f=0 it is -inf dB (log10(0)); the high-pass below zeroes that
-            # bin anyway, so the warning is harmless -- silence it.
             with np.errstate(divide="ignore"):
                 a_db = librosa.A_weighting(freqs)
             gain = gain * (10.0 ** (a_db / 10.0))
         if self.fmin > 0:
-            gain[freqs < self.fmin] = 0.0                          # high-pass
+            gain[freqs < self.fmin] = 0.0
         self._freq_gain = np.nan_to_num(gain, nan=0.0, posinf=0.0,
                                         neginf=0.0).astype(np.float64)
         self._freq_gain_sr = sr
         return self._freq_gain
 
-    def _savgol(self, x: np.ndarray) -> np.ndarray:
-        """Savitzky-Golay smoothing with a window sized in seconds, guarded for
-        short clips (window must be odd, > polyorder, and <= len(x))."""
+    def _savgol(self, x: np.ndarray, fps: Optional[float] = None) -> np.ndarray:
         from scipy.signal import savgol_filter
-        win = int(round(self.smooth_sec * DAC_FRAMES_PER_S))
+        win = int(round(self.smooth_sec * _lc.active_fps(fps)))
         if win % 2 == 0:
-            win += 1                          # must be odd
+            win += 1
         win = max(win, self.polyorder + 2)
         if win % 2 == 0:
             win += 1
-        if win > len(x):                      # clip too short -> shrink window
+        if win > len(x):
             win = len(x) if len(x) % 2 == 1 else len(x) - 1
         if win <= self.polyorder:
-            return x                          # not enough frames to smooth
+            return x
         return savgol_filter(x, window_length=win, polyorder=self.polyorder)
 
     def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
         import librosa
-        # 1. STFT magnitude spectrogram, hop aligned to DAC frames (like chroma).
+        hop = _lc.active().hop_length
         S = np.abs(librosa.stft(y=audio.astype(np.float32),
-                                n_fft=self.n_fft, hop_length=DAC_HOP_LENGTH))  # (freq, T)
+                                n_fft=self.n_fft, hop_length=hop))
 
-        # 2. Frequency weighting on the magnitude. _frequency_gain is a POWER
-        #    gain, so we apply sqrt(gain) to the magnitude => magnitude^2 carries
-        #    the intended power weighting (high-pass + optional A-weighting).
-        gain = self._frequency_gain(sr)                    # power gain, (freq,)
+        gain = self._frequency_gain(sr)
         S_w = S * np.sqrt(gain)[:, None]
 
-        # 3. Per-frame RMS from the weighted spectrogram. librosa.feature.rms(S=)
-        #    is correctly normalized (time-domain-consistent, window-aware), so
-        #    the dB scale below is properly calibrated -- unlike a raw bin sum.
         rms = librosa.feature.rms(S=S_w, frame_length=self.n_fft,
-                                  hop_length=DAC_HOP_LENGTH)[0]   # (T,)
+                                  hop_length=hop)[0]
 
-        # 4. ABSOLUTE dB (not relative to the clip max): 20*log10(rms + eps).
-        #    Keeps dynamics comparable across clips (level roughly equalised by
-        #    the preprocessing loudnorm); silence maps to the floor.
         energy_db = 20.0 * np.log10(rms + 1e-7)
 
-        # 5. Smooth the dynamic envelope (remove onset spikes).
-        energy_db = self._savgol(energy_db)
+        energy_db = self._savgol(energy_db, fps=sr / hop)
 
-        # 6. Normalise [-top_db, 0] dB -> [0, 1] (silence -> 0, full-scale -> 1).
-        #    The NULL condition (all zeros) therefore reads as silence, matching
-        #    the zeros-mean-absence convention of chroma / rhythm.
         energy_norm = np.clip((energy_db + self.top_db) / self.top_db, 0.0, 1.0)
 
-        # 7. Align to the DAC-aligned n_frames and shape (n_frames, 1).
         energy_norm = self._resample_to_frames(energy_norm, n_frames)
         return energy_norm.reshape(n_frames, 1).astype(np.float32)
 
 
-# ============================================================
-# FRAME-LEVEL: F0 (CREPE, monophonic pitch contour)
-# ============================================================
-
 class CrepeF0Extractor(FrameConditionExtractor):
-    """
-    Monophonic fundamental-frequency (f0) contour from CREPE, via the torch-native
-    `torchcrepe` backend (NOT the TensorFlow `crepe` package -- the project runs
-    with USE_TF=0). It is the project's ONLY pitch condition:
-      * f0      -> a single continuous pitch curve, for monophonic / lead-line
-                   control (bass line, solo voice, lead instrument in front).
-
-    Pipeline (mirrors the other frame extractors' DAC alignment, hardened per the
-    f0 review):
-      1. resample to 16 kHz mono (torchcrepe's operating rate);
-      2. torchcrepe.predict -> per-frame pitch (Hz) + periodicity (voicing conf.);
-      3. voicing decision BEFORE any zeroing: median-filter periodicity, gate out
-         silent frames (local RMS < silence_db), threshold, and drop voiced runs
-         shorter than min_voiced_frames;
-      4. normalize pitch on a LOG scale in [0,1] over ALL frames (no zeros yet, so
-         interpolation never sees an injected 0 -> no phantom pitch ramps);
-      5. resample SEPARATELY to the DAC-aligned n_frames -- pitch linearly, the
-         voiced mask with nearest -- then re-apply the mask;
-      6. map voiced pitch to [voiced_floor, 1], reserving 0 EXCLUSIVELY for
-         "unvoiced/absent" (so 0 is never confused with pitch==fmin).
-
-    Output: (n_frames, dim). dim=2 (default, with_periodicity=True) ->
-    [pitch_norm, periodicity]; dim=1 -> [pitch_norm]. Both channels are 0 on
-    unvoiced frames, matching the zeros-mean-absence convention of the other
-    conditions, so the CFG NULL condition reads as fully unvoiced.
-
-    Requires: pip install torchcrepe
-    """
-
     def __init__(self,
                  fmin: float = 50.0,
                  fmax: float = 1000.0,
-                 model: str = "full",              # "full" or "tiny"
+                 model: str = "full",
                  voicing_threshold: float = 0.5,
-                 with_periodicity: bool = True,     # 2 channels [pitch, periodicity]
+                 with_periodicity: bool = True,
                  hop_ms: float = 10.0,
-                 silence_db: float = -60.0,         # frames quieter than this -> unvoiced
-                 median_win: int = 3,               # median filter on periodicity (odd, 0=off)
-                 min_voiced_frames: int = 3,        # drop voiced runs shorter than this
-                 voiced_floor: float = 0.05,        # voiced pitch mapped to [floor, 1]
-                 device: Optional[str] = "cpu",     # set "cuda" in CONFIG for speed
-                 batch_size: int = 64):             # CREPE frames per inference batch
+                 silence_db: float = -60.0,
+                 median_win: int = 3,
+                 min_voiced_frames: int = 3,
+                 voiced_floor: float = 0.05,
+                 device: Optional[str] = "cpu",
+                 batch_size: int = 64):
         self.fmin = float(fmin)
         self.fmax = float(fmax)
         self.model = model
@@ -481,7 +255,7 @@ class CrepeF0Extractor(FrameConditionExtractor):
         if sr != CR:
             import librosa
             y = librosa.resample(y, orig_sr=sr, target_sr=CR)
-        wav = torch.from_numpy(y).unsqueeze(0)               # [1, t] @16k
+        wav = torch.from_numpy(y).unsqueeze(0)
 
         hop = max(1, int(round(self.hop_ms / 1000.0 * CR)))
         dev = self.device
@@ -493,44 +267,35 @@ class CrepeF0Extractor(FrameConditionExtractor):
             model=self.model, return_periodicity=True,
             batch_size=self.batch_size, device=dev,
         )
-        pitch = pitch.squeeze(0).cpu().numpy().astype(np.float64)         # (F,) Hz
-        periodicity = periodicity.squeeze(0).cpu().numpy().astype(np.float64)  # (F,)
+        pitch = pitch.squeeze(0).cpu().numpy().astype(np.float64)
+        periodicity = periodicity.squeeze(0).cpu().numpy().astype(np.float64)
         F = pitch.shape[0]
-        if F < 2:                                            # degenerate -> unvoiced
+        if F < 2:
             return np.zeros((n_frames, self.dim), dtype=np.float32)
 
-        # --- voicing decision (periodicity + silence + cleanup), BEFORE any zeroing ---
         per_s = self._median_filter(periodicity, self.median_win)
         silent = self._silence_mask(y, hop, F, self.silence_db)
         voiced = (per_s >= self.voicing_threshold) & (~silent)
         voiced = self._remove_short_runs(voiced, self.min_voiced_frames)
 
-        # --- pitch normalized on a LOG scale over ALL frames (no zeros injected) ---
         lo, hi = np.log2(self.fmin), np.log2(self.fmax)
         pf = np.clip(pitch, self.fmin, self.fmax)
         pnorm_all = ((np.log2(pf) - lo) / (hi - lo + 1e-8)).astype(np.float64)
 
-        # --- SEPARATE resampling to n_frames (report #3 of the f0 review) ---
-        # pitch: linear (smooth contour, interpolated from REAL pitch values, so no
-        #        artificial ramps toward zero at voiced/unvoiced boundaries);
-        # mask : nearest (crisp voiced/unvoiced boundaries);
-        # then RE-APPLY the mask to the pitch. Zero is thus reserved for absence.
         pnorm_r = self._resample_to_frames(pnorm_all.reshape(-1, 1), n_frames)[:, 0]
         mask_r  = self._resample_nearest(voiced.astype(np.float64), n_frames) > 0.5
         per_r   = self._resample_to_frames(per_s.reshape(-1, 1), n_frames)[:, 0]
 
-        # voiced pitch mapped to [voiced_floor, 1] so that 0 means ONLY "unvoiced"
         pitch_ch = np.where(
             mask_r, self.voiced_floor + (1.0 - self.voiced_floor) * pnorm_r, 0.0)
 
         if self.with_periodicity:
-            per_ch = np.where(mask_r, per_r, 0.0)            # 0 at unvoiced too
-            feat = np.stack([pitch_ch, per_ch], axis=-1)     # (n_frames, 2)
+            per_ch = np.where(mask_r, per_r, 0.0)
+            feat = np.stack([pitch_ch, per_ch], axis=-1)
         else:
-            feat = pitch_ch.reshape(-1, 1)                   # (n_frames, 1)
+            feat = pitch_ch.reshape(-1, 1)
         return feat.astype(np.float32)
 
-    # ---- f0 post-processing helpers (numpy; no unverifiable torchcrepe APIs) ----
     @staticmethod
     def _median_filter(x: np.ndarray, win: int) -> np.ndarray:
         if win and win >= 3:
@@ -540,8 +305,6 @@ class CrepeF0Extractor(FrameConditionExtractor):
 
     @staticmethod
     def _silence_mask(y16k: np.ndarray, hop: int, F: int, silence_db: float) -> np.ndarray:
-        """Per-CREPE-frame silence gate: True where the local RMS is below
-        silence_db. Local energy is a box-smoothed y^2 sampled at frame centers."""
         win = max(hop, 1024)
         energy = np.convolve((y16k.astype(np.float64) ** 2),
                              np.ones(win) / win, mode="same")
@@ -552,7 +315,6 @@ class CrepeF0Extractor(FrameConditionExtractor):
 
     @staticmethod
     def _remove_short_runs(mask: np.ndarray, min_len: int) -> np.ndarray:
-        """Set voiced runs shorter than min_len frames back to unvoiced."""
         if min_len <= 1 or mask.size == 0:
             return mask
         out = mask.copy()
@@ -580,75 +342,12 @@ class CrepeF0Extractor(FrameConditionExtractor):
         return f(np.linspace(0, 1, target_len))
 
 
-# ============================================================
-# FRAME-LEVEL: CHORD (crema's chord model, PyTorch port)
-# ============================================================
-
 class CremaChordExtractor(FrameConditionExtractor):
-    """
-    Harmony as a chord recognizer hears it: per frame, the probability that
-    each of the 12 pitch classes (C, C#, ..., B) belongs to the chord being
-    played -- crema's `chord_pitch` output. Output (n_frames, 12) in [0, 1],
-    the same shape as chroma.
-
-    Versus chroma: chroma measures how much ENERGY each pitch class has, so a
-    melody note, an overtone or a drum hit light it up as much as the chord
-    does. chord_pitch is the answer of a network trained to name chords
-    (McFee & Bello, ISMIR 2017): which notes make up the chord. A frame with
-    no chord (crema's N) is all near 0, which is also what the null condition
-    of CFG dropout means here.
-
-    Backbone: crema_chord.py, a PyTorch port of crema that loads its original
-    weights (crema_chord_weights.npz, next to it). Verified against the
-    original (Keras 2) on real chunks, whole tracks and edge cases: features
-    bit-identical, outputs within 3e-6. On a new machine:
-        python crema_chord.py --selftest
-
-    Pipeline:
-      1. crema's HCQT front-end on the chunk (44.1 kHz, 10.77 frames/s);
-      2. the network -> chord_pitch, (T_native, 12);
-      3. aligned to the DAC frames ON THE TIME AXIS: crema frame k is centred
-         on k*4096/44100 s, DAC frame j on j*512/44100 s (the convention the
-         chroma condition follows), linear interpolation, first and last crema
-         frame held at the ends. Not _resample_to_frames: that maps the first
-         and last frame onto the chunk's ends, and crema's last frame of a 5 s
-         chunk sits at 4.83 s, not 4.99 s -- an 8x slower rate makes that
-         stretch visible;
-      4. SILENCE GATE: DAC frames whose RMS is below `silence_db` (dBFS,
-         window of 4 DAC hops) are set to 0 = no chord;
-      5. clipped to [0, 1].
-
-    WHY THE GATE: crema reads every excerpt relative to its own loudest bin,
-    so it has no notion of absolute level -- measured: a C major triad gets
-    the same answer at -20 and at -90 dBFS -- and it "hears" a chord in
-    silence too: on the silent frames of real chunks (3.3% of the frames of
-    the instruments set) it put up to 0.3-0.9 on arbitrary pitch classes.
-    Zeros mean absence for every frame condition here (and are the null of
-    CFG dropout), so silence has to be zeros. -60 dBFS is the f0 extractor's
-    silence_db and the dataset's gate. The gate is on the extractor, not on
-    the port: crema_chord.py reproduces crema as it is.
-
-    CONTEXT, measured (3 tracks, 12.8k frames): crema reads whole tracks.
-    Given 5 s chunks, as here, it names the same chord as on the whole track
-    in 58% of the frames (cosine of the 12-d vectors 0.91). The cause is the
-    network's context -- fed full-track features but seeing 5 s it agrees 62%
-    of the time -- not the chunk's level normalization or its edges (about 2
-    points each). The training target and the adherence re-extraction (from a
-    5 s generation) both see 5 s, so they are consistent with each other.
-
-    Cost: CPU, in the preprocessing workers like chroma. The librosa HCQT is
-    ~80-150 ms per 5 s chunk (chroma_cqt ~100 ms), the network ~8 ms on one
-    thread. Deliberately NO device attribute: preprocess_stream moves
-    extractors that have one into the main process, next to the DAC, where
-    this CPU-bound work would run serially.
-    """
-
-    _models: dict = {}   # weights path -> crema_chord.CremaChord, per process
+    _models: dict = {}
 
     def __init__(self, silence_db: Optional[float] = -60.0,
                  weights: Optional[str] = None):
         from crema_chord import DEFAULT_WEIGHTS, file_sha1
-        # None disables the gate (crema's raw answer, silence included).
         self.silence_db = None if silence_db is None else float(silence_db)
         self._weights = str(weights or DEFAULT_WEIGHTS)
         if not Path(self._weights).is_file():
@@ -656,8 +355,6 @@ class CremaChordExtractor(FrameConditionExtractor):
                 f"CremaChordExtractor: weights not found at {self._weights}. "
                 f"crema_chord_weights.npz ships next to crema_chord.py -- copy "
                 f"it along with the code.")
-        # Content identity of the weights: the probe cache fingerprint reads
-        # public scalar attributes, and a path would differ between machines.
         self.weights_sha1 = file_sha1(self._weights)
 
     @property
@@ -679,16 +376,17 @@ class CremaChordExtractor(FrameConditionExtractor):
     def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
         from crema_chord import CREMA_FPS
         y = np.asarray(audio, dtype=np.float32)
-        pitch = self._get_model().outputs(y, sr)["chord_pitch"]   # (T, 12)
-        if pitch.shape[0] == 0:          # shorter than one crema hop
+        pitch = self._get_model().outputs(y, sr)["chord_pitch"]
+        if pitch.shape[0] == 0:
             return np.zeros((n_frames, self.dim), dtype=np.float32)
         t_src = np.arange(pitch.shape[0]) / CREMA_FPS
-        t_dst = np.arange(n_frames) / DAC_FRAMES_PER_S
+        fps = _lc.active_fps()
+        t_dst = np.arange(n_frames) / fps
         out = np.stack([np.interp(t_dst, t_src, pitch[:, c])
                         for c in range(pitch.shape[1])], axis=1)
         if self.silence_db is not None:
             import librosa
-            hop = max(1, int(round(sr / DAC_FRAMES_PER_S)))   # one DAC frame
+            hop = max(1, int(round(sr / fps)))
             rms = librosa.feature.rms(y=y, frame_length=4 * hop,
                                       hop_length=hop)[0]
             rms_db = 20.0 * np.log10(rms + 1e-12)
@@ -698,72 +396,143 @@ class CremaChordExtractor(FrameConditionExtractor):
         return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
-# ============================================================
-# GLOBAL: TEXT with CLAP (music-aware)
-# ============================================================
+MIDI_LOWEST_KEY = 21
+MIDI_N_KEYS = 88
+MIDI_DRUM_CLASSES = (
+    ("kick", (36, 35)),
+    ("snare", (38, 27, 28, 31, 32, 33, 34, 37, 39, 40, 56, 65, 66, 75, 85)),
+    ("hihat_closed", (42, 44, 54, 68, 69, 70, 71, 73, 78, 80, 22)),
+    ("hihat_open", (46, 67, 72, 74, 79, 81, 26)),
+    ("tom_low", (45, 29, 41, 43, 61, 64, 84)),
+    ("tom_mid", (48, 47, 60, 63, 77, 86, 87)),
+    ("tom_high", (50, 30, 62, 76, 83)),
+    ("crash", (49, 52, 55, 57, 58)),
+    ("ride", (51, 53, 59, 82)),
+)
+MIDI_DRUM_CLASS_OF = {p: k for k, (_n, ps) in enumerate(MIDI_DRUM_CLASSES)
+                      for p in ps}
+MIDI_DIM = 2 * MIDI_N_KEYS + len(MIDI_DRUM_CLASSES)
+
+
+def read_midi_notes(path) -> list:
+    import mido
+    mf = mido.MidiFile(str(path))
+    t, open_notes, notes = 0.0, {}, []
+    for msg in mf:
+        t += msg.time
+        if msg.type not in ("note_on", "note_off"):
+            continue
+        key = (msg.channel, msg.note)
+        if msg.type == "note_on" and msg.velocity > 0:
+            open_notes.setdefault(key, []).append(t)
+        elif open_notes.get(key):
+            notes.append((open_notes[key].pop(0), t, msg.note,
+                          msg.channel == 9))
+    for (channel, note), starts in open_notes.items():
+        notes.extend((s, t, note, channel == 9) for s in starts)
+    notes.sort()
+    return notes
+
+
+def midi_notes_to_roll(notes, n_frames: int, t0: float = 0.0,
+                       fps: Optional[float] = None) -> np.ndarray:
+    fps = _lc.active_fps(fps)
+    n_frames = int(n_frames)
+    roll = np.zeros((n_frames, MIDI_DIM), dtype=np.float32)
+    end = n_frames / float(fps)
+    n_keys, drum0 = MIDI_N_KEYS, 2 * MIDI_N_KEYS
+    for onset, offset, pitch, is_drum in notes:
+        s, e = float(onset) - t0, float(offset) - t0
+        if e <= 0.0 or s >= end:
+            continue
+        a = int(round(s * fps))
+        if is_drum:
+            k = MIDI_DRUM_CLASS_OF.get(int(pitch))
+            if k is not None and s >= 0.0 and a < n_frames:
+                roll[a, drum0 + k] = 1.0
+            continue
+        key = int(pitch) - MIDI_LOWEST_KEY
+        if not 0 <= key < n_keys:
+            continue
+        lo = max(a, 0)
+        hi = min(max(int(round(e * fps)), a + 1), n_frames)
+        if hi > lo:
+            roll[lo:hi, key] = 1.0
+        if s >= 0.0 and a < n_frames:
+            roll[a, n_keys + key] = 1.0
+    return roll
+
+
+def midi_roll_to_events(roll, fps: Optional[float] = None):
+    fps = _lc.active_fps(fps)
+    r = np.asarray(roll, dtype=np.float32)
+    n_keys, drum0 = MIDI_N_KEYS, 2 * MIDI_N_KEYS
+    sounding = r[:, :n_keys] >= 0.5
+    onsets = r[:, n_keys:drum0] >= 0.5
+    T = r.shape[0]
+    pitched = []
+    for a, k in zip(*np.nonzero(onsets)):
+        b = a + 1
+        while b < T and sounding[b, k] and not onsets[b, k]:
+            b += 1
+        pitched.append((a / fps, b / fps, int(k) + MIDI_LOWEST_KEY))
+    pitched.sort()
+    drums = sorted((a / fps, int(k))
+                   for a, k in zip(*np.nonzero(r[:, drum0:] >= 0.5)))
+    return pitched, drums
+
+
+class MidiExtractor(FrameConditionExtractor):
+    companion_suffixes = (".mid", ".midi")
+    lowest_key = MIDI_LOWEST_KEY
+    n_keys = MIDI_N_KEYS
+    n_drum_classes = len(MIDI_DRUM_CLASSES)
+
+    def __init__(self, device: str = "cpu"):
+        from midi_transcriber import MODEL_NAME, REVISION
+        self.device = str(device)
+        self.transcriber = f"YourMT3+ {MODEL_NAME} @ {REVISION[:8]}"
+
+    @property
+    def name(self) -> str:
+        return "midi"
+
+    @property
+    def dim(self) -> int:
+        return MIDI_DIM
+
+    def load_companion(self, path) -> list:
+        return read_midi_notes(path)
+
+    def from_companion(self, notes, t0: float, n_frames: int) -> np.ndarray:
+        return midi_notes_to_roll(notes, n_frames, t0=float(t0))
+
+    def from_notes(self, notes, n_frames: int) -> np.ndarray:
+        return midi_notes_to_roll(notes, n_frames, t0=0.0)
+
+    def prepare(self):
+        from midi_transcriber import YourMT3Transcriber
+        YourMT3Transcriber(self.device).load()
+
+    def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
+        from midi_transcriber import YourMT3Transcriber
+        notes = YourMT3Transcriber(self.device).transcribe(audio, sr)
+        return midi_notes_to_roll([(o, e, p, d) for o, e, p, d, _prog in notes],
+                                  n_frames)
+
 
 class CLAPTextCondition(GlobalConditionExtractor):
-    """
-    Encodes text with the CLAP text encoder.
-
-    CLAP is a dual-encoder model (audio + text) trained on audio-text pairs.
-    The text encoder lives in the same space as the audio encoder, so the
-    embedding of "baroque sacred music" is *close* to the audio embeddings of
-    baroque sacred music. For conditioning a musical generative model this is
-    more appropriate than a generic sentence-transformer.
-
-    Implementation: uses ClapTextModelWithProjection (not ClapModel), which is
-    the canonical API to extract the projected text embedding. It exposes an
-    explicit .text_embeds field, robust to signature changes of
-    ClapModel.get_text_features across transformers versions.
-
-    Available models, with what they scored here (6 Sept 2026, measured on 120
-    Museart clips, 40 per class, plus a sanity check on four unmistakable
-    synthetic sounds -- sine / white noise / silence / siren -- each against its
-    own description). "retrieval" is 3-way class accuracy from the audio
-    (chance 33.3%), "margin" the mean gap between the right description's score
-    and the best wrong one, "sep" the audio-audio cosine within a class minus
-    between classes:
-
-        - 'laion/clap-htsat-unfused'     sanity 4/4  83.3%  +0.192  +0.260  <- default
-        - 'laion/larger_clap_general'    sanity 4/4  80.0%  +0.121  +0.221
-        - 'laion/clap-htsat-fused'       sanity 4/4  75.0%  +0.079  +0.199
-        - 'laion/larger_clap_music'      sanity 1/4  BROKEN -- DO NOT USE
-
-    THE MUSIC-SPECIALISED CHECKPOINT IS BROKEN and was this file's default until
-    the day those numbers were measured. Both its towers emit near-constant
-    embeddings: its softmax over the four synthetic sounds is a flat 0.250 on
-    every cell, and audio-text cosines sit at ~0.01 whatever the pair. It is the
-    published checkpoint, not the code: the weights (projections included) load
-    correctly, the feature extractor is configured as the model expects
-    (enable_fusion=False, rand_trunc, repeatpad), and transformers 4.57.6 and
-    5.16.1 behave identically. Nothing here had ever run it -- enabled_global
-    was [] -- so no past result is affected, but it would have made both the
-    text condition and its influence metric silently meaningless.
-
-    A degenerate checkpoint fails SILENTLY: the embeddings look healthy (finite,
-    unit norm, right dtype and shape) and only their spread gives it away. Run
-    the synthetic sanity check before trusting any CLAP number from a checkpoint
-    that has not been measured here.
-    """
-
     def __init__(self, model_name: str = "laion/clap-htsat-unfused"):
         self.model_name = model_name
         self._model = None
         self._processor = None
         self._dim = None
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        # The audio tower, built only if encode_audio is ever called (see below).
         self._audio_embedder = None
 
     def _load(self):
         if self._model is not None:
             return
-        # ClapTextModelWithProjection is the canonical API to extract the
-        # projected text embedding in the shared audio-text space. It returns an
-        # object with a .text_embeds field, independent of the transformers
-        # version (ClapModel.get_text_features changed signature across recent
-        # versions).
         from transformers import ClapTextModelWithProjection, AutoTokenizer
         self._model = ClapTextModelWithProjection.from_pretrained(self.model_name)
         self._processor = AutoTokenizer.from_pretrained(self.model_name)
@@ -777,8 +546,6 @@ class CLAPTextCondition(GlobalConditionExtractor):
     def name(self): return "text"
     @property
     def dim(self):
-        # From the CONFIG first: asking for the width must not put a second
-        # checkpoint on the GPU (see _projection_dim_from_config).
         if self._dim is None:
             self._dim = _projection_dim_from_config(self.model_name)
         if self._dim is None:
@@ -787,18 +554,16 @@ class CLAPTextCondition(GlobalConditionExtractor):
 
     @torch.no_grad()
     def encode_text(self, text: str) -> np.ndarray:
-        """Encode a single string -> (dim,) L2-normalized embedding."""
         self._load()
         inputs = self._processor([text], return_tensors="pt", padding=True)
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         out = self._model(**inputs)
-        feat = out.text_embeds   # (1, dim) — gia' proiettato
+        feat = out.text_embeds
         feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
         return feat.squeeze(0).cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
     def encode_batch(self, texts: List[str]) -> np.ndarray:
-        """Encode a list of strings -> (N, dim) all L2-normalized."""
         self._load()
         inputs = self._processor(list(texts), return_tensors="pt", padding=True)
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
@@ -809,41 +574,11 @@ class CLAPTextCondition(GlobalConditionExtractor):
 
     @property
     def ctx_dim(self) -> int:
-        """Width of ONE token state -- the text tower's hidden size (768 for
-        clap-htsat-unfused), NOT `dim`. See encode_tokens for why the two
-        differ."""
         self._load()
         return int(self._model.config.hidden_size)
 
     @torch.no_grad()
     def encode_tokens(self, texts: List[str]):
-        """Encode strings -> ((N, Lmax, ctx_dim) float32, (N,) int32 lengths).
-
-        The TOKEN-LEVEL states of CLAP's text tower: one vector per token
-        instead of one per string. This is what a cross-attention needs, and it
-        is exactly what `encode_batch` cannot give -- the projected embedding is
-        a single vector, and an attention with one key is a learned bias, not an
-        attention.
-
-        PRE-PROJECTION ON PURPOSE, hence `ctx_dim` (768) and not `dim` (512).
-        The 512-d shared space is where audio and text are COMPARED, which is
-        what the pooled condition and the similarity metric need; the 768-d
-        token states are where the individual words still are, and the model
-        learns its own way into them through K and V. Projecting them down to
-        512 first would spend a compression on the one thing this path exists
-        to keep.
-
-        Rows are padded with zeros to the longest string in `texts` and the
-        TRUE LENGTH is returned beside them. The padding is zeroed here as well
-        as masked later: padding that reaches K and V is padding the model reads
-        as words, and a mask lost somewhere between here and the network would
-        then fail silently rather than loudly.
-
-        NOT L2-normalized, unlike every other method on this class. There is no
-        shared space to normalize into here, and scaling each token to unit norm
-        would erase the only cue that distinguishes a content word from a
-        separator.
-        """
         self._load()
         inputs = self._processor(list(texts), return_tensors="pt", padding=True)
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
@@ -855,33 +590,6 @@ class CLAPTextCondition(GlobalConditionExtractor):
         return (h.cpu().numpy().astype(np.float32),
                 lengths.cpu().numpy().astype(np.int32))
 
-    # ---- AUDIO SIDE: what the preprocessing actually stores ---------------
-    #
-    # The condition is called "text" because that is the SLOT, and text is what
-    # it receives at inference. At TRAINING time the stored value is the CLAP
-    # embedding of the chunk's own AUDIO (the AudioLDM arrangement): CLAP's two
-    # towers share one space, so a vector from the audio encoder and one from
-    # the text encoder are interchangeable in that slot, and a model trained on
-    # the first accepts the second.
-    #
-    # WHY NOT THE CLASS NAME, which is what the preprocessing used to store:
-    # one embedding per class makes the text condition carry exactly one bit --
-    # the category -- and the image condition, drawn from that same class,
-    # carries the same one. Two conditions saying the identical thing cannot be
-    # told apart in an ablation. The per-chunk audio embedding makes text a
-    # signal that varies WITHIN a class and leaves image as the categorical one.
-    #
-    # TWO CAVEATS, both accepted deliberately when this was chosen:
-    #   * at training the condition is computed from the very audio the model
-    #     has to produce, so it contains the answer and the text-influence
-    #     metric is flattering by construction. Read it knowing that.
-    #   * the two towers share a space but do not sit exactly on top of each
-    #     other, so a text vector at inference is not drawn from quite the same
-    #     cloud as the audio vectors seen in training.
-    #
-    # The audio tower is a SECOND checkpoint load, so it is built lazily and
-    # only in the process that extracts: a run that merely reads back stored
-    # embeddings never pays for it.
 
     def _audio_side(self):
         if self._audio_embedder is None:
@@ -891,18 +599,9 @@ class CLAPTextCondition(GlobalConditionExtractor):
 
     @torch.no_grad()
     def encode_audio(self, wav_np: np.ndarray, sr: int) -> np.ndarray:
-        """(T,) waveform -> (dim,) L2-normalized embedding, in the SAME space as
-        encode_text.
-
-        The PRESENCE of this method is what marks a global condition as
-        computable per chunk (preprocess_stream._global_is_chunk_level), so it
-        rides the same extraction path as f0 instead of the per-class one. A
-        global condition without it is a per-class one, and the two need no
-        registry of names to tell apart."""
         return self._audio_side().embed(wav_np, sr)
 
     def unload(self):
-        """Free GPU memory after pre-computing the embeddings."""
         if self._audio_embedder is not None:
             self._audio_embedder.unload()
             self._audio_embedder = None
@@ -914,26 +613,7 @@ class CLAPTextCondition(GlobalConditionExtractor):
                 torch.cuda.empty_cache()
 
 
-# ============================================================
-# CLAP AUDIO EMBEDDER (audio side of CLAP, for text-condition INFLUENCE)
-# ============================================================
-
 class ClapAudioEmbedder:
-    """
-    Audio encoder of the SAME CLAP checkpoint used by CLAPTextCondition.
-
-    Used at validation only, to measure how much the text condition influenced
-    the generation: CLAP's audio and text encoders share one space, so the
-    cosine between the audio embedding of a generation and the CLAP-text
-    embedding that conditioned it (already stored in the dataset, L2-normalized)
-    is a direct text-adherence score. The training's Condition_influence table
-    shows its mean over the validation generations (`text/clap_sim`);
-    test_cond.py also reports the delta between the with-text and the
-    null-text generations.
-
-    Lazily loaded; only instantiated when 'text' is an active global condition.
-    """
-
     def __init__(self, model_name: str = "laion/clap-htsat-unfused",
                  device: Optional[str] = None):
         self.model_name = model_name
@@ -951,13 +631,6 @@ class ClapAudioEmbedder:
         self._processor = AutoProcessor.from_pretrained(self.model_name)
         self._model.eval().to(self._device)
         self._dim = int(self._model.config.projection_dim)
-        # The processor's audio keyword was renamed `audios` -> `audio`:
-        # transformers 5 REJECTS the old name, older 4.x releases do not know
-        # the new one. Decided ONCE from the signature rather than by calling
-        # and catching: the wrong-keyword error is a ValueError, and so is
-        # "your audio is at the wrong sampling rate", so a try/except around
-        # the call cannot tell the two apart and would report a real data
-        # problem as a version problem.
         try:
             params = inspect.signature(self._processor.__call__).parameters
             self._audio_kw = "audio" if "audio" in params else "audios"
@@ -968,15 +641,6 @@ class ClapAudioEmbedder:
 
     @torch.no_grad()
     def embed(self, wav_np: np.ndarray, sr: int) -> np.ndarray:
-        """(T,) waveform at `sr` -> (dim,) L2-normalized audio embedding in CLAP
-        space.
-
-        RESAMPLES to CLAP's own rate first. The feature extractor does NOT do it
-        for you: handed 44100 Hz audio it raises ValueError and refuses, which
-        is exactly what this project would feed it -- every chunk here is at the
-        DAC's 44.1 kHz while CLAP wants 48 kHz. (This docstring used to claim
-        the processor resampled internally. It does not, and nothing had ever
-        called this method with real audio to find out.)"""
         self._load()
         if wav_np.ndim > 1:
             wav_np = wav_np.squeeze()
@@ -992,7 +656,7 @@ class ClapAudioEmbedder:
                                  **{self._audio_kw: wav_np})
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         out = self._model(**inputs)
-        feat = out.audio_embeds                      # (1, dim)
+        feat = out.audio_embeds
         feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
         return feat.squeeze(0).cpu().numpy().astype(np.float32)
 
@@ -1005,61 +669,29 @@ class ClapAudioEmbedder:
                 torch.cuda.empty_cache()
 
 
-# ============================================================
-# TEXT LABEL VOCABULARY (reading a stored CLAP vector back as words)
-# ============================================================
-#
-# WHY THIS EXISTS. The 'text' condition of a validation sample is the CLAP
-# embedding of its own audio, and CLAP is a one-way street: there is no decoder,
-# so those numbers cannot be turned back into the sentence that would describe
-# them -- no sentence ever existed. A panel showing "validation sample #37"
-# conditioned on 512 anonymous numbers tells the reader nothing about WHAT it
-# was conditioned on.
-#
-# So the label is a RETRIEVAL, not a translation: of the phrases below, which
-# sit closest to that sample's vector? It is honest only if read that way --
-# "the nearest phrase I know" -- which is why the cosine is always shown beside
-# it. A low cosine means the vocabulary has nothing close, not that the audio
-# resembles the phrase shown.
-#
-# It costs nothing to recompute: the per-chunk vector is already on disk and the
-# phrase embeddings are cached in the dataset, so the label is one dot product.
-# That is deliberate -- edit this list, re-encode the phrases, and every label
-# changes without re-preprocessing a single chunk of audio.
 TEXT_LABEL_VOCAB = [
-    # instrumentation
     "solo pipe organ", "a cappella choir", "harpsichord", "solo piano",
     "string quartet", "solo violin", "solo cello", "acoustic guitar",
     "electric guitar", "distorted electric guitar", "electric bass",
     "drum kit", "hand percussion", "brass section", "solo trumpet",
     "woodwinds", "synthesizer", "analog synthesizer bass", "orchestra",
-    # texture and register
     "a single sustained note", "a dense polyphonic texture",
     "a solo melodic line", "a low bass register", "a high bright register",
     "sparse and quiet", "loud and dense",
-    # rhythm and motion
     "a steady four on the floor beat", "a fast rhythmic pattern",
     "a slow tempo", "no clear pulse", "a strong groove",
-    # space and production
     "a large reverberant church", "a dry close recording",
     "a live concert recording", "a lo-fi noisy recording",
-    # style
     "baroque sacred music", "gregorian chant", "classical music",
     "romantic orchestral music", "rock music", "heavy metal",
     "electronic dance music", "ambient music", "experimental noise",
     "jazz", "folk music", "film score",
-    # extended technique / non-musical
     "a plucked pizzicato attack", "a bowed tremolo", "breathy air noise",
     "silence", "white noise",
 ]
 
 
 def nearest_phrases(vec, vocab_emb, phrases, k: int = 2):
-    """(dim,) stored vector + (n_phrases, dim) vocabulary -> [(phrase, cos), ...]
-
-    Both sides are L2-normalized, so the dot product IS the cosine. Returns the
-    k nearest, best first. Kept here rather than in the metrics module because
-    it is about what the text condition MEANS, not about scoring a model."""
     v = np.asarray(vec, dtype=np.float32).reshape(-1)
     M = np.asarray(vocab_emb, dtype=np.float32)
     if v.size == 0 or M.size == 0 or M.shape[1] != v.shape[0]:
@@ -1069,43 +701,8 @@ def nearest_phrases(vec, vocab_emb, phrases, k: int = 2):
     return [(phrases[i], float(sims[i])) for i in order if i < len(phrases)]
 
 
-# ============================================================
-# WAV2CLIP AUDIO EMBEDDER (audio in CLIP's space, for IMAGE influence)
-# ============================================================
-
 class Wav2ClipAudioEmbedder:
-    """
-    Audio encoder distilled INTO CLIP's own embedding space (Wav2CLIP, Wu et
-    al. 2022). It is what makes an audio-vs-image number exist at all.
-
-    WHY IT IS NEEDED. CLIP embeds images and text in one space; CLAP embeds
-    audio and text in a DIFFERENT one. Between a CLIP image vector and a CLAP
-    audio vector there is no meaningful cosine -- they are coordinates in
-    unrelated spaces. Wav2CLIP is trained to place audio where CLIP would place
-    the matching image, so its output can be compared directly with the CLIP
-    image embeddings this project already stores.
-
-    HOW STRONG IS THE SIGNAL, measured here on 6 September 2026 over 36 Museart
-    clips and 36 of its images (12 + 12 per class): same-class audio-image
-    cosine +0.0748, cross-class +0.0629, i.e. a separation of only +0.0119, and
-    audio->class retrieval 41.7% against a 33.3% chance level. That is real but
-    SMALL, and the reason is a double domain mismatch: Wav2CLIP is distilled on
-    VGGSound (video frames of everyday sound events) while this corpus pairs
-    music with album covers and paintings.
-    READ THE NUMBER ACCORDINGLY. The training's Condition_influence table shows
-    the ABSOLUTE cosine (`image/clip_sim`, the mean over the validation
-    generations): a value near 0.07 says little on its own, so read the column
-    across steps. test_cond.py also gives the PAIRED delta -- the same image
-    scored against the conditioned and the null generation -- which is far more
-    sensitive than the cross-class retrieval above, so a consistent positive
-    delta still means something.
-
-    Kept deliberately separate from ImageCondition: that class encodes the
-    IMAGES (and is what the dataset's banks were built with), this one encodes
-    AUDIO into the same space, and only validation ever needs it.
-    """
-
-    SR = 16000          # Wav2CLIP's own rate; anything else must be resampled
+    SR = 16000
 
     def __init__(self, device: Optional[str] = None):
         self._model = None
@@ -1129,8 +726,6 @@ class Wav2ClipAudioEmbedder:
 
     @torch.no_grad()
     def embed(self, wav_np: np.ndarray, sr: int) -> np.ndarray:
-        """(T,) waveform at `sr` -> (512,) L2-normalized vector in CLIP space,
-        directly comparable with an ImageCondition embedding."""
         import wav2clip
         self._load()
         wav_np = np.asarray(wav_np, dtype=np.float32)
@@ -1152,25 +747,7 @@ class Wav2ClipAudioEmbedder:
                 torch.cuda.empty_cache()
 
 
-# ============================================================
-# GLOBAL: IMAGE (CLIP)
-# ============================================================
-
 class ImageCondition(GlobalConditionExtractor):
-    """
-    Encodes an image with CLIP.
-
-    Implementation: uses CLIPVisionModelWithProjection (not CLIPModel), for the
-    same reason CLAPTextCondition uses ClapTextModelWithProjection -- it is the
-    canonical API to extract the projected embedding, it exposes an explicit
-    .image_embeds field, and it is robust to the signature changes that
-    CLIPModel.get_image_features has gone through across transformers versions.
-    Under transformers 5.x that method no longer returns a tensor at all but a
-    BaseModelOutputWithPooling, which broke the previous implementation outright.
-    The two produce bit-identical vectors (verified: max abs diff 0.0), and this
-    one loads only the vision tower instead of the full dual-encoder.
-    """
-
     def __init__(self, model_name: str = "openai/clip-vit-base-patch32"):
         self.model_name = model_name
         self._model = None
@@ -1191,8 +768,6 @@ class ImageCondition(GlobalConditionExtractor):
     def name(self): return "image"
     @property
     def dim(self):
-        # Same as CLAPTextCondition.dim: the config knows the width, so reading
-        # it never builds the vision tower.
         if self._dim is None:
             self._dim = _projection_dim_from_config(self.model_name)
         if self._dim is None:
@@ -1206,7 +781,7 @@ class ImageCondition(GlobalConditionExtractor):
         img = Image.open(image_path).convert("RGB")
         inputs = self._processor(images=img, return_tensors="pt")
         out = self._model(**inputs)
-        feat = out.image_embeds          # (1, dim) -- already projected
+        feat = out.image_embeds
         feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
         return feat.squeeze(0).cpu().numpy().astype(np.float32)
 
@@ -1217,23 +792,7 @@ class ImageCondition(GlobalConditionExtractor):
             self._model = None
 
 
-# ============================================================
-# IMAGE DATASET MANAGER
-# ============================================================
-
 class ImageDatasetManager:
-    """
-    Manages an image dataset with a structure parallel to the audio.
-
-    Supported layout (with split):
-        image_root/{train,val,test}/<class_name>/*.jpg
-    Legacy layout (without split):
-        image_root/<class_name>/*.jpg
-
-    If you pass `split`, the split layout is used. If the split folder
-    does not exist, it automatically falls back to the legacy layout with a warning.
-    """
-
     EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
     def __init__(self, image_root: str, split: Optional[str] = None):
@@ -1279,28 +838,8 @@ class ImageDatasetManager:
         return self.class_images.get(class_name, [])
 
 
-# ============================================================
-# CONDITION CONFIG -- UNICO PUNTO DI VERITA
-# ============================================================
-#
-# To enable/disable a condition: change "enabled".
-# To add a new condition:
-#   1. Create a class extending FrameConditionExtractor or GlobalConditionExtractor
-#   2. Aggiungila in CONDITION_CONFIG con "enabled": True
-#   3. Done -- everything else adapts automatically
-#
-# LABEL REMOVAL: the `label` (categorical) condition has been removed.
-# The `text` modality with CLAP replaces it: at training it receives the name
-# the class name as a string at training; at inference it can take free prompts.
-# ============================================================
-
 CONDITION_CONFIG = {
     "frame_level": {
-        # out_dim = per-condition projection width (JASCO bottleneck). The
-        # extractor produces `raw_dim` channels per frame (ChromaExtractor ->
-        # 12 chroma classes via librosa CQT); a single Linear(raw_dim ->
-        # out_dim) projects them before they are concatenated with the latent
-        # on the feature dim.
         "chroma": {
             "class": ChromaExtractor,
             "kwargs": {},
@@ -1314,22 +853,12 @@ CONDITION_CONFIG = {
             "enabled": True,
         },
         "energy": {
-            # Frequency-weighted spectral-energy dynamics curve (1 channel).
-            # raw_dim=1 -> projected to out_dim by the FrameConditionEncoder.
-            # weighting="A" + fmin high-pass = perceptual loudness on the
-            # audible band. out_dim is small: it is a low-bandwidth 1-D signal.
             "class": EnergyExtractor,
             "kwargs": {"weighting": "A", "fmin": 40.0},
             "out_dim": 16,
             "enabled": True,
         },
         "f0": {
-            # Monophonic f0 contour from CREPE (torchcrepe backend): a single
-            # continuous pitch curve for monophonic / lead-line control, and the
-            # project's only pitch condition. raw_dim=2 by default
-            # ([pitch_norm, periodicity]); set with_periodicity=False for raw_dim=1.
-            # Set device="cuda" here for speed on large datasets (only honored
-            # with --num_workers 0). Requires: pip install torchcrepe
             "class": CrepeF0Extractor,
             "kwargs": {"fmin": 50.0, "fmax": 1000.0, "model": "full",
                        "voicing_threshold": 0.5, "with_periodicity": True,
@@ -1340,36 +869,21 @@ CONDITION_CONFIG = {
             "enabled": True,
         },
         "chord": {
-            # crema's chord model (PyTorch port, crema_chord.py): per frame,
-            # the probability that each pitch class belongs to the chord.
-            # raw_dim=12 like chroma, and chroma's projection width. It has no
-            # device knob, so it runs on CPU in the preprocessing workers, like
-            # chroma. Weights: crema_chord_weights.npz, next to crema_chord.py.
-            # LAST in this dict on purpose: the frame conditions are
-            # concatenated in this order, so appending keeps every existing
-            # run's layout. silence_db: frames quieter than this are "no
-            # chord" (crema itself hears chords in silence; None = off).
             "class": CremaChordExtractor,
             "kwargs": {"silence_db": -60.0},
             "out_dim": 64,
             "enabled": True,
         },
-        # Example for adding MFCC in the future:
-        # "mfcc": {
-        #     "class": MFCCExtractor,
-        #     "kwargs": {"n_mfcc": 20},
-        #     "out_dim": 64,
-        #     "enabled": False,
-        # },
+        "midi": {
+            "class": MidiExtractor,
+            "kwargs": {"device": "cpu"},
+            "out_dim": 128,
+            "enabled": True,
+        },
     },
     "global": {
         "text": {
             "class": CLAPTextCondition,
-            # NOT 'laion/larger_clap_music': that checkpoint is broken (flat
-            # 0.250 softmax over four unmistakable sounds). See the table in
-            # CLAPTextCondition's docstring for the measurements behind this
-            # choice. ClapAudioEmbedder reads this same value, so the influence
-            # metric always scores in the space the condition was built in.
             "kwargs": {"model_name": "laion/clap-htsat-unfused"},
             "enabled": True,
         },
@@ -1382,41 +896,15 @@ CONDITION_CONFIG = {
 }
 
 
-# ============================================================
-# CONDITION REGISTRY -- LETTORE DEL CONFIG
-# ============================================================
-
 class ConditionRegistry:
-    """
-    Instantiates the extractors that are both:
-      1) marked enabled=True in CONDITION_CONFIG (the project-wide pool
-         of conditions that the pipeline knows how to handle), AND
-      2) selected by the per-run filters `enabled_frame` / `enabled_global`,
-         typically driven by the YAML config of the training run.
-
-    Used by extract_conditions.py, audio_dataset_cond.py, training_cond.py,
-    test_cond.py.
-
-    Args:
-        n_classes:       kept for back-compat with extract_conditions.py
-                         (LabelCondition has been removed).
-        config:          alternative dict in place of CONDITION_CONFIG.
-        enabled_frame:   per-run filter for frame-level conditions:
-                           - None  -> use everything enabled=True in CONDITION_CONFIG
-                           - []    -> use NO frame-level condition
-                           - list  -> use only the listed names (each must
-                                      be enabled=True in CONDITION_CONFIG)
-        enabled_global:  same semantics for global conditions.
-    """
-
     def __init__(self, n_classes: Optional[int] = None,
                  config: Optional[dict] = None,
                  enabled_frame:  Optional[List[str]] = None,
                  enabled_global: Optional[List[str]] = None):
         self.frame_extractors: Dict[str, FrameConditionExtractor] = {}
-        self.frame_out_dims: Dict[str, int] = {}   # per-condition projection width (JASCO)
+        self.frame_out_dims: Dict[str, int] = {}
         self.global_extractors: Dict[str, GlobalConditionExtractor] = {}
-        self.n_classes = n_classes  # ignored, kept for back-compat
+        self.n_classes = n_classes
 
         config = config or CONDITION_CONFIG
         self._build(config, enabled_frame, enabled_global)
@@ -1424,7 +912,6 @@ class ConditionRegistry:
     def _build(self, config,
                enabled_frame:  Optional[List[str]] = None,
                enabled_global: Optional[List[str]] = None):
-        # ---- Frame-level ----
         for name, cfg in config.get("frame_level", {}).items():
             if not cfg.get("enabled", False):
                 continue
@@ -1433,15 +920,10 @@ class ConditionRegistry:
             cls = cfg["class"]
             kwargs = cfg.get("kwargs", {})
             self.frame_extractors[name] = cls(**kwargs)
-            # Per-condition projection width for the JASCO-style concat.
-            # Defaults to the raw extractor dim when out_dim is not declared
-            # (i.e. an identity-width projection), so older configs still work.
             self.frame_out_dims[name] = int(
                 cfg.get("out_dim", self.frame_extractors[name].dim)
             )
 
-        # Sanity check: explicit list must reference conditions that
-        # are enabled=True in CONDITION_CONFIG (catches typos early).
         if enabled_frame is not None:
             missing = set(enabled_frame) - set(self.frame_extractors.keys())
             if missing:
@@ -1453,7 +935,6 @@ class ConditionRegistry:
                     f"Currently active in CONDITION_CONFIG: {available}"
                 )
 
-        # ---- Global (all continuous now) ----
         for name, cfg in config.get("global", {}).items():
             if not cfg.get("enabled", False):
                 continue
@@ -1488,13 +969,10 @@ class ConditionRegistry:
 
     @property
     def frame_cond_out_dims(self) -> Dict[str, int]:
-        """Per-condition projection width used for the JASCO-style concat.
-        Same keys (and order) as frame_cond_dims."""
         return {n: self.frame_out_dims[n] for n in self.frame_extractors.keys()}
 
     @property
     def global_cond_configs(self) -> Dict[str, dict]:
-        """All global conditions are now continuous -> only `dim`."""
         return {n: {"dim": e.dim} for n, e in self.global_extractors.items()}
 
     def extract_frame_conditions(
@@ -1511,34 +989,9 @@ class ConditionRegistry:
         return f"ConditionRegistry(frame=[{f}], global=[{g}])"
 
 
-# ============================================================
-# ENCODERS nn.Module (used by the DiT)
-# ============================================================
-
 class FrameConditionEncoder(nn.Module):
-    """
-    JASCO-style frame-condition encoder.
-
-    Each frame condition is projected by a SINGLE Linear (raw_dim -> out_dim),
-    exactly as JASCO's MelodyConditioner (output_proj = nn.Linear(card, out_dim),
-    audiocraft/modules/jasco_conditioners.py). The projected conditions are
-    returned CONCATENATED on the feature dim, in a fixed canonical order. The
-    network then concatenates this with the noisy latent on the feature dim and
-    applies a single input projection to hidden_size — see
-    audiocraft/models/flow_matching.py, forward():
-        for cond in temporal_conds: x = torch.concat((x, c), dim=-1)
-        input_ = self.emb(x)
-
-    NB: this does NOT project to hidden_size and does NOT sum the conditions.
-    The fusion to hidden_size is the network's single input_proj, applied AFTER
-    concatenation with the latent.
-    """
-
     def __init__(self, condition_dims: Dict[str, int], out_dims: Dict[str, int]):
         super().__init__()
-        # Canonical fixed order = insertion order of condition_dims (driven by
-        # CONDITION_CONFIG / the registry). The concat slots are positional, so
-        # this order MUST be identical at train and inference time.
         self.names = list(condition_dims.keys())
         missing = set(self.names) - set(out_dims.keys())
         if missing:
@@ -1550,27 +1003,11 @@ class FrameConditionEncoder(nn.Module):
         self.total_out_dim = int(sum(out_dims[name] for name in self.names))
 
     def forward(self, conditions: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        conditions: {name: (B, T, raw_dim)} — every expected name must be
-                    present (zeros for null conditions). The caller
-                    (ConditionedAudioDiT) guarantees this.
-        Returns:
-            (B, T, total_out_dim) — projected conditions concatenated in
-            canonical order.
-        """
         parts = [self.projections[name](conditions[name]) for name in self.names]
         return torch.cat(parts, dim=-1)
 
 
 class GlobalConditionEncoder(nn.Module):
-    """
-    Projects global conditions (continuous) -> hidden_size.
-    Sums the projections and applies a final LayerNorm to balance the scales
-    across different modalities (e.g. text CLAP vs image CLIP).
-
-    NB: no more categorical branch (LabelCondition removed).
-    """
-
     def __init__(self, global_configs: Dict[str, dict], hidden_size: int):
         super().__init__()
         self.encoders = nn.ModuleDict()
@@ -1582,29 +1019,12 @@ class GlobalConditionEncoder(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_size, eps=1e-6)
 
     def forward(self, conditions: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
-        """
-        conditions: {name: (B, dim)} — every expected name must be present
-                    (zeros for null conditions), exactly like
-                    FrameConditionEncoder. The caller (ConditionedAudioDiT)
-                    guarantees this via _gather_global_conditions.
-
-        The contract matters: a name simply MISSING from the dict used to be
-        left out of the sum, which is a third state the model never saw. The
-        null it is trained against is a ZERO VECTOR through the projection --
-        not the absence of that projection's bias and LayerNorm contribution --
-        so "give me only a prompt, no image" has to send zeros for the image,
-        not nothing.
-        """
         embs = [enc(conditions[name]) for name, enc in self.encoders.items()
                 if name in conditions]
         if not embs:
             return None
         return self.final_norm(torch.stack(embs, dim=0).sum(dim=0))
 
-
-# ============================================================
-# NULL CONDITIONS (for CFG)
-# ============================================================
 
 def make_null_frame_conditions(B: int, n_frames: int,
                                  cond_dims: Dict[str, int],
@@ -1616,21 +1036,10 @@ def make_null_frame_conditions(B: int, n_frames: int,
 def make_null_global_conditions(B: int,
                                   global_configs: Dict[str, dict],
                                   device) -> Dict[str, torch.Tensor]:
-    """
-    Create "null" global conditions for CFG: zero vectors.
-
-    text (CLAP) and image (CLIP) are both L2-normalized in the projected
-    space, so a zero vector is OOD with respect to any
-    real condition and acts as a pseudo-null token. This is the standard
-    choice in generative models with continuous embeddings.
-    """
     return {n: torch.zeros(B, cfg["dim"], device=device)
             for n, cfg in global_configs.items()}
 
 
-# ============================================================
-# QUICK TEST
-# ============================================================
 if __name__ == "__main__":
     print("=" * 60)
     print("Test ConditionRegistry (CLAP-based, no label)")
@@ -1641,7 +1050,6 @@ if __name__ == "__main__":
     print(f"\nFrame cond dims:    {reg.frame_cond_dims}")
     print(f"Global cond configs: {reg.global_cond_configs}")
 
-    # Test text encoding (requires internet the first time)
     print("\n--- Test CLAP text encoding (single prompt) ---")
     if "text" in reg.global_extractors:
         t = reg.global_extractors["text"]

@@ -1,45 +1,4 @@
-# metrics.py
-#
-# Evaluation metrics for unconditional audio generation, computed entirely in
-# the (normalized) DAC latent space:
-#
-#   - FD-DAC (Frechet DAC Distance): Frechet/Wasserstein-2 distance between two
-#     multivariate Gaussians fitted on the DAC latents, with FULL covariance.
-#   - KL divergence: Kullback-Leibler divergence between the same two
-#     multivariate Gaussians (full covariance), in BOTH directions
-#     (real||gen and gen||real), since KL is asymmetric.
-#
-# DESIGN / ASSUMPTIONS (discussed and chosen deliberately):
-#   - Both metrics model the real and generated latent distributions as
-#     multivariate Gaussians N(mu, Sigma) with a FULL covariance over the DAC
-#     pre-quantizer latent dimension (72x72; the number comes from the tensor at
-#     runtime, this is just what it is for the 44 kHz DAC).
-#     This is the SAME assumption for both, so FD-DAC and KL are directly
-#     comparable and live in the SAME representation space.
-#   - Space: the NORMALIZED latent space. Real latents come normalized from the
-#     dataset; generated latents are taken PRE-denormalization (i.e. straight
-#     out of the model, already in normalized space). So both distributions are
-#     in the same space and the metrics measure a genuine distribution gap, not
-#     a normalization offset.
-#   - A non-parametric / non-Gaussian KL (e.g. kNN Kozachenko-Leonenko) was
-#     considered but rejected: in 1024-D it is dominated by the curse of
-#     dimensionality and is LESS reliable than the closed-form Gaussian KL, not
-#     more "truthful". The Gaussian assumption is identical to the one already
-#     accepted for FD-DAC.
-#
-# This module exposes FOUR metrics, all single-Gaussian, FULL-covariance,
-# selectable from config (metrics.enabled):
-#   - fd_dac      : Frechet on DAC latents       (latent-only, frame-level)
-#   - kl_dac      : KL both directions on DAC     (latent-only, frame-level)
-#   - fad_encodec : Frechet on Encodec embeddings (supervisor/Roebel; decode+Encodec,
-#                   frame-level ~13ms; reference = REAL val wavs, no DAC)
-#   - fad_vggish  : Frechet on VGGish embeddings  (decode+VGGish, ~0.96s window;
-#                   reference = REAL val wavs, no DAC)
-# fd_dac/kl_dac are latent-only (no decode). The two FADs decode the GENERATED
-# latents to audio (unavoidable: the model only outputs DAC latents) and embed;
-# their reference is the real val audio, embedded directly (no DAC on the real
-# side). NONE of these use Gaussian mixtures: all are single multivariate
-# Gaussians, exactly like the official FAD/FD/KL.
+# Distributional metrics: FD on the codec latents, KL, FAD-VGGish.
 
 import os
 import torch
@@ -52,12 +11,7 @@ import warnings
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.nn.utils')
 
 
-# ============================================================
-# COMMON: mean / covariance from cumulative sums
-# ============================================================
-
 def compute_mu_sigma(sum_x: torch.Tensor, sum_xx: torch.Tensor, n) -> tuple:
-    """Unbiased mean and full covariance from cumulative sums."""
     if isinstance(n, torch.Tensor):
         n = n.item()
     mu = sum_x / n
@@ -65,15 +19,7 @@ def compute_mu_sigma(sum_x: torch.Tensor, sum_xx: torch.Tensor, n) -> tuple:
     return mu, sigma, n
 
 
-# ============================================================
-# FRECHET DISTANCE — numerically stable (eigendecomposition)
-# ============================================================
-
 def symmetric_psd_matrix_sqrt(m: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    Principal square root of a positive semi-definite matrix.
-    Uses torch eigendecomposition (more stable than scipy.linalg.sqrtm).
-    """
     m = 0.5 * (m + m.T)
     eigvals, eigvecs = torch.linalg.eigh(m)
     eigvals = torch.clamp(eigvals, min=eps)
@@ -87,12 +33,6 @@ def compute_frechet_distance(
     sigma2: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """
-    Frechet Distance between two multivariate Gaussians.
-
-    FD(P1, P2) = ||mu1 - mu2||^2 + Tr(Sigma1) + Tr(Sigma2)
-                 - 2 * Tr(sqrt(Sigma1^{1/2} Sigma2 Sigma1^{1/2}))
-    """
     mu1 = mu1.reshape(-1).double()
     mu2 = mu2.reshape(-1).double()
     sigma1 = sigma1.double()
@@ -121,10 +61,6 @@ def compute_frechet_distance(
     return fd.to(torch.float32)
 
 
-# ============================================================
-# KL DIVERGENCE — full-covariance multivariate Gaussian
-# ============================================================
-
 def gaussian_kl_fullcov(
     mu_p: torch.Tensor,
     sigma_p: torch.Tensor,
@@ -132,29 +68,6 @@ def gaussian_kl_fullcov(
     sigma_q: torch.Tensor,
     eps: float = 1e-6,
 ) -> float:
-    """
-    KL( N(mu_p, Sigma_p) || N(mu_q, Sigma_q) ) for FULL-covariance Gaussians.
-
-        KL = 0.5 * [ tr(Sq^-1 Sp)
-                     + (mu_q - mu_p)^T Sq^-1 (mu_q - mu_p)
-                     - d
-                     + ln(det Sq / det Sp) ]
-
-    NUMERICAL STABILITY (essential in 1024-D):
-      Computed via Cholesky factorization, never via explicit inverse or naive
-      det:
-        - Sp, Sq are symmetrized and regularized (S + eps*I) so they are SPD.
-        - log det S = 2 * sum(log(diag(L)))  where S = L L^T.
-        - tr(Sq^-1 Sp) and the Mahalanobis term use cholesky_solve (triangular
-          solves), avoiding the cost and instability of forming Sq^-1.
-
-    NOTE on direction (KL is asymmetric):
-      KL(real || gen): penalizes the model for NOT covering regions where the
-                       real data lives (mode-covering view).
-      KL(gen || real): penalizes the model for generating where real data is
-                       unlikely (mode-seeking view).
-      evaluate_generation logs BOTH so nothing is lost.
-    """
     mu_p = mu_p.reshape(-1).double()
     mu_q = mu_q.reshape(-1).double()
     Sp = sigma_p.double()
@@ -171,11 +84,9 @@ def gaussian_kl_fullcov(
     logdet_p = 2.0 * torch.log(torch.diag(Lp)).sum()
     logdet_q = 2.0 * torch.log(torch.diag(Lq)).sum()
 
-    # tr(Sq^-1 Sp) via X = Sq^-1 Sp (cholesky_solve), then trace.
     X = torch.cholesky_solve(Sp, Lq)
     tr_term = torch.trace(X)
 
-    # Mahalanobis: (mu_q - mu_p)^T Sq^-1 (mu_q - mu_p)
     diff = (mu_q - mu_p).unsqueeze(1)
     sol = torch.cholesky_solve(diff, Lq)
     maha = (diff * sol).sum()
@@ -184,10 +95,6 @@ def gaussian_kl_fullcov(
     return float(kl.item())
 
 
-# ============================================================
-# REFERENCE STATS ON THE VALIDATION SET (shared by FD-DAC and KL)
-# ============================================================
-
 @torch.no_grad()
 def precompute_latent_reference(
     val_dataset,
@@ -195,16 +102,6 @@ def precompute_latent_reference(
     device: Optional[str] = None,
     batch_accum: int = 50,
 ) -> dict:
-    """
-    Pre-compute mu and full covariance (Sigma) of the REAL latents over the
-    whole validation set, in the normalized space. These same stats feed BOTH
-    FD-DAC and the KL divergence (same Gaussian, same space).
-
-    Online accumulation with sum_x and sum_xx for numerical stability.
-
-    Cache: if cache_path exists -> load; if given but missing -> compute & save;
-    if None -> compute without saving.
-    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -225,7 +122,7 @@ def precompute_latent_reference(
     buffer = []
 
     for idx in tqdm(range(len(val_dataset)), desc="Latent reference"):
-        frames, _ = val_dataset[idx]   # (n_frames, dim) normalized
+        frames, _ = val_dataset[idx]
         buffer.append(frames)
 
         if len(buffer) >= batch_accum or idx == len(val_dataset) - 1:
@@ -258,9 +155,6 @@ def precompute_latent_reference(
     if cache_path is not None:
         cache_path_obj = Path(cache_path)
         cache_path_obj.parent.mkdir(parents=True, exist_ok=True)
-        # Publish atomically (temp + os.replace): an interruption during a plain
-        # torch.save leaves a TRUNCATED cache file, which the next run finds,
-        # tries to load, and fails on -- every time, until it is deleted by hand.
         _tmp = str(cache_path_obj) + ".tmp"
         torch.save(stats, _tmp)
         os.replace(_tmp, str(cache_path_obj))
@@ -269,29 +163,14 @@ def precompute_latent_reference(
     return stats
 
 
-# Backwards-compatible alias: training.py historically imported
-# precompute_fd_dac_reference. It is the same thing now (reference stats are
-# shared between FD-DAC and KL), so we keep the old name working.
 def precompute_fd_dac_reference(val_dataset, cache_path=None, device=None,
                                 batch_accum: int = 50) -> dict:
     return precompute_latent_reference(
         val_dataset, cache_path=cache_path, device=device, batch_accum=batch_accum)
 
 
-# ============================================================
-# GENERATED-SIDE STATS (streamed in blocks to bound GPU memory)
-# ============================================================
-
 def _generated_mu_sigma(generated_latents: torch.Tensor, device: str,
                         block_size: int = 16):
-    """
-    mu and full covariance of the GENERATED latents, accumulating sum_x/sum_xx
-    one block of `block_size` samples at a time. Peak GPU memory is independent
-    of N (only one block on the GPU at once), mirroring the reference path.
-
-    generated_latents: (N, n_frames, dim) on CPU.
-    Returns (mu, sigma) as float64 GPU tensors.
-    """
     dim = generated_latents.shape[-1]
     sum_x = torch.zeros(dim, dtype=torch.float64, device=device)
     sum_xx = torch.zeros(dim, dim, dtype=torch.float64, device=device)
@@ -310,22 +189,12 @@ def _generated_mu_sigma(generated_latents: torch.Tensor, device: str,
     return mu_gen, sigma_gen
 
 
-# ============================================================
-# FD-DAC
-# ============================================================
-
 def compute_fd_dac(
     generated_latents: torch.Tensor,
     ref_stats: dict,
     device: str = "cuda",
     block_size: int = 16,
 ) -> float:
-    """
-    Frechet DAC Distance between generated latents and the reference.
-
-    generated_latents: (N, n_frames, dim) on CPU. Streamed to GPU in blocks.
-    ref_stats: dict with 'mu' and 'sigma' (full covariance) of the reference.
-    """
     mu_gen, sigma_gen = _generated_mu_sigma(generated_latents, device, block_size)
 
     mu_ref = ref_stats["mu"].to(device)
@@ -340,29 +209,17 @@ def compute_fd_dac(
     return float(fd.item())
 
 
-# ============================================================
-# KL (both directions), sharing the generated stats
-# ============================================================
-
 def compute_kl_both(
     generated_latents: torch.Tensor,
     ref_stats: dict,
     device: str = "cuda",
     block_size: int = 16,
 ) -> dict:
-    """
-    KL divergence (full-covariance Gaussian) between the REAL reference and the
-    GENERATED latents, in BOTH directions.
-
-    Returns {"kl_real_gen": KL(real||gen), "kl_gen_real": KL(gen||real)}.
-    Same Gaussian assumption and same (normalized) latent space as FD-DAC.
-    """
     mu_gen, sigma_gen = _generated_mu_sigma(generated_latents, device, block_size)
 
     mu_ref = ref_stats["mu"].to(device)
     sigma_ref = ref_stats["sigma"].to(device)
 
-    # real = reference (P = real), gen = generated (Q = gen)
     kl_real_gen = gaussian_kl_fullcov(mu_ref, sigma_ref, mu_gen, sigma_gen)
     kl_gen_real = gaussian_kl_fullcov(mu_gen, sigma_gen, mu_ref, sigma_ref)
 
@@ -373,13 +230,6 @@ def compute_kl_both(
     return {"kl_real_gen": kl_real_gen, "kl_gen_real": kl_gen_real}
 
 
-# ============================================================
-# DAC-latent metrics, selection-driven, sharing ONE mu/sigma
-# ============================================================
-
-# The DAC-latent metrics available to the CONDITIONED pipeline. (The audio-FAD
-# metrics of ALL_METRICS -- fad_encodec / fad_vggish -- belong to the
-# unconditional evaluate_generation path and are not wired here.)
 DAC_METRICS = ("fd_dac", "kl_dac")
 
 
@@ -390,29 +240,12 @@ def compute_dac_metrics(
     device: str = "cuda",
     block_size: int = 16,
 ) -> dict:
-    """
-    Compute the REQUESTED DAC-latent metrics over `generated_latents`, fitting the
-    generated mu/full-covariance ONCE and reusing it for every requested metric.
-
-    `enabled`: any subset of DAC_METRICS ("fd_dac", "kl_dac"). Only the requested
-    metrics are computed; the others come back as None (and cost nothing).
-
-    Sharing the stats is what makes the selection cheap AND fast at the same time:
-    the expensive part is the covariance accumulation over all frames, which is
-    done once regardless of how many metrics are requested; each metric on top of
-    it is a small (dim x dim) linear-algebra step. Results are NUMERICALLY
-    IDENTICAL to calling compute_fd_dac() / compute_kl_both() separately.
-
-    Returns {"fd_dac": float|None, "kl_real_gen": tensor|None,
-             "kl_gen_real": tensor|None}.
-    """
     out = {"fd_dac": None, "kl_real_gen": None, "kl_gen_real": None}
     want_fd = "fd_dac" in enabled
     want_kl = "kl_dac" in enabled
     if not (want_fd or want_kl):
         return out
 
-    # the one expensive pass, shared by every requested metric
     mu_gen, sigma_gen = _generated_mu_sigma(generated_latents, device, block_size)
     mu_ref = ref_stats["mu"].to(device)
     sigma_ref = ref_stats["sigma"].to(device)
@@ -431,19 +264,7 @@ def compute_dac_metrics(
     return out
 
 
-# ============================================================
-# EVALUATION FUNCTION (for the training loop)
-# ============================================================
-
-# ============================================================
-# AUDIO EMBEDDERS for the FAD metrics (Encodec = Roebel, VGGish = 1s window).
-# Lazy-loaded, so this module imports fine without encodec / vggish installed.
-# ============================================================
-
 class EncodecEmbedder:
-    """Encodec encoder embeddings (pre-quantization), frame-level (~13 ms @ 24kHz).
-    Faithful to the supervisor's fad.py.get_embeddings."""
-
     def __init__(self, audio_sr_model: int = 24000, device: str = "cpu"):
         self.audio_sr_model = audio_sr_model
         self.device = device
@@ -468,7 +289,6 @@ class EncodecEmbedder:
 
     @torch.no_grad()
     def embed(self, audio: torch.Tensor, audio_sr: int) -> torch.Tensor:
-        """audio (b, c, n) -> (b*n_enc, d), encoder output pooled over frames."""
         self._load()
         x = audio.to(self.device).float()
         if self._model.sample_rate != audio_sr:
@@ -479,20 +299,14 @@ class EncodecEmbedder:
             x = torch.from_numpy(np.ascontiguousarray(x_np, dtype=np.float32)).to(self.device)
         if self._model.sample_rate == 48000:
             if x.shape[1] != 2:
-                x = torch.cat((x, x), dim=1)            # 48kHz model wants stereo
+                x = torch.cat((x, x), dim=1)
         elif x.shape[1] > 1:
-            x = x.mean(dim=1, keepdim=True)             # 24kHz model wants mono
-        e = self._model.encoder(x)                      # (b, d, n)
+            x = x.mean(dim=1, keepdim=True)
+        e = self._model.encoder(x)
         return e.permute(0, 2, 1).reshape(-1, e.shape[1])
 
 
 class VGGishEmbedder:
-    """VGGish embeddings, ~0.96 s temporal window per vector (128-D). The ~1s
-    window is intrinsic to VGGish (log-mel patches), which is why this is the
-    "1-second-window" FAD. Loaded via torch.hub (harritaylor/torchvggish).
-    NOTE: first load downloads weights via torch.hub (needs network once). This
-    loader is the single piece to verify in your environment."""
-
     def __init__(self, device: str = "cpu"):
         self.device = device
         self._model = None
@@ -510,23 +324,16 @@ class VGGishEmbedder:
 
     @torch.no_grad()
     def embed(self, audio: torch.Tensor, audio_sr: int) -> torch.Tensor:
-        """audio (b, c, n) -> (n_windows, 128). Processes the (mono) clip; VGGish
-        resamples to 16 kHz internally."""
         self._load()
-        wav = audio[0].mean(dim=0).cpu().numpy()        # 1-D mono
-        emb = self._model(wav, fs=audio_sr)             # (n_windows, 128)
+        wav = audio[0].mean(dim=0).cpu().numpy()
+        emb = self._model(wav, fs=audio_sr)
         if emb.dim() == 1:
             emb = emb.unsqueeze(0)
         return emb.to(self.device)
 
 
-# ============================================================
-# AUDIO-SIDE mu/sigma (shared by reference wavs and decoded generated latents)
-# ============================================================
-
 @torch.no_grad()
 def _audio_clips_to_mu_sigma(clip_iter, n_items, embedder, device, desc):
-    """clip_iter yields (wav (b,c,T), sr). Accumulate mu/sigma of embeddings."""
     sum_x = None
     sum_xx = None
     count = 0
@@ -547,16 +354,6 @@ def _audio_clips_to_mu_sigma(clip_iter, n_items, embedder, device, desc):
 @torch.no_grad()
 def precompute_audio_reference(val_wav_source, embedder, cache_path=None,
                                device: str = "cuda") -> dict:
-    """Reference mu/sigma = embeddings of the REAL val wavs (NO DAC). Cached.
-
-    `val_wav_source` is either
-      * a DIRECTORY, searched recursively for *.wav  (unconditional pipeline:
-        the dataset has a val/ folder, so the directory IS the split), or
-      * an explicit ITERABLE OF FILE PATHS (conditioned pipeline: the dataset is
-        SPLIT-LESS on disk, so wav/ holds train, val and test together and
-        globbing it would build the "real" reference on the test set as well --
-        the exact leakage the in-code split exists to prevent).
-    """
     if cache_path is not None and Path(cache_path).exists():
         print(f"[Audio ref] loading cache: {cache_path}")
         return torch.load(str(cache_path), map_location="cpu", weights_only=False)
@@ -580,18 +377,15 @@ def precompute_audio_reference(val_wav_source, embedder, cache_path=None,
 
     def _iter():
         for p in wavs:
-            # soundfile (libsndfile) reads WAV with no system FFmpeg, unlike
-            # torchaudio.load (torchcodec backend) which needs FFmpeg DLLs and
-            # fails on bare Windows envs.
-            data, sr = sf.read(str(p), dtype="float32", always_2d=True)  # (T, c)
-            w = torch.from_numpy(data.T.copy())                           # (c, T)
-            yield w.unsqueeze(0), sr                                      # (1, c, T)
+            data, sr = sf.read(str(p), dtype="float32", always_2d=True)
+            w = torch.from_numpy(data.T.copy())
+            yield w.unsqueeze(0), sr
 
     mu, sigma, count = _audio_clips_to_mu_sigma(_iter(), len(wavs), embedder, device, "Audio ref")
     stats = {"mu": mu.cpu(), "sigma": sigma.cpu(), "n_total": count}
     if cache_path is not None:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        _tmp = str(cache_path) + ".tmp"          # atomic publish, see above
+        _tmp = str(cache_path) + ".tmp"
         torch.save(stats, _tmp)
         os.replace(_tmp, str(cache_path))
         print(f"[Audio ref] cache saved: {cache_path}")
@@ -600,52 +394,32 @@ def precompute_audio_reference(val_wav_source, embedder, cache_path=None,
 
 @torch.no_grad()
 def _decode_embed_mu_sigma(generated_latents, normalizer, embedder, device, desc):
-    """Decode generated latents to audio (DAC) and embed -> mu/sigma."""
-    from audio_dataset_npy import decode_latents, DAC_SAMPLE_RATE
+    from audio_dataset_npy import decode_latents
+    import latent_codec as lc
+    sr = lc.active().sample_rate
 
     def _iter():
         for i in range(generated_latents.shape[0]):
-            z = generated_latents[i].T                  # (dim, n_frames) normalized
-            z = normalizer.denormalize(z)               # raw DAC latents
-            wav = decode_latents(z, device=device)      # (1, T) @ 44.1kHz
-            yield wav.unsqueeze(0), DAC_SAMPLE_RATE      # (1, 1, T)
+            z = generated_latents[i].T
+            z = normalizer.denormalize(z)
+            wav = decode_latents(z, device=device)
+            yield wav.unsqueeze(0), sr
 
     return _audio_clips_to_mu_sigma(_iter(), generated_latents.shape[0], embedder, device, desc)
 
 
-# ============================================================
-# CONFIG-DRIVEN SETUP + EVALUATION
-#
-# Metric registry. All single-Gaussian, FULL covariance:
-#   fd_dac      : Frechet on DAC latents          (latent-only, frame-level)
-#   kl_dac      : KL both directions on DAC        (latent-only, frame-level)
-#   fad_encodec : Frechet on Encodec embeddings    (Roebel; decode+Encodec, frame)
-#   fad_vggish  : Frechet on VGGish embeddings     (decode+VGGish, ~0.96s window)
-# ============================================================
-
 ALL_METRICS = ("fd_dac", "kl_dac", "fad_encodec", "fad_vggish")
 
-# What the CONDITIONED pipeline (training_cond.py) actually computes. It is a
-# SUBSET of ALL_METRICS on purpose: `fad_encodec` needs the Encodec dependency
-# and is not wired, so listing it must fail loudly rather than be ignored.
 COND_METRICS = ("fd_dac", "kl_dac", "fad_vggish")
 
 
 @torch.no_grad()
 def compute_audio_mu_sigma(clip_iter, n_items, embedder, device: str = "cuda",
                            desc: str = "Audio stats"):
-    """Public entry point for the streaming audio-embedding statistics.
-
-    `clip_iter` yields (wav (b, c, T), sr); the embeddings are accumulated as
-    running sums, so peak memory does not grow with n_items -- decoding and
-    embedding N clips costs TIME, not RAM. Returns (mu, sigma, n_vectors)."""
     return _audio_clips_to_mu_sigma(clip_iter, n_items, embedder, device, desc)
 
 
 def compute_fad(mu_gen, sigma_gen, ref_stats: dict, device: str = "cuda") -> float:
-    """Frechet Audio Distance between generated statistics and a reference built
-    by precompute_audio_reference() / compute_audio_mu_sigma(). Same Gaussian
-    formula as FD-DAC, on audio embeddings instead of DAC latents."""
     mu_ref = ref_stats["mu"].to(device)
     sigma_ref = ref_stats["sigma"].to(device)
     fad = compute_frechet_distance(mu_ref, sigma_ref,
@@ -657,7 +431,6 @@ def compute_fad(mu_gen, sigma_gen, ref_stats: dict, device: str = "cuda") -> flo
 
 
 def make_embedders(enabled, device: str = "cuda", encodec_sr: int = 24000) -> dict:
-    """Instantiate only the audio embedders needed by `enabled`."""
     emb = {}
     if "fad_encodec" in enabled:
         emb["encodec"] = EncodecEmbedder(audio_sr_model=encodec_sr, device=device)
@@ -668,25 +441,6 @@ def make_embedders(enabled, device: str = "cuda", encodec_sr: int = 24000) -> di
 
 def build_references(enabled, val_dataset, val_wav_root, embedders, cache_dir,
                      device: str = "cuda", strict: bool = True) -> dict:
-    """Pre-compute (and cache) only the references needed by `enabled`.
-    DAC reference is the real val latents; the FAD references are the real val
-    wavs embedded directly (no DAC).
-
-    NOT USED BY THE CONDITIONED PIPELINE. training_cond.py builds its own
-    references inline (it needs the val file list to come from the recorded
-    split, never from globbing the wav directory); this entry point belongs to
-    the unconditional project, which shares this module. There is therefore no
-    `metrics.strict` key in cond_default.yaml — an earlier version of this
-    docstring pointed at one, and it never existed.
-
-    A metric in `enabled` is an EXPLICIT request, so by default
-    (strict=True) a FAD reference that cannot be built — missing val wavs, an
-    unloadable audio backend (FFmpeg / torchcodec), or VGGish weights that
-    cannot be fetched — is a HARD ERROR that STOPS the run at startup, BEFORE
-    any training, with a clear message. This prevents silently training for
-    hours believing a metric is on when it is not. Pass strict=False only when
-    you deliberately want the run to proceed and skip any FAD that cannot be
-    built (e.g. a sweep across offline nodes)."""
     cache_dir = Path(cache_dir)
     refs = {}
     if "fd_dac" in enabled or "kl_dac" in enabled:
@@ -723,26 +477,8 @@ def evaluate_generation(model, normalizer, val_dataset, *, enabled, references,
                         t_min: float = 0.001, t_max: float = 0.999,
                         seed: Optional[int] = None,
                         device: str = "cuda", use_amp: bool = False) -> dict:
-    """
-    Generate N samples ONCE, then compute every metric in `enabled`, reusing the
-    same generated latents (DAC metrics use them directly; audio metrics decode
-    them once per embedder). Returns a flat dict of scalars plus the latents:
-      {"fd_dac":.., "kl_real_gen":.., "kl_gen_real":.., "fad_encodec":..,
-       "fad_vggish":.., "generated_latents": <tensor>}.
-    Only the enabled keys are present. token_dim is inferred (72 or 1024).
-    (t_min, t_max, euler_steps come from cfg.sampling so the metric sampler
-    matches the one used to generate the logged audio — see euler_integrate.)
-    `seed` (cfg.metrics.seed) fixes the generation noise via a DEDICATED Generator,
-    so the same checkpoint yields the same FD/KL every eval (comparable across
-    checkpoints) WITHOUT touching the global training RNG. null = free-running.
-    """
-    # NOTE: evaluate_generation() is the UNCONDITIONAL end-to-end audio-metrics
-    # helper and is NOT used by the conditioned pipeline (which uses
-    # precompute_latent_reference + condition_metrics). Its Euler sampler lives in
-    # the uncond `sampling.py`. Guard the import so a stray call fails clearly
-    # instead of raising a bare ModuleNotFoundError (report #13).
     try:
-        from sampling import euler_integrate      # shared sampler (avoids divergence)
+        from sampling import euler_integrate
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
             "evaluate_generation() is the unconditional metrics path (needs the "
@@ -751,11 +487,11 @@ def evaluate_generation(model, normalizer, val_dataset, *, enabled, references,
     embedders = embedders or {}
     model.eval()
     n_frames = val_dataset.n_frames
-    token_dim = val_dataset[0][0].shape[-1]             # 72 or 1024, no hardcode
+    token_dim = val_dataset[0][0].shape[-1]
 
     gen_rng = None
     if seed is not None:
-        gen_rng = torch.Generator(device=device)        # dedicated, isolated RNG
+        gen_rng = torch.Generator(device=device)
         gen_rng.manual_seed(int(seed))
 
     gen_list = []
@@ -765,8 +501,8 @@ def evaluate_generation(model, normalizer, val_dataset, *, enabled, references,
         x = euler_integrate(model, x, steps=euler_steps,
                             t_min=t_min, t_max=t_max, use_amp=use_amp)
         gf = x[0].cpu()
-        if torch.isfinite(gf).all():            # drop NaN/inf samples so they do
-            gen_list.append(gf)                 # not poison mu/sigma (-> NaN metrics)
+        if torch.isfinite(gf).all():
+            gen_list.append(gf)
         else:
             n_skipped += 1
         del x
@@ -781,7 +517,7 @@ def evaluate_generation(model, normalizer, val_dataset, *, enabled, references,
               "skipping metrics this eval.")
         return {}
 
-    generated_latents = torch.stack(gen_list)           # CPU, normalized, finite
+    generated_latents = torch.stack(gen_list)
 
     out = {}
     if "fd_dac" in enabled:
@@ -806,9 +542,6 @@ def evaluate_generation(model, normalizer, val_dataset, *, enabled, references,
     return out
 
 
-# ============================================================
-# QUICK TEST
-# ============================================================
 if __name__ == "__main__":
     print("Test compute_frechet_distance...")
     d = 128
@@ -846,7 +579,6 @@ if __name__ == "__main__":
     kl = compute_kl_both(gen_latents, ref_stats, device="cpu", block_size=4)
     print(f"  FD-DAC: {fd_dac:.4f}")
     print(f"  KL(real||gen): {kl['kl_real_gen']:.4f} | KL(gen||real): {kl['kl_gen_real']:.4f}")
-    # block-size invariance
     fd_a = compute_fd_dac(gen_latents, ref_stats, device="cpu", block_size=4)
     fd_b = compute_fd_dac(gen_latents, ref_stats, device="cpu", block_size=16)
     assert abs(fd_a - fd_b) < 1e-9
