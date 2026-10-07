@@ -9,7 +9,7 @@ all the remaining CLI arguments to it. Mirrors the unconditional launcher
 in the sister repository.
 
 Use:
-    # All defaults (1 GPU, configs/cond_default.yaml)
+    # All defaults (1 GPU, configs/training_cond_default.yaml)
     python launch_training_cond.py
 
     # Custom config

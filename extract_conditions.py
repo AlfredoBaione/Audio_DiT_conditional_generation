@@ -21,10 +21,7 @@ import soundfile as sf
 import torch
 from tqdm import tqdm
 
-from conditions import (
-    ConditionRegistry,
-    DAC_SAMPLE_RATE,
-)
+from conditions import (ConditionRegistry)
 import latent_codec as lc
 
 

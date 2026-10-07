@@ -22,7 +22,6 @@ from conditions import (
     MIDI_DRUM_CLASSES,
     midi_roll_to_events,
     CONDITION_CONFIG,
-    DAC_FRAMES_PER_S,
 )
 
 

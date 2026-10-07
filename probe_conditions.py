@@ -1294,15 +1294,15 @@ def main():
                          "is one embedding and does not depend on the geometry.")
     ap.add_argument("--n_probes", type=int, default=16)
     ap.add_argument("--duration_s", type=float, default=5.0)
-    ap.add_argument("--codec", choices=list(_lc.CODEC_NAMES),
-                    default=_lc.DEFAULT_CODEC,
+    ap.add_argument("--codec", choices=["dac", "encodec"],
+                    default="dac",
                     help="the dataset's codec (its dataset_meta.json): the "
                          "synthesis sample rate and the extractors' frame "
                          "grid follow it, as in the training")
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
-    _lc.activate(args.codec)
+    _lc.activate({"dac": "dac_44khz", "encodec": "encodec_32khz"}[args.codec])
 
     global_probe = is_global_probe(args.condition)
     if not global_probe and args.n_frames is None:

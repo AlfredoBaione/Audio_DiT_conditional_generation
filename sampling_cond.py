@@ -13,10 +13,8 @@ import torch
 import numpy as np
 import soundfile as sf
 
-from audio_dataset_npy import (
-    LatentNormalizer, DAC_SAMPLE_RATE, DAC_FRAMES_PER_S,
-)
-from network_cond import (ConditionedAudioDiT, TOKEN_DIM,
+from audio_dataset_npy import LatentNormalizer
+from network_cond import (ConditionedAudioDiT,
                           ckpt_frame_reinject_every,
                           ckpt_text_cross_every, ckpt_text_ctx_dim,
                           check_ckpt_reinject_gate, ckpt_attention)

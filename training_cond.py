@@ -43,11 +43,10 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from audio_dataset_npy import (
-    DAC_LATENT_DIM, DAC_SAMPLE_RATE, frames_per_chunk,
-)
+from audio_dataset_npy import frames_per_chunk
+
 import latent_codec as lc
-from network_cond import (ConditionedAudioDiT, TOKEN_DIM, check_ckpt_reinject_gate,
+from network_cond import (ConditionedAudioDiT, check_ckpt_reinject_gate,
                           ckpt_attention, ATTENTION_KINDS)
 from audio_dataset_cond import (
     build_conditioned_datasets, collate_conditioned, load_caption_table,
@@ -289,7 +288,7 @@ def merge_cli_overrides(cfg, dotlist, where):
 def load_config():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=str,
-                        default="configs/cond_default.yaml")
+                        default="configs/training_cond_default.yaml")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path checkpoint for resume (override YAML). "
                               "The model architecture, the conditioning "

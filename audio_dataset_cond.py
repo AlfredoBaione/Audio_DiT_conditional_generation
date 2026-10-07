@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from audio_dataset_npy import (
-    LatentNormalizer, DAC_LATENT_DIM, SUPPORTED_EXTS,
+    LatentNormalizer, SUPPORTED_EXTS,
     frames_per_chunk,
     load_source_split, compute_split, _class_of_file, _chunks_from_files,
     _meta_latent_frames, NORMALIZER_MAX_CHUNKS,

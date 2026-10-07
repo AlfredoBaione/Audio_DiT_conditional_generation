@@ -36,6 +36,9 @@ import numpy as np
 
 import latent_codec as lc
 
+CODEC_CHOICES = {"dac": "dac_44khz", "encodec": "encodec_32khz"}
+CODEC_CLI_NAME = {v: k for k, v in CODEC_CHOICES.items()}
+
 try:
     import torch
     import torch.nn.functional as F
@@ -950,7 +953,7 @@ class VendoredChunker:
                     yield kept, chunk, last_end
 
 
-class DACEncoder:
+class CodecEncoder:
     def __init__(self, device: str = "cuda", codec: str = lc.DEFAULT_CODEC):
         self.spec = lc.get_spec(codec)
         tag = f"[{self.spec.label}]"
@@ -1702,13 +1705,13 @@ def _force_cpu_extractors(registry, names=None):
     _set_extractor_device(registry, names, "cpu")
 
 
-def _process_gpu_batch(dac_enc, batch, sr, n_frames: int,
+def _process_gpu_batch(encoder, batch, sr, n_frames: int,
                        registry=None, gpu_names=None, force=False):
     if not batch:
         return 0, 0
 
     n_lat = _encode_and_save_batch(
-        dac_enc, [it for it in batch if it.get("latent_path")], sr, n_frames)
+        encoder, [it for it in batch if it.get("latent_path")], sr, n_frames)
 
     n_cond = 0
     if registry is not None and gpu_names:
@@ -1725,12 +1728,12 @@ def _process_gpu_batch(dac_enc, batch, sr, n_frames: int,
     return n_lat, n_cond
 
 
-def _encode_and_save_batch(dac_enc, batch, sr, n_frames: int) -> int:
-    if not batch or dac_enc is None:
+def _encode_and_save_batch(encoder, batch, sr, n_frames: int) -> int:
+    if not batch or encoder is None:
         return 0
     audios = [it["audio"] for it in batch]
-    lats = dac_enc.encode_batch(audios, sr)
-    tag, dim = f"[{dac_enc.spec.label}]", dac_enc.spec.latent_dim
+    lats = encoder.encode_batch(audios, sr)
+    tag, dim = f"[{encoder.spec.label}]", encoder.spec.latent_dim
     if len(lats) != len(batch):
         raise RuntimeError(
             f"{tag} Encoder returned {len(lats)} latents for "
@@ -1886,9 +1889,9 @@ def _meta_dict(args, chunk_length, chunk_overlap, latent_frames_per_chunk=None):
         "pad_last_chunk": args.pad_last_chunk,
         "keep_num_chunks_per_file": args.keep_num_chunks_per_file,
         "latent_frames_per_chunk": latent_frames_per_chunk,
-        "latent_dim": lc.get_spec(args.codec).latent_dim,
-        "codec": lc.get_spec(args.codec).name,
-        "dac_model": "44khz" if args.codec == "dac_44khz" else None,
+        "latent_dim": lc.active().latent_dim,
+        "codec": lc.active().name,
+        "dac_model": "44khz" if lc.active().name == "dac_44khz" else None,
         "min_chunk_sec": args.min_chunk_sec,
         "silence_threshold": args.silence_threshold,
         "max_silence_ratio": args.max_silence_ratio,
@@ -1944,7 +1947,7 @@ def check_or_write_meta(out_root: Path, meta: dict):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Streaming preprocessing (chunk -> DAC encode -> latents), "
+        description="Streaming preprocessing (chunk -> codec encode -> latents), "
                     "supervisor-style. Optional per-chunk WAV/conditions, "
                     "incremental, with the train/val/test split decided here "
                     "and recorded in splits.json.",
@@ -1958,18 +1961,18 @@ def build_parser():
                              "built-in defaults < config file < command line, so "
                              "a flag you type always wins over the file.")
 
-    parser.add_argument("--codec", type=str, default=lc.DEFAULT_CODEC,
-                        choices=list(lc.CODEC_NAMES),
+    parser.add_argument("--codec", type=str, default="dac",
+                        choices=list(CODEC_CHOICES),
                         help="The autoencoder that turns each chunk into the "
-                             "latents the DiT models: dac_44khz (default; 72-d "
-                             "latents, 86.13 frames/s) or encodec_32khz "
-                             "(MusicGen's EnCodec; 128-d continuous latents, 50 "
+                             "latents the DiT models: dac (default; 44.1 kHz, "
+                             "72-d latents, 86.13 frames/s) or encodec (MusicGen's "
+                             "EnCodec; 32 kHz, 128-d continuous latents, 50 "
                              "frames/s). Recorded in dataset_meta.json -- the "
                              "training reads it from there. Part of the dataset "
                              "identity: one OUT dir holds one codec.")
     parser.add_argument("--sr", type=int, default=None,
                         help="Target sample rate. Follows --codec when not given "
-                             "(44100 for dac_44khz, 32000 for encodec_32khz); "
+                             "(44100 for dac, 32000 for encodec); "
                              "any other value is refused.")
     parser.add_argument("--chunk_duration", type=float, default=5.0,
                         help="Chunk length in seconds (default: 5.0).")
@@ -2017,14 +2020,14 @@ def build_parser():
                              "(default: --chunk_duration).")
 
     parser.add_argument("--device", type=str, default="cuda",
-                        help="Device for the DAC encoder (and, unless "
+                        help="Device for the codec encoder (and, unless "
                              "--cond_device says otherwise, for the GPU-capable "
                              "condition extractors).")
     parser.add_argument("--cond_device", type=str, default=None,
                         help="Device for the GPU-capable condition extractors "
                              "(f0 via torchcrepe, rhythm via beat_this). "
                              "Default: follow --device. These run in the MAIN "
-                             "process, next to the DAC batch, so no worker ever "
+                             "process, next to the encoder batch, so no worker ever "
                              "touches CUDA. Pure-DSP conditions (chroma, energy) "
                              "always run on CPU in the workers, "
                              "whatever this says. The device changes speed only, "
@@ -2037,7 +2040,7 @@ def build_parser():
                              "--save_wav val). A bare --save_wav means 'all', as "
                              "before. Anything but 'none'/'all' needs the split, "
                              "so it is resolved from splits.json. The wavs are "
-                             "the REAL source audio (never DAC round-trips): "
+                             "the REAL source audio (never codec round-trips): "
                              "'val' is what a standard FAD reference is built "
                              "from, and it costs ~10x less disk than 'all'.")
 
@@ -2129,8 +2132,9 @@ def build_parser():
                              "table, so another N can be re-derived later "
                              "without re-reading a single .npz.")
 
-    parser.add_argument("--skip_dac", action="store_true",
-                        help="Do everything except DAC encoding (debug).")
+    parser.add_argument("--skip_encoder", "--skip_dac", dest="skip_encoder",
+                        action="store_true",
+                        help="Do everything except the codec encoding (debug).")
     parser.add_argument("--force", action="store_true",
                         help="Recompute the latents/conditions of the chunks this "
                              "run encounters, instead of skipping the ones already "
@@ -2153,12 +2157,12 @@ def build_parser():
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader workers doing the CPU work (load, "
                              "acoustic, chunking, condition extraction) in "
-                             "parallel with the GPU DAC. 0 = single process "
+                             "parallel with the GPU encoder. 0 = single process "
                              "(default). Start with 4 on a large dataset; each "
                              "worker loads one condition model when conditions "
                              "are enabled.")
     parser.add_argument("--batch_size", type=int, default=8,
-                        help="Chunks encoded per DAC forward pass (default: 8).")
+                        help="Chunks encoded per encoder forward pass (default: 8).")
     parser.add_argument("--loader_batch_size", type=int, default=8,
                         help="Chunks transported in each worker IPC batch "
                              "(default: 8). Kept separate from --batch_size so "
@@ -2295,19 +2299,19 @@ def main():
         raise SystemExit("[preprocess_stream] --prefetch_factor must be >= 1.")
 
     try:
-        codec = lc.activate(args.codec)
+        codec = lc.activate(CODEC_CHOICES[args.codec])
     except ValueError as e:
         raise SystemExit(f"[preprocess_stream] --codec: {e}")
     if args.sr is None:
         args.sr = codec.sample_rate
     elif int(args.sr) != codec.sample_rate:
         raise SystemExit(
-            f"[preprocess_stream] --sr {args.sr}, but {codec.name} encodes "
+            f"[preprocess_stream] --sr {args.sr}, but {args.codec} encodes "
             f"{codec.sample_rate} Hz audio. Leave --sr unset (it follows "
             f"--codec) or set it to {codec.sample_rate}. The latent frame rate "
             f"and all conditions assume the codec's own rate.")
     args.sr = int(args.sr)
-    print(f"[codec] {codec.name}: {codec.sample_rate} Hz, hop {codec.hop_length} "
+    print(f"[codec] {args.codec}: {codec.sample_rate} Hz, hop {codec.hop_length} "
           f"-> {codec.frames_per_s:.2f} frames/s, {codec.latent_dim}-d latents")
 
     chunk_length = int(round(args.chunk_duration * args.sr))
@@ -2326,9 +2330,11 @@ def main():
             _old_codec = None
         if _old_codec is not None and _old_codec != codec.name:
             raise SystemExit(
-                f"[preprocess_stream] {out_root} holds a {_old_codec} dataset, "
-                f"this run asks for {codec.name}. To add to it (a condition, the "
-                f"wavs), pass --codec {_old_codec} with the other parameters it "
+                f"[preprocess_stream] {out_root} holds a "
+                f"{CODEC_CLI_NAME.get(_old_codec, _old_codec)} dataset, "
+                f"this run asks for {args.codec}. To add to it (a condition, the "
+                f"wavs), pass --codec {CODEC_CLI_NAME.get(_old_codec, _old_codec)} "
+                f"with the other parameters it "
                 f"was built with; a dataset in another codec needs a fresh "
                 f"output dir.")
 
@@ -2481,12 +2487,12 @@ def main():
     )
     chunker = VendoredChunker(**backend_kw)
 
-    dac_enc = None
-    if not args.skip_dac:
-        dac_enc = DACEncoder(device=args.device, codec=codec.name)
+    encoder = None
+    if not args.skip_encoder:
+        encoder = CodecEncoder(device=args.device, codec=codec.name)
 
-    if dac_enc is not None:
-        n_frames_fixed = dac_enc.n_frames_for(chunk_length, args.sr)
+    if encoder is not None:
+        n_frames_fixed = encoder.n_frames_for(chunk_length, args.sr)
     else:
         n_frames_fixed = None
         meta_path = out_root / "dataset_meta.json"
@@ -2516,8 +2522,8 @@ def main():
                             mm.close()
         if n_frames_fixed is None:
             raise SystemExit(
-                "[preprocess_stream] --skip_dac but no latent/meta on disk to read "
-                "the latent length from: run once without --skip_dac first.")
+                "[preprocess_stream] --skip_encoder but no latent/meta on disk to read "
+                "the latent length from: run once without --skip_encoder first.")
     print(f"[latents] T (real {codec.label} frames per chunk) = {n_frames_fixed}")
     if registry is not None and registry.frame_names:
         print(f"[conditions] frame-aligned to T={n_frames_fixed}")
@@ -2560,7 +2566,7 @@ def main():
         files, n_skipped = filter_complete_sources(
             files, prev_manifest, changed_srcs,
             latent_root, cond_root, wav_root, n_frames_fixed,
-            _run_cond_names, dac_enc is not None, wav_sources)
+            _run_cond_names, encoder is not None, wav_sources)
         if n_skipped:
             print(f"[resume] {n_skipped}/{n_before} source(s) already have every "
                   f"output this run would write -> not decoded at all.")
@@ -2610,10 +2616,10 @@ def main():
     loader = DataLoader(**loader_kw)
     print(f"[run] num_workers={args.num_workers}, "
           f"loader_batch_size={args.loader_batch_size}, "
-          f"dac_batch_size={args.batch_size}, "
+          f"encoder_batch_size={args.batch_size}, "
           f"prefetch_factor={args.prefetch_factor if args.num_workers else 0}, "
           f"start_method={args.worker_start_method if args.num_workers else 'none'}, "
-          f"skip_dac={args.skip_dac}")
+          f"skip_encoder={args.skip_encoder}")
 
     try:
         from tqdm import tqdm
@@ -2625,13 +2631,13 @@ def main():
     n_gcond = 0
     pending = []
     produced = {}
-    _dac_on = not (args.skip_dac or dac_enc is None)
-    _gpu_work = _dac_on or bool(gpu_cond_names)
+    _encode_on = not (args.skip_encoder or encoder is None)
+    _gpu_work = _encode_on or bool(gpu_cond_names)
 
     def _flush(items):
         nonlocal n_lat, n_gcond
         a, b = _process_gpu_batch(
-            dac_enc if _dac_on else None, items, args.sr, n_frames_fixed,
+            encoder if _encode_on else None, items, args.sr, n_frames_fixed,
             registry=registry, gpu_names=gpu_cond_names, force=args.force)
         n_lat += a
         n_gcond += b

@@ -9,7 +9,7 @@ Locks GPU(s) BEFORE importing torch, then runs test_cond.py forwarding
 all the remaining CLI arguments to it.
 
 Use:
-    # All defaults (1 GPU, configs/test_cond.yaml)
+    # All defaults (1 GPU, configs/test_cond_default.yaml)
     python launch_test_cond.py \\
         --ckpt runs/cond_A/checkpoints/checkpoint_step50000.pt
 

@@ -12,12 +12,6 @@ from typing import Optional, Tuple, List, Dict
 
 import latent_codec as lc
 
-
-DAC_SAMPLE_RATE  = 44100
-DAC_LATENT_DIM   = 72
-DAC_HOP_LENGTH   = 512
-DAC_FRAMES_PER_S = DAC_SAMPLE_RATE / DAC_HOP_LENGTH
-
 MAX_FRAMES = 4096
 
 SUPPORTED_EXTS   = {".npy"}
@@ -724,30 +718,3 @@ def build_datasets(
     return train_dataset, val_dataset, test_dataset, normalizer, label_to_idx, split_info
 
 
-if __name__ == "__main__":
-    import sys
-
-    root       = sys.argv[1] if len(sys.argv) > 1 else "./dataset_ready_cond/latents"
-    duration_s = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
-    norm_path  = sys.argv[3] if len(sys.argv) > 3 else None
-
-    print(f"Test AudioLatentDataset on: {root}")
-    print(f"duration_s={duration_s}s | normalizer_path={norm_path}\n")
-
-    train_dataset, val_dataset, test_dataset, normalizer, label_map, split_info = \
-        build_datasets(latent_root=root, duration_s=duration_s,
-                       normalizer_path=norm_path, preload=False)
-
-    if norm_path is None:
-        import os
-        os.makedirs("checkpoints_v2", exist_ok=True)
-        normalizer.save("checkpoints_v2/normalizer.pt")
-
-    print(f"\nSplit: {split_info['file_counts']} files | "
-          f"{split_info['chunk_counts']} chunks | {split_info['n_classes']} classes")
-    sample, label = train_dataset[0]
-    print(f"\nSingle sample:")
-    print(f"  shape   : {sample.shape}  (n_frames, token_dim)")
-    print(f"  label   : {label} ({train_dataset.idx_to_label[label]})")
-    print(f"  Mean    : {sample.mean():.4f}")
-    print(f"  Std     : {sample.std():.4f}")

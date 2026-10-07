@@ -11,9 +11,7 @@ from typing import Dict, List, Optional
 from abc import ABC, abstractmethod
 
 
-DAC_SAMPLE_RATE  = 44100
-DAC_HOP_LENGTH   = 512
-DAC_FRAMES_PER_S = DAC_SAMPLE_RATE / DAC_HOP_LENGTH
+
 
 import latent_codec as _lc
 
@@ -1040,21 +1038,3 @@ def make_null_global_conditions(B: int,
             for n, cfg in global_configs.items()}
 
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Test ConditionRegistry (CLAP-based, no label)")
-    print("=" * 60)
-
-    reg = ConditionRegistry()
-    print(reg)
-    print(f"\nFrame cond dims:    {reg.frame_cond_dims}")
-    print(f"Global cond configs: {reg.global_cond_configs}")
-
-    print("\n--- Test CLAP text encoding (single prompt) ---")
-    if "text" in reg.global_extractors:
-        t = reg.global_extractors["text"]
-        emb = t.encode_text("baroque sacred music")
-        print(f"  Embedding shape: {emb.shape}, "
-              f"norm: {np.linalg.norm(emb):.4f} (expected ~1.0)")
-        t.unload()
-        print("  CLAP offloaded from GPU.")

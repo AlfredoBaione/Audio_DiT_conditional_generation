@@ -5,7 +5,7 @@ source_dir: "./Entire_music_reduced"
 output_dir: "./dataset_ready_cond"
 
 # chunking (part of the dataset identity)
-codec:           "dac_44khz"   # dac_44khz (72-d, 86.13 frames/s) | encodec_32khz (128-d, 50 frames/s)
+codec:           "dac"         # dac (72-d, 86.13 frames/s) | encodec (128-d, 50 frames/s)
 sr:              null          # null = the codec's own rate
 chunk_duration:  5.0
 chunk_overlap:   0.0
@@ -56,7 +56,7 @@ label_csv:    null             # for label_source: csv
 # execution
 device:      "cuda"
 cond_device: null              # null = same as device
-skip_dac:    false             # true = everything but the codec encode
+skip_encoder: false            # true = everything but the codec encode
 num_workers:       4
 batch_size:        16
 loader_batch_size: 8

@@ -16,9 +16,9 @@ from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from audio_dataset_npy import LatentNormalizer, DAC_SAMPLE_RATE
+from audio_dataset_npy import LatentNormalizer
 from audio_dataset_cond import ConditionedAudioDataset, load_source_split
-from network_cond import (ConditionedAudioDiT, TOKEN_DIM,
+from network_cond import (ConditionedAudioDiT,
                           ckpt_frame_reinject_every,
                           ckpt_text_cross_every, ckpt_text_ctx_dim,
                           check_ckpt_reinject_gate, ckpt_attention)
@@ -51,10 +51,10 @@ def load_config():
         add_help=True,
     )
     parser.add_argument("--config", type=str,
-                        default="configs/test_cond.yaml",
+                        default="configs/test_cond_default.yaml",
                         help="Test config, layered ON TOP of the checkpoint's "
                              "own training config (default: "
-                             "configs/test_cond.yaml)")
+                             "configs/test_cond_default.yaml)")
     parser.add_argument("--ckpt", type=str, required=True,
                         help="Path to checkpoint (.pt) - typically "
                              "runs/<run_name>/checkpoints/checkpoint_step<N>.pt")
@@ -106,7 +106,7 @@ def load_config():
               f"enabled_frame={cfg.conditioning.enabled_frame}, "
               f"enabled_global={cfg.conditioning.enabled_global}).")
     else:
-        train_yaml = "configs/cond_default.yaml"
+        train_yaml = "configs/training_cond_default.yaml"
         if not os.path.exists(train_yaml):
             raise FileNotFoundError(
                 f"The checkpoint stores no training config and {train_yaml} "
