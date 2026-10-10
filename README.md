@@ -898,6 +898,58 @@ drops from 0.49–0.54 (Transformer) to 0.01–0.02.
   computation of the formula above, and that λ and the norm receive gradient in
   every block.
 
+### QK-norm — `model.qk_norm`
+
+| value | q and k of every attention |
+|---|---|
+| `true` (default) | per-head RMSNorm with a learned gain (one for q, one for k, shared by the heads, ε = 1e-6), after the projection and before RoPE, as in Stable Audio 3 |
+| `false` | used as they come out of the projection; every run before 9 Oct 2026 |
+
+Stable Audio 3 ([arXiv 2605.17991](https://arxiv.org/abs/2605.17991), Sec. 2.2,
+eq. 2) normalises q and k in every self- and cross-attention "to prevent
+dot-product outputs from growing unconstrained"; both released DiTs have it
+(`small` with standard, `medium` with differential attention). Without it the
+logit q·kᵀ/√d grows with the norms of W_q, W_k and with the AdaLN scale, and
+nothing bounds it. An XL run on SHS (batch 16, lr 1e-4, no weight decay, no
+clipping) trained smoothly for 380k steps, then one isolated grad-norm spike sent
+the train, validation and EMA losses back to their early-training values.
+
+- Applied in `SelfAttention`, in both maps of `DifferentialSelfAttention` (the
+  same norm for q1/q2 and for k1/k2, as in SA3) and in `CrossAttention`.
+  `2 × head_dim` parameters per attention layer (4k on `XL`).
+- **It changes the state_dict and what the weights compute**, so it is checked on
+  `--resume` and `paths.init_from` like `model.attention`: a different value is a
+  new run. `sampling_cond.py` and `test_cond.py` read it off the checkpoint's
+  weights (`network_cond.ckpt_qk_norm`: an `attn.q_norm.weight` means on);
+  checkpoints written before the option read back as `false` and load as before.
+- `python test_functions/test_network_cond.py` checks every attention against an
+  explicit computation, that q/k weights scaled ×50 leave the output unchanged
+  with the norm (and not without), and that the gains receive gradient.
+
+### Learning rate, optimizer, clipping — `training.lr_schedule`, `training.adam_*`, `training.weight_decay*`, `training.grad_clip`
+
+| key | default | Stable Audio 3 | what it does |
+|---|---|---|---|
+| `lr_schedule` | `inverse_power` | `inverse_power` | after the linear warmup, `lr · (1 + step / lr_inv_gamma)^−lr_power`; `cosine`: constant until `decay_start_frac`, then cosine to 0 (every run before 9 Oct 2026) |
+| `lr_inv_gamma`, `lr_power` | 1e6, 0.5 | 1e6, 0.5 | the lr is ×0.95 at 100k steps, ×0.85 at 380k, ×0.71 at 1M |
+| `adam_betas` | [0.9, 0.999] | [0.9, 0.95] | AdamW betas |
+| `adam_eps` | 1e-8 | — | AdamW eps |
+| `weight_decay` | 0.0 | 0.01 | decoupled weight decay |
+| `weight_decay_matrices_only` | true | — | with `weight_decay > 0`: two AdamW groups, decay on the weight matrices only; biases, norm gains (q/k norms included), the λ vectors and the text null token are not decayed |
+| `grad_clip` | 0.0 (off) | not stated | global-norm clipping after gradient accumulation; with grad norms of 0.1–0.3, 1.0 cuts only spikes |
+
+The paper's learning rates (Muon 1e-5, AdamW 1e-6, Sec. 3.5) belong to its
+Muon+AdamW hybrid and the paragraph speaks of generator and discriminator; it
+does not say they hold for pre-training, so `training.lr` keeps its value.
+
+- The startup log prints what is in effect: `LR schedule: ...` and
+  `Optimizer: AdamW | betas=... | eps=... | weight_decay=... | grad_clip=...`.
+- **Resume:** keys a checkpoint predates are set to what it was trained with
+  (`cosine`, [0.9, 0.999], 1e-8, one group), not to the YAML defaults.
+  `grad_clip` and the schedule shape passed on the command line take effect;
+  lr, betas, eps and weight_decay come back with the optimizer state, and the
+  startup log says so when they differ from the config.
+
 ### Where the training puts its timesteps — `training.t_sampler`
 
 `t = 0` is pure noise, `t = 1` the data.

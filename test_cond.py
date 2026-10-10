@@ -21,7 +21,8 @@ from audio_dataset_cond import ConditionedAudioDataset, load_source_split
 from network_cond import (ConditionedAudioDiT,
                           ckpt_frame_reinject_every,
                           ckpt_text_cross_every, ckpt_text_ctx_dim,
-                          check_ckpt_reinject_gate, ckpt_attention)
+                          check_ckpt_reinject_gate, ckpt_attention,
+                          ckpt_qk_norm)
 from conditions import ConditionRegistry
 import latent_codec as lc
 from metrics import (precompute_latent_reference, precompute_audio_reference,
@@ -280,7 +281,9 @@ def main():
     text_cross_every = ckpt_text_cross_every(ckpt)
     text_ctx_dim = ckpt_text_ctx_dim(ckpt)
     attention = ckpt_attention(ckpt)
+    qk_norm = ckpt_qk_norm(ckpt)
     print(f"[test_cond] Self-attention:        {attention}")
+    print(f"[test_cond] QK-norm:               {'on' if qk_norm else 'off'}")
     print(f"[test_cond] Euler steps:           {cfg.sampling.euler_steps} | "
           f"t schedule: {tc.t_schedule_of(cfg.sampling)}")
 
@@ -293,6 +296,7 @@ def main():
         text_cross_every=text_cross_every,
         text_ctx_dim=text_ctx_dim,
         attention=attention,
+        qk_norm=qk_norm,
         token_dim=CODEC.latent_dim,
     ).to(device)
 

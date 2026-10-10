@@ -17,7 +17,8 @@ from audio_dataset_npy import LatentNormalizer
 from network_cond import (ConditionedAudioDiT,
                           ckpt_frame_reinject_every,
                           ckpt_text_cross_every, ckpt_text_ctx_dim,
-                          check_ckpt_reinject_gate, ckpt_attention)
+                          check_ckpt_reinject_gate, ckpt_attention,
+                          ckpt_qk_norm)
 import latent_codec as lc
 from conditions import (
     ConditionRegistry,
@@ -406,6 +407,7 @@ def main():
     text_cross_every = ckpt_text_cross_every(ckpt)
     text_ctx_dim = ckpt_text_ctx_dim(ckpt)
     attention = ckpt_attention(ckpt)
+    qk_norm = ckpt_qk_norm(ckpt)
 
     model = ConditionedAudioDiT(
         kind=ckpt.get("model_kind", "L"),
@@ -416,6 +418,7 @@ def main():
         text_cross_every=text_cross_every,
         text_ctx_dim=text_ctx_dim,
         attention=attention,
+        qk_norm=qk_norm,
         token_dim=CODEC.latent_dim,
     ).to(device)
 

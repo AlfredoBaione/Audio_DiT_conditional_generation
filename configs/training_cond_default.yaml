@@ -8,6 +8,7 @@ model:
   frame_reinject_every: 1    # 0 = frame conditions at the input only; N = re-injected every N blocks
   text_cross_every: 0        # 0 = off; N = text cross-attention every N blocks
   attention: standard        # standard | differential (DIFF Transformer)
+  qk_norm: true              # per-head RMSNorm on q and k before RoPE (Stable Audio 3); false = runs before it
 
 data:
   train_batch_size: 8
@@ -21,14 +22,20 @@ data:
 training:
   num_steps: 1000001
   lr: 1.0e-4
+  lr_schedule: inverse_power # inverse_power: lr * (1 + step / lr_inv_gamma)^-lr_power (Stable Audio 3) | cosine: constant, cosine decay from decay_start_frac
+  lr_inv_gamma: 1.0e6
+  lr_power: 0.5
   seed: 42
   strict_conditions: true    # false = missing conditions zero-filled (debug only)
-  weight_decay: 0.0
-  grad_clip:    0.0          # 0 = off
+  weight_decay: 0.0          # Stable Audio 3: 0.01
+  weight_decay_matrices_only: true   # decay only weight matrices, not biases, norm gains, lambda vectors, null token
+  adam_betas: [0.9, 0.999]   # Stable Audio 3: [0.9, 0.95]
+  adam_eps: 1.0e-8
+  grad_clip:    0.0          # 0 = off; 1.0 cuts only spikes (normal grad norm 0.1-0.3)
   use_amp:      false
   t_sampler: logit_normal    # logit_normal | truncated_logit (truncated logit-normal shifted towards the noise, as Stable Audio 3)
-  warmup_steps: 5000
-  decay_start_frac: 0.8
+  warmup_steps: 5000         # linear, both schedules
+  decay_start_frac: 0.8      # cosine only
   use_ema:    true
   ema_decay:  0.9999
   ema_start:  5000

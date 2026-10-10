@@ -1,4 +1,5 @@
-# Tests for network_cond.py: conditioning paths, frame re-injection, differential attention.
+# Tests for network_cond.py: conditioning paths, frame re-injection, differential attention,
+# QK-norm.
 # Run with `pytest test_functions` or `python test_functions/test_network_cond.py`.
 
 import sys
@@ -11,7 +12,8 @@ import torch
 import torch.nn as nn
 import latent_codec as lc
 from network_cond import (ConditionedAudioDiT, DifferentialSelfAttention,
-                          apply_rotary_pos_emb, ckpt_attention)
+                          apply_rotary_pos_emb, ckpt_attention, ckpt_qk_norm,
+                          QK_NORM_EPS)
 
 B, N = 2, 430
 TOKEN_DIM = lc.active().latent_dim   # 72 con DAC (default), 128 con EnCodec
@@ -37,7 +39,7 @@ def test_frame_f0_only():
 
 def test_frame_and_global():
     x, t = _inputs()
-    model2 = ConditionedAudioDiT(
+    model2 = ConditionedAudioDiT(token_dim=TOKEN_DIM,
         kind='S',
         frame_cond_dims={"f0": 2, "chroma": 12, "rhythm": 2},
         frame_cond_out_dims={"f0": 16, "chroma": 64, "rhythm": 32},
@@ -156,7 +158,7 @@ def test_reinjection_stride_and_inert_cases():
     assert model8.reinject_layers == []
 
     try:
-        ConditionedAudioDiT(kind='S', frame_cond_dims={"f0": 2},
+        ConditionedAudioDiT(token_dim=TOKEN_DIM, kind='S', frame_cond_dims={"f0": 2},
                             frame_cond_out_dims={"f0": 16},
                             global_cond_configs={}, frame_reinject_every=-1)
         raise AssertionError("negative stride should have raised")
@@ -253,6 +255,221 @@ def test_differential_attention():
         raise AssertionError("an odd number of heads should have raised")
     except ValueError as e:
         print(f"  odd head count rejected: {e}")
+
+
+def _rms(x, w):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + QK_NORM_EPS) * w
+
+
+def _wake_up(model):
+    with torch.no_grad():
+        for blk in model.blocks:
+            nn.init.normal_(blk.adaLN_modulation[-1].weight, std=0.02)
+            nn.init.normal_(blk.adaLN_modulation[-1].bias,   std=0.02)
+            if blk.cross_attn is not None:
+                nn.init.normal_(blk.cross_attn.proj.weight, std=0.02)
+        nn.init.normal_(model.final_layer.linear.weight, std=0.02)
+        nn.init.normal_(model.final_layer.adaLN_modulation[-1].weight, std=0.02)
+
+
+def test_qk_norm_weights_and_checkpoints():
+    plain_kw = dict(token_dim=TOKEN_DIM,
+                    kind='S', frame_cond_dims={}, frame_cond_out_dims={},
+                    global_cond_configs={})
+    nl, hd = 6, 512 // 8
+    for attention in ("standard", "differential"):
+        m_off = ConditionedAudioDiT(**plain_kw, attention=attention)
+        m_on  = ConditionedAudioDiT(**plain_kw, attention=attention, qk_norm=True)
+        assert not m_off.qk_norm and m_on.qk_norm
+        sd_off, sd_on = m_off.state_dict(), m_on.state_dict()
+        extra = sorted(set(sd_on) - set(sd_off))
+        assert set(sd_off) <= set(sd_on)
+        assert len(extra) == 2 * nl and all(
+            k.endswith(".attn.q_norm.weight") or k.endswith(".attn.k_norm.weight")
+            for k in extra), extra
+        assert all(sd_on[k].shape == (hd,) and torch.all(sd_on[k] == 1)
+                   for k in extra)
+        print(f"  {attention}: +{len(extra)} gain vectors of {hd} "
+              f"(q_norm/k_norm in {nl} blocks), initialised to 1")
+
+        m_off.load_state_dict(sd_off)
+        missing, unexpected = m_on.load_state_dict(sd_off, strict=False)
+        assert unexpected == [] and sorted(missing) == extra
+        try:
+            m_on.load_state_dict(sd_off)
+            raise AssertionError("an old state_dict must not load strictly "
+                                 "into a QK-norm model")
+        except RuntimeError:
+            pass
+
+        assert ckpt_qk_norm({"model_state_dict": sd_off}) is False
+        assert ckpt_qk_norm({"model_state_dict": sd_on}) is True
+        assert ckpt_qk_norm({"ema_state_dict": sd_on, "qk_norm": True}) is True
+        assert ckpt_qk_norm({"config": {"model": {"qk_norm": True}}}) is True
+        assert ckpt_qk_norm({}) is False
+        for sd, field in ((sd_off, True), (sd_on, False)):
+            try:
+                ckpt_qk_norm({"model_state_dict": sd, "qk_norm": field})
+                raise AssertionError("a field contradicting the weights should raise")
+            except RuntimeError:
+                pass
+    assert not ConditionedAudioDiT(**plain_kw).qk_norm
+    print("  ckpt_qk_norm: read off the weights; legacy checkpoints -> False; "
+          "a contradicting field is refused")
+
+
+def test_qk_norm_self_attention():
+    torch.manual_seed(0)
+    plain_kw = dict(token_dim=TOKEN_DIM,
+                    kind='S', frame_cond_dims={}, frame_cond_out_dims={},
+                    global_cond_configs={})
+    hid, nh = 512, 8
+    hd = hid // nh
+    m_on = ConditionedAudioDiT(**plain_kw, qk_norm=True)
+    att = m_on.blocks[2].attn
+    with torch.no_grad():
+        att.q_norm.weight.uniform_(0.5, 1.5)
+        att.k_norm.weight.uniform_(0.5, 1.5)
+    xa = torch.randn(B, N, hid)
+    with torch.no_grad():
+        got = att(xa)
+        q_, k_, v_ = att.qkv(xa).reshape(B, N, 3, nh, hd).permute(2, 0, 3, 1, 4)
+        q_, k_ = _rms(q_, att.q_norm.weight), _rms(k_, att.k_norm.weight)
+        cs, sn = att._cos_sin(N, xa.device, xa.dtype)
+        q_, k_ = apply_rotary_pos_emb(q_, k_, cs, sn)
+        A = torch.softmax(q_ @ k_.transpose(-1, -2) / math.sqrt(hd), -1)
+        ref = att.proj((A @ v_).transpose(1, 2).reshape(B, N, hid))
+        dd = (got - ref).abs().max().item()
+    print(f"  formula check:   max |module - explicit RMSNorm(q), RMSNorm(k)| = {dd:.3e}")
+    assert dd < 1e-5, dd
+
+    m_off = ConditionedAudioDiT(**plain_kw)
+    att_off = m_off.blocks[2].attn
+    with torch.no_grad():
+        for a in (att, att_off):
+            base = a(xa)
+            a.qkv.weight[:2 * hid] *= 50.0
+            moved = (a(xa) - base).abs().max().item()
+            a.qkv.weight[:2 * hid] /= 50.0
+            if a is att:
+                assert moved < 1e-3, moved
+                print(f"  q/k weights x50: output moves {moved:.2e} with QK-norm")
+            else:
+                assert moved > 1e-2, moved
+                print(f"  q/k weights x50: output moves {moved:.2e} without")
+
+    x, t = _inputs()
+    _wake_up(m_on)
+    m_on.zero_grad(set_to_none=True)
+    out = m_on(x, t)
+    assert out.shape == x.shape and torch.isfinite(out).all()
+    out.pow(2).mean().backward()
+    for i, blk in enumerate(m_on.blocks):
+        for nm in ("q_norm", "k_norm"):
+            g = getattr(blk.attn, nm).weight.grad
+            assert g is not None and g.abs().sum().item() > 0, f"no grad, block {i} {nm}"
+    print(f"  grad check:      q_norm/k_norm gains of all {len(m_on.blocks)} "
+          f"blocks receive gradient")
+
+
+def test_qk_norm_differential_attention():
+    torch.manual_seed(0)
+    plain_kw = dict(token_dim=TOKEN_DIM,
+                    kind='S', frame_cond_dims={}, frame_cond_out_dims={},
+                    global_cond_configs={})
+    hid, nh = 512, 8
+    hd = hid // nh
+    m = ConditionedAudioDiT(**plain_kw, attention="differential", qk_norm=True)
+    att = m.blocks[3].attn
+    with torch.no_grad():
+        att.q_norm.weight.uniform_(0.5, 1.5)
+        att.k_norm.weight.uniform_(0.5, 1.5)
+    xa = torch.randn(B, N, hid)
+    with torch.no_grad():
+        got = att(xa)
+        q_, k_, v_ = att.qkv(xa).split(hid, dim=-1)
+        q_ = q_.reshape(B, N, nh, hd).transpose(1, 2)
+        k_ = k_.reshape(B, N, nh, hd).transpose(1, 2)
+        v_ = v_.reshape(B, N, nh // 2, 2 * hd).transpose(1, 2)
+        q_, k_ = _rms(q_, att.q_norm.weight), _rms(k_, att.k_norm.weight)
+        cs, sn = att._cos_sin(N, xa.device, xa.dtype)
+        q_, k_ = apply_rotary_pos_emb(q_, k_, cs, sn)
+        A1 = torch.softmax(q_[:, 0::2] @ k_[:, 0::2].transpose(-1, -2) / math.sqrt(hd), -1)
+        A2 = torch.softmax(q_[:, 1::2] @ k_[:, 1::2].transpose(-1, -2) / math.sqrt(hd), -1)
+        lam = (torch.exp((att.lambda_q1 * att.lambda_k1).sum())
+               - torch.exp((att.lambda_q2 * att.lambda_k2).sum()) + att.lambda_init)
+        o_ = (A1 - lam * A2) @ v_
+        o_ = o_ * torch.rsqrt(o_.pow(2).mean(-1, keepdim=True) + 1e-5) * att.subln.weight
+        o_ = o_ * (1 - att.lambda_init)
+        ref = att.proj(o_.transpose(1, 2).reshape(B, N, hid))
+        dd = (got - ref).abs().max().item()
+    print(f"  formula check:   max |module - explicit, both maps normalised| = {dd:.3e}")
+    assert dd < 1e-5, dd
+
+    x, t = _inputs()
+    _wake_up(m)
+    m.zero_grad(set_to_none=True)
+    m(x, t).pow(2).mean().backward()
+    for i, blk in enumerate(m.blocks):
+        for nm in ("q_norm", "k_norm"):
+            g = getattr(blk.attn, nm).weight.grad
+            assert g is not None and g.abs().sum().item() > 0, f"no grad, block {i} {nm}"
+    print(f"  grad check:      q_norm/k_norm gains of all {len(m.blocks)} blocks "
+          f"receive gradient")
+
+
+def test_qk_norm_cross_attention():
+    torch.manual_seed(0)
+    kw = dict(token_dim=TOKEN_DIM, kind='S', frame_cond_dims={},
+              frame_cond_out_dims={}, global_cond_configs={"text": {"dim": 512}},
+              text_cross_every=2, text_ctx_dim=768)
+    m_off = ConditionedAudioDiT(**kw)
+    m_on  = ConditionedAudioDiT(**kw, qk_norm=True)
+    extra = sorted(set(m_on.state_dict()) - set(m_off.state_dict()))
+    n_cross = len(m_on.text_cross_layers)
+    assert n_cross == 3
+    assert len(extra) == 2 * (6 + n_cross), extra
+    assert sum(".cross_attn." in k for k in extra) == 2 * n_cross
+    assert ckpt_qk_norm({"model_state_dict": m_on.state_dict()}) is True
+
+    hid, nh, L = 512, 8, 5
+    hd = hid // nh
+    ca = m_on.blocks[0].cross_attn
+    with torch.no_grad():
+        nn.init.normal_(ca.proj.weight, std=0.02)
+        ca.q_norm.weight.uniform_(0.5, 1.5)
+        ca.k_norm.weight.uniform_(0.5, 1.5)
+        xa, ctx = torch.randn(B, N, hid), torch.randn(B, L, 768)
+        got = ca(xa, ctx)
+        q_ = ca.q(xa).view(B, N, nh, hd).transpose(1, 2)
+        kv = ca.kv(ctx).view(B, L, 2, nh, hd)
+        k_, v_ = kv[:, :, 0].transpose(1, 2), kv[:, :, 1].transpose(1, 2)
+
+        def _attend(q, k):
+            A = torch.softmax(q @ k.transpose(-1, -2) / math.sqrt(hd), -1)
+            return ca.proj((A @ v_).transpose(1, 2).reshape(B, N, hid))
+
+        ref = _attend(_rms(q_, ca.q_norm.weight), _rms(k_, ca.k_norm.weight))
+        dd = (got - ref).abs().max().item()
+        d_raw = (got - _attend(q_, k_)).abs().max().item()
+    print(f"  formula check:   max |cross-attention - explicit| = {dd:.3e} "
+          f"(vs {d_raw:.3e} without the norm)")
+    assert dd < 1e-5, dd
+    assert d_raw > 1e-3, d_raw
+
+    x, t = _inputs()
+    _wake_up(m_on)
+    m_on.zero_grad(set_to_none=True)
+    out = m_on(x, t, global_conditions={"text": torch.randn(B, 512)},
+               text_context=torch.randn(B, L, 768),
+               text_context_mask=torch.ones(B, L, dtype=torch.bool))
+    assert out.shape == x.shape and torch.isfinite(out).all()
+    out.pow(2).mean().backward()
+    for i in m_on.text_cross_layers:
+        for nm in ("q_norm", "k_norm"):
+            g = getattr(m_on.blocks[i].cross_attn, nm).weight.grad
+            assert g is not None and g.abs().sum().item() > 0, f"no grad, cross {i} {nm}"
+    print(f"  {n_cross} cross-attention layers carry q_norm/k_norm and receive gradient")
 
 
 if __name__ == "__main__":

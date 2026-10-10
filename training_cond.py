@@ -47,7 +47,7 @@ from audio_dataset_npy import frames_per_chunk
 
 import latent_codec as lc
 from network_cond import (ConditionedAudioDiT, check_ckpt_reinject_gate,
-                          ckpt_attention, ATTENTION_KINDS)
+                          ckpt_attention, ckpt_qk_norm, ATTENTION_KINDS)
 from audio_dataset_cond import (
     build_conditioned_datasets, collate_conditioned, load_caption_table,
 )
@@ -325,6 +325,15 @@ def load_config():
             print(f"[RESUME] model.kind restored from checkpoint: {cfg.model.kind} "
                   "(older checkpoint without full config; other params come "
                   "from the YAML/CLI).")
+        cfg.model.qk_norm = ckpt_qk_norm(_meta)
+        _ck_trn = (_meta.get("config") or {}).get("training") or {}
+        _legacy = {k: v for k, v in LEGACY_TRAINING_KEYS.items()
+                   if k not in _ck_trn}
+        for _k, _v in _legacy.items():
+            cfg.training[_k] = _v
+        print(f"[RESUME] model.qk_norm={cfg.model.qk_norm} (read off the weights)"
+              + (f" | absent from this checkpoint, set to what it was trained "
+                 f"with: {_legacy}" if _legacy else ""))
         del _meta
 
     drop_obsolete_sampling_keys(cfg)
@@ -380,6 +389,33 @@ def load_config():
     t_schedule_of(cfg.get("sampling", None))
     del _att, _tsm
 
+    _trn = cfg.training
+    _sch = _trn.get("lr_schedule", "cosine")
+    if _sch not in LR_SCHEDULES:
+        raise SystemExit(
+            f"[config] training.lr_schedule = {_sch!r}, must be one of "
+            f"{list(LR_SCHEDULES)}. Nothing was run.")
+    if _sch == "inverse_power" and not (float(_trn.get("lr_inv_gamma", 1.0e6)) > 0
+                                        and float(_trn.get("lr_power", 0.5)) >= 0):
+        raise SystemExit(
+            f"[config] training.lr_inv_gamma = {_trn.get('lr_inv_gamma')} must be "
+            f"> 0 and training.lr_power = {_trn.get('lr_power')} must be >= 0. "
+            f"Nothing was run.")
+    _betas = list(_trn.get("adam_betas", LEGACY_TRAINING_KEYS["adam_betas"]))
+    if len(_betas) != 2 or not all(0.0 <= float(b) < 1.0 for b in _betas):
+        raise SystemExit(
+            f"[config] training.adam_betas = {_betas}, must be two values in "
+            f"[0, 1), e.g. [0.9, 0.95]. Nothing was run.")
+    if not float(_trn.get("adam_eps", 1e-8)) > 0:
+        raise SystemExit(
+            f"[config] training.adam_eps = {_trn.get('adam_eps')}, must be > 0. "
+            f"Nothing was run.")
+    if float(_trn.weight_decay) < 0:
+        raise SystemExit(
+            f"[config] training.weight_decay = {_trn.weight_decay}, must be >= 0. "
+            f"Nothing was run.")
+    del _trn, _sch, _betas
+
     if args.resume is not None:
         cfg.paths.resume_from = args.resume
 
@@ -397,10 +433,26 @@ def load_config():
     return cfg, run_name
 
 
-def make_lr_lambda(num_steps: int, warmup_steps: int, decay_start_frac: float):
+LR_SCHEDULES = ("inverse_power", "cosine")
+LEGACY_TRAINING_KEYS = {
+    "lr_schedule": "cosine",
+    "adam_betas": [0.9, 0.999],
+    "adam_eps": 1e-8,
+    "weight_decay_matrices_only": False,
+}
+
+
+def make_lr_lambda(num_steps: int, warmup_steps: int, decay_start_frac: float,
+                   schedule: str = "cosine", inv_gamma: float = 1.0e6,
+                   power: float = 0.5):
+    if schedule not in LR_SCHEDULES:
+        raise ValueError(f"lr schedule must be one of {LR_SCHEDULES}, got {schedule!r}")
     decay_start = int(num_steps * decay_start_frac)
 
     def lr_lambda(step: int) -> float:
+        if schedule == "inverse_power":
+            warm = step / warmup_steps if step < warmup_steps else 1.0
+            return warm * (1.0 + step / inv_gamma) ** (-power)
         if step < warmup_steps:
             return step / warmup_steps
         if step < decay_start:
@@ -409,6 +461,83 @@ def make_lr_lambda(num_steps: int, warmup_steps: int, decay_start_frac: float):
         return 0.5 * (1 + torch.cos(torch.tensor(progress * math.pi)).item())
 
     return lr_lambda
+
+
+def lr_lambda_from_cfg(train_cfg):
+    return make_lr_lambda(
+        num_steps=train_cfg.num_steps,
+        warmup_steps=train_cfg.warmup_steps,
+        decay_start_frac=train_cfg.decay_start_frac,
+        schedule=str(train_cfg.get("lr_schedule", "cosine")),
+        inv_gamma=float(train_cfg.get("lr_inv_gamma", 1.0e6)),
+        power=float(train_cfg.get("lr_power", 0.5)),
+    )
+
+
+def is_decayed_param(name: str, p: torch.Tensor) -> bool:
+    return p.ndim >= 2 and not name.endswith("text_null")
+
+
+def optimizer_layout(train_cfg) -> str:
+    return ("matrices"
+            if bool(train_cfg.get("weight_decay_matrices_only", False))
+            and float(train_cfg.weight_decay) > 0 else "single")
+
+
+def build_optimizer(model, train_cfg, layout: str):
+    wd = float(train_cfg.weight_decay)
+    named = list(model.named_parameters())
+    if layout == "matrices":
+        groups = [
+            {"params": [p for n, p in named if is_decayed_param(n, p)],
+             "weight_decay": wd},
+            {"params": [p for n, p in named if not is_decayed_param(n, p)],
+             "weight_decay": 0.0},
+        ]
+    elif layout == "single":
+        groups = [{"params": [p for _, p in named], "weight_decay": wd}]
+    else:
+        raise ValueError(f"optimizer layout must be 'single' or 'matrices', got {layout!r}")
+    betas = train_cfg.get("adam_betas", LEGACY_TRAINING_KEYS["adam_betas"])
+    return torch.optim.AdamW(
+        groups,
+        lr=float(train_cfg.lr),
+        betas=(float(betas[0]), float(betas[1])),
+        eps=float(train_cfg.get("adam_eps", LEGACY_TRAINING_KEYS["adam_eps"])),
+    )
+
+
+def optimizer_overrides_ignored(optimizer, scheduler, train_cfg) -> list:
+    g = optimizer.param_groups[0]
+    betas = tuple(float(b) for b in
+                  train_cfg.get("adam_betas", LEGACY_TRAINING_KEYS["adam_betas"]))
+    eps = float(train_cfg.get("adam_eps", LEGACY_TRAINING_KEYS["adam_eps"]))
+    out = []
+    if not math.isclose(scheduler.base_lrs[0], float(train_cfg.lr), rel_tol=1e-9):
+        out.append(f"lr={scheduler.base_lrs[0]:g} (training.lr={float(train_cfg.lr):g})")
+    if tuple(float(b) for b in g["betas"]) != betas:
+        out.append(f"betas={tuple(g['betas'])} (training.adam_betas={list(betas)})")
+    if not math.isclose(g["eps"], eps, rel_tol=1e-9):
+        out.append(f"eps={g['eps']:g} (training.adam_eps={eps:g})")
+    if not math.isclose(g["weight_decay"], float(train_cfg.weight_decay),
+                        rel_tol=1e-9, abs_tol=1e-12):
+        out.append(f"weight_decay={g['weight_decay']:g} "
+                   f"(training.weight_decay={float(train_cfg.weight_decay):g})")
+    return out
+
+
+def restore_optimizer(model, train_cfg, optimizer, scheduler, lr_lambda, ckpt):
+    saved = ("matrices" if len(ckpt["optimizer_state_dict"]["param_groups"]) == 2
+             else "single")
+    rebuilt = None
+    if saved != optimizer_layout(train_cfg):
+        optimizer = build_optimizer(model, train_cfg, saved)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        rebuilt = saved
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    return (optimizer, scheduler, rebuilt,
+            optimizer_overrides_ignored(optimizer, scheduler, train_cfg))
 
 
 def sample_logit_normal(batch_size, device, t_min, t_max, mean=0.0, std=1.0):
@@ -2455,6 +2584,7 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
         "frame_reinject_every": int(cfg.model.get("frame_reinject_every", 0)),
         "text_cross_every":     int(cfg.model.get("text_cross_every", 0)),
         "attention":            str(cfg.model.get("attention", "standard")),
+        "qk_norm":              bool(cfg.model.get("qk_norm", False)),
         "codec":                lc.active().name,
         "config":               OmegaConf.to_container(cfg, resolve=True),
         "label_map":            label_map,
@@ -3023,11 +3153,12 @@ if __name__ == "__main__":
             "vectors already on disk and does not touch a single audio file."
         )
     ATTENTION = str(cfg.model.get("attention", "standard"))
+    QK_NORM = bool(cfg.model.get("qk_norm", False))
     print(f"[MODEL] Building ConditionedAudioDiT-{cfg.model.kind} "
           f"| frame={list(FRAME_COND_DIMS)} | global={list(GLOBAL_CONFIGS)} "
           f"| frame_reinject_every={FRAME_REINJECT_EVERY} "
           f"| text_cross_every={TEXT_CROSS_EVERY} "
-          f"| attention={ATTENTION}")
+          f"| attention={ATTENTION} | qk_norm={QK_NORM}")
     model = ConditionedAudioDiT(
         kind=cfg.model.kind,
         drop=cfg.model.get("drop", 0.0),
@@ -3038,20 +3169,13 @@ if __name__ == "__main__":
         text_cross_every=TEXT_CROSS_EVERY,
         text_ctx_dim=TEXT_CTX_DIM,
         attention=ATTENTION,
+        qk_norm=QK_NORM,
         token_dim=lc.active().latent_dim,
     ).to(device)
     ema = EMAModel(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.training.lr,
-        weight_decay=cfg.training.weight_decay,
-    )
-    lr_lambda = make_lr_lambda(
-        num_steps=cfg.training.num_steps,
-        warmup_steps=cfg.training.warmup_steps,
-        decay_start_frac=cfg.training.decay_start_frac,
-    )
+    optimizer = build_optimizer(model, cfg.training, optimizer_layout(cfg.training))
+    lr_lambda = lr_lambda_from_cfg(cfg.training)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler    = torch.amp.GradScaler('cuda', enabled=cfg.training.use_amp)
 
@@ -3117,6 +3241,15 @@ if __name__ == "__main__":
                 f"what the existing ones compute, so it needs a run from "
                 f"scratch (leave paths.init_from empty), or set "
                 f"model.attention={_ck_att} to warm-start as before.")
+        _ck_qk = ckpt_qk_norm(_ck)
+        if _ck_qk != QK_NORM:
+            raise RuntimeError(
+                f"{init_from} was trained with model.qk_norm={_ck_qk}, this run "
+                f"builds qk_norm={QK_NORM}. A warm start may only ADD "
+                f"zero-initialised weights; the QK-norm changes what the existing "
+                f"q/k weights compute, so it needs a run from scratch (leave "
+                f"paths.init_from empty), or set model.qk_norm={_ck_qk} to "
+                f"warm-start as before.")
         _sd = (_ck.get("ema_state_dict") if _ck.get("ema_ready", True)
                and "ema_state_dict" in _ck else _ck.get("model_state_dict"))
         if not isinstance(_sd, dict):
@@ -3202,6 +3335,16 @@ if __name__ == "__main__":
                 f"per-head RMSNorm) in every block. Pass "
                 f"model.attention={ckpt_att} to resume this run; a different "
                 f"attention is a NEW run from scratch.")
+        ckpt_qk = ckpt_qk_norm(ckpt)
+        if ckpt_qk != QK_NORM:
+            raise RuntimeError(
+                f"Checkpoint was trained with model.qk_norm={ckpt_qk} but the "
+                f"model was built with qk_norm={QK_NORM}. They must match to "
+                f"resume: the QK-norm changes what the q/k weights compute and "
+                f"adds its own gains in every attention layer. Pass "
+                f"model.qk_norm={ckpt_qk} to resume this run (--resume reads it "
+                f"off the checkpoint weights by itself); a different qk_norm is "
+                f"a NEW run from scratch.")
 
         ckpt_frame_dims = ckpt.get("frame_cond_dims", None)
         if ckpt_frame_dims is not None and dict(ckpt_frame_dims) != dict(FRAME_COND_DIMS):
@@ -3214,8 +3357,16 @@ if __name__ == "__main__":
             )
 
         model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        optimizer, scheduler, _rebuilt, _ignored = restore_optimizer(
+            model, cfg.training, optimizer, scheduler, lr_lambda, ckpt)
+        if _rebuilt:
+            print(f"[RESUME] optimizer rebuilt with the checkpoint's parameter "
+                  f"grouping ({_rebuilt}): the saved Adam moments are "
+                  f"indexed by it.")
+        if _ignored:
+            print(f"[RESUME] NOTE: the optimizer restored from the checkpoint "
+                  f"keeps {', '.join(_ignored)}; these training.* values are not "
+                  f"applied on resume (grad_clip and the schedule shape are).")
         if cfg.training.use_ema:
             if "ema_state_dict" in ckpt:
                 ema.load_state_dict(ckpt["ema_state_dict"])
@@ -3285,6 +3436,20 @@ if __name__ == "__main__":
     print(f"LR: {cfg.training.lr} | "
           f"EMA: {'on (decay=' + str(cfg.training.ema_decay) + ')' if cfg.training.use_ema else 'off'} | "
           f"AMP: {cfg.training.use_amp}")
+    _sch = str(cfg.training.get("lr_schedule", "cosine"))
+    print(f"LR schedule: {_sch} | warmup {cfg.training.warmup_steps} steps, then "
+          + (f"lr * (1 + step / {float(cfg.training.get('lr_inv_gamma', 1.0e6)):g})"
+             f"^-{float(cfg.training.get('lr_power', 0.5)):g} (Stable Audio 3)"
+             if _sch == "inverse_power" else
+             f"constant until {cfg.training.decay_start_frac:g} of the run, then "
+             f"cosine to 0"))
+    _g0 = optimizer.param_groups[0]
+    print(f"Optimizer: AdamW | betas={tuple(_g0['betas'])} | eps={_g0['eps']:g} | "
+          f"weight_decay={_g0['weight_decay']:g} "
+          + ("on the weight matrices only" if len(optimizer.param_groups) == 2
+             else "on every parameter")
+          + f" | grad_clip={cfg.training.grad_clip or 'off'}")
+    del _sch, _g0
     print(f"Sequence: {n_frames} frame = {n_frames} token of dim {lc.active().latent_dim}")
     print(f"Train: {len(train_dataset)} chunk | Val: {len(val_dataset)} chunk")
     print(f"Audio every {cfg.intervals.audio} step | "

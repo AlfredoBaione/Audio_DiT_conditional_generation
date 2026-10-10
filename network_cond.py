@@ -13,10 +13,25 @@ from conditions import FrameConditionEncoder, GlobalConditionEncoder
 
 
 ATTENTION_KINDS = ("standard", "differential")
+QK_NORM_EPS = 1e-6
 
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def qk_rms_norm(norm: Optional[nn.Module], x: torch.Tensor) -> torch.Tensor:
+    if norm is None:
+        return x
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        return norm(x.float()).to(x.dtype)
+
+
+def make_qk_norms(head_dim: int, enabled: bool):
+    if not enabled:
+        return None, None
+    return (nn.RMSNorm(head_dim, eps=QK_NORM_EPS, elementwise_affine=True),
+            nn.RMSNorm(head_dim, eps=QK_NORM_EPS, elementwise_affine=True))
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -67,7 +82,7 @@ class TimestepEmbedder(nn.Module):
 
 class SelfAttention(nn.Module):
     def __init__(self, hidden_size: int, n_heads: int, max_seq_len: int = 4096,
-                 theta: float = 10000.0):
+                 theta: float = 10000.0, qk_norm: bool = False):
         super().__init__()
         assert hidden_size % n_heads == 0
         self.n_heads  = n_heads
@@ -75,6 +90,7 @@ class SelfAttention(nn.Module):
 
         self.qkv  = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
         self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_norm, self.k_norm = make_qk_norms(self.head_dim, qk_norm)
 
         inv_freq = compute_default_rope_parameters(self.head_dim, theta=theta)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -89,6 +105,7 @@ class SelfAttention(nn.Module):
         B, S, _ = x.shape
         qkv = self.qkv(x).reshape(B, S, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        q, k = qk_rms_norm(self.q_norm, q), qk_rms_norm(self.k_norm, k)
 
         cos, sin = self._cos_sin(S, x.device, x.dtype)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -104,7 +121,8 @@ def diff_lambda_init(layer_idx: int) -> float:
 
 class DifferentialSelfAttention(nn.Module):
     def __init__(self, hidden_size: int, n_heads: int, layer_idx: int,
-                 max_seq_len: int = 4096, theta: float = 10000.0):
+                 max_seq_len: int = 4096, theta: float = 10000.0,
+                 qk_norm: bool = False):
         super().__init__()
         assert hidden_size % n_heads == 0
         if n_heads % 2 != 0:
@@ -119,6 +137,7 @@ class DifferentialSelfAttention(nn.Module):
 
         self.qkv  = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
         self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_norm, self.k_norm = make_qk_norms(self.head_dim, qk_norm)
 
         inv_freq = compute_default_rope_parameters(self.head_dim, theta=theta)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -148,6 +167,7 @@ class DifferentialSelfAttention(nn.Module):
         q = q.reshape(B, S, 2 * h, d).transpose(1, 2)
         k = k.reshape(B, S, 2 * h, d).transpose(1, 2)
         v = v.reshape(B, S, h, 2 * d).transpose(1, 2)
+        q, k = qk_rms_norm(self.q_norm, q), qk_rms_norm(self.k_norm, k)
 
         cos, sin = self._cos_sin(S, x.device, x.dtype)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -183,7 +203,8 @@ class FFN(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, hidden_size: int, n_heads: int, ctx_dim: int):
+    def __init__(self, hidden_size: int, n_heads: int, ctx_dim: int,
+                 qk_norm: bool = False):
         super().__init__()
         if hidden_size % n_heads != 0:
             raise ValueError(
@@ -193,6 +214,7 @@ class CrossAttention(nn.Module):
         self.q = nn.Linear(hidden_size, hidden_size, bias=True)
         self.kv = nn.Linear(ctx_dim, 2 * hidden_size, bias=True)
         self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.q_norm, self.k_norm = make_qk_norms(self.head_dim, qk_norm)
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor,
                 ctx_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -202,6 +224,7 @@ class CrossAttention(nn.Module):
         kv = self.kv(ctx.to(x.dtype)).view(B, L, 2, self.n_heads, self.head_dim)
         k = kv[:, :, 0].transpose(1, 2)
         v = kv[:, :, 1].transpose(1, 2)
+        q, k = qk_rms_norm(self.q_norm, q), qk_rms_norm(self.k_norm, k)
         attn_mask = None
         if ctx_mask is not None:
             attn_mask = ctx_mask.view(B, 1, 1, L)
@@ -213,15 +236,17 @@ class CrossAttention(nn.Module):
 class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, max_seq_len=4096,
                  mlp_ratio=4.0, drop=0.0, cross_attn_ctx_dim=0,
-                 attention="standard", layer_idx=0):
+                 attention="standard", layer_idx=0, qk_norm=False):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         if attention == "standard":
-            self.attn  = SelfAttention(hidden_size, num_heads, max_seq_len=max_seq_len)
+            self.attn  = SelfAttention(hidden_size, num_heads, max_seq_len=max_seq_len,
+                                       qk_norm=qk_norm)
         elif attention == "differential":
             self.attn  = DifferentialSelfAttention(hidden_size, num_heads,
                                                    layer_idx=layer_idx,
-                                                   max_seq_len=max_seq_len)
+                                                   max_seq_len=max_seq_len,
+                                                   qk_norm=qk_norm)
         else:
             raise ValueError(
                 f"attention must be one of {ATTENTION_KINDS}, got {attention!r}")
@@ -237,7 +262,8 @@ class DiTBlock(nn.Module):
             self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False,
                                            eps=1e-6)
             self.cross_attn = CrossAttention(hidden_size, num_heads,
-                                             int(cross_attn_ctx_dim))
+                                             int(cross_attn_ctx_dim),
+                                             qk_norm=qk_norm)
 
     def forward(self, x, c, ctx=None, ctx_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
@@ -293,6 +319,7 @@ class ConditionedAudioDiT(nn.Module):
         text_cross_every:     int = 0,
         text_ctx_dim:         int = 0,
         attention:            str = "standard",
+        qk_norm:              bool = False,
     ):
         super().__init__()
         cfg = self.CONFIGS[kind]
@@ -306,6 +333,7 @@ class ConditionedAudioDiT(nn.Module):
             raise ValueError(
                 f"attention must be one of {ATTENTION_KINDS}, got {attention!r}")
         self.attention   = attention
+        self.qk_norm     = bool(qk_norm)
 
         self.frame_cond_dims     = dict(frame_cond_dims)     if frame_cond_dims     else {}
         self.frame_cond_out_dims = dict(frame_cond_out_dims) if frame_cond_out_dims else {}
@@ -359,7 +387,7 @@ class ConditionedAudioDiT(nn.Module):
                      mlp_ratio=mlp_ratio, drop=drop,
                      cross_attn_ctx_dim=(self.text_ctx_dim
                                          if i in self.text_cross_layers else 0),
-                     attention=attention, layer_idx=i)
+                     attention=attention, layer_idx=i, qk_norm=self.qk_norm)
             for i in range(n_layers)
         ])
 
@@ -464,6 +492,14 @@ class ConditionedAudioDiT(nn.Module):
                   f"per-head RMSNorm | +{n_layers * 6 * _d} params")
         else:
             print(f"  Self-attention: standard ({n_heads} heads x {_d})")
+
+        if self.qk_norm:
+            n_att = n_layers + len(self.text_cross_layers)
+            print(f"  QK-norm: per-head RMSNorm on q and k before RoPE "
+                  f"(eps {QK_NORM_EPS:g}, Stable Audio 3) in {n_att} attention "
+                  f"layer(s) | +{n_att * 2 * _d} params")
+        else:
+            print("  QK-norm: OFF")
 
     def initialize_weights(self):
         def _basic_init(module):
@@ -664,6 +700,29 @@ def ckpt_attention(ckpt: dict) -> str:
             f"({'with' if from_weights == 'differential' else 'without'} "
             f"the lambda vectors). The weights are what gets loaded; the field "
             f"is wrong -- the checkpoint was edited or assembled by hand.")
+    return from_weights
+
+
+def ckpt_qk_norm(ckpt: dict) -> bool:
+    sd = ckpt.get("model_state_dict", None)
+    if not isinstance(sd, dict) or not sd:
+        sd = ckpt.get("ema_state_dict", None)
+    from_weights = None
+    if isinstance(sd, dict) and sd:
+        from_weights = any(k.endswith("attn.q_norm.weight") for k in sd)
+    field = ckpt.get("qk_norm", None)
+    if field is None:
+        cfg = ckpt.get("config", None)
+        if isinstance(cfg, dict):
+            field = (cfg.get("model", None) or {}).get("qk_norm", None)
+    if from_weights is None:
+        return bool(field or False)
+    if field is not None and bool(field) != from_weights:
+        raise RuntimeError(
+            f"this checkpoint says qk_norm={field!r} but its weights are "
+            f"{'with' if from_weights else 'without'} the q_norm/k_norm "
+            f"gains. The weights are what gets loaded; the field is wrong -- "
+            f"the checkpoint was edited or assembled by hand.")
     return from_weights
 
 
