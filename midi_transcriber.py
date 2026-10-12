@@ -14,6 +14,7 @@ import io
 import sys
 import time
 import types
+import importlib.machinery
 import warnings
 import contextlib
 from copy import deepcopy
@@ -68,7 +69,10 @@ def _import_authors_code(root: Path):
             sys.path.append(p)
     stub = "wandb" not in sys.modules
     if stub:
-        sys.modules["wandb"] = types.SimpleNamespace(Table=lambda **_: None)
+        wandb_stub = types.ModuleType("wandb")
+        wandb_stub.__spec__ = importlib.machinery.ModuleSpec("wandb", None)
+        wandb_stub.Table = lambda **_: None
+        sys.modules["wandb"] = wandb_stub
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
@@ -78,8 +82,8 @@ def _import_authors_code(root: Path):
         if stub:
             sys.modules.pop("wandb", None)
     for mod in (model_helper, ymt3):
-        f = Path(mod.__file__).resolve()
-        if root.resolve() not in f.parents:
+        f = Path(os.path.abspath(mod.__file__))
+        if Path(os.path.abspath(root)) not in f.parents:
             raise RuntimeError(
                 f"YourMT3+: '{mod.__name__}' was imported from {f}, not from "
                 f"the YourMT3 snapshot {root}. A module with the same generic "
