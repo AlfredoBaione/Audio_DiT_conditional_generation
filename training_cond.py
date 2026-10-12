@@ -2908,7 +2908,7 @@ if __name__ == "__main__":
     print(f"Frame cond out dims: {FRAME_COND_OUT_DIMS}")
     print(f"Global cond configs: {GLOBAL_CONFIGS}\n")
 
-    print("Loading conditioned datasets...")
+    print("Loading datasets...")
     if DIST.enabled and not DIST.is_main:
         dist_barrier(DIST)
     cond_root = cfg.paths.condition_root if Path(cfg.paths.condition_root).exists() else None

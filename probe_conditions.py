@@ -22,7 +22,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from conditions import DAC_SAMPLE_RATE, DAC_FRAMES_PER_S, CONDITION_CONFIG
+from conditions import CONDITION_CONFIG
 from typing import Optional
 
 import latent_codec as _lc
