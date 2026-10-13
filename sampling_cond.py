@@ -3,6 +3,15 @@
 import os
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
+_IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
+if os.path.isdir(_IRCAM_LOCAL):
+    _cache = os.path.join(_IRCAM_LOCAL, ".cache")
+    os.environ["HOME"] = _IRCAM_LOCAL
+    os.environ.setdefault("XDG_CACHE_HOME", _cache)
+    os.environ["HF_HOME"] = os.path.join(_cache, "huggingface")
+    os.environ["TORCH_HOME"] = os.path.join(_cache, "torch")
+
 import sys
 import math
 import argparse

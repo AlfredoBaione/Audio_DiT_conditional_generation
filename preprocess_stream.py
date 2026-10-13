@@ -16,7 +16,7 @@ if os.path.isdir(_IRCAM_LOCAL):
     _cache = os.path.join(_IRCAM_LOCAL, ".cache")
     os.environ["HOME"] = _IRCAM_LOCAL
     os.environ.setdefault("XDG_CACHE_HOME", _cache)
-    os.environ.setdefault("HF_HOME", os.path.join(_cache, "huggingface"))
+    os.environ["HF_HOME"] = os.path.join(_cache, "huggingface")
     os.environ["TORCH_HOME"] = os.path.join(_cache, "torch")
 
 import re
