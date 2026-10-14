@@ -59,6 +59,7 @@ cond_device: null              # null = same as device
 skip_encoder: false            # true = everything but the codec encode
 num_workers:       4
 batch_size:        16
+cpu_batch_size:    8
 loader_batch_size: 8
 prefetch_factor:   1
 worker_start_method: "spawn"

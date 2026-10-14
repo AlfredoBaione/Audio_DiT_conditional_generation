@@ -1024,7 +1024,6 @@ class CompanionNotes:
     def __init__(self, registry, path: Path):
         self.registry = registry
         self.path = Path(path)
-        self.t0 = 0.0
         self._parsed = {}
 
     def data(self, name):
@@ -1069,66 +1068,74 @@ def _npz_missing(cond_path: Path, names, force: bool = False) -> bool:
 
 
 def extract_and_merge_chunk_conditions(
-    registry, chunk_audio_np, sr: int, n_frames: int,
-    cond_path: Path, force: bool = False, names=None,
-    companion: Optional[CompanionNotes] = None,
-) -> bool:
+    registry, chunks, sr: int, n_frames: int, cond_paths,
+    force: bool = False, names=None, companions=None,
+) -> int:
     import numpy as np
     if names is None:
         names = list(registry.frame_names) + _split_globals_by_stage(registry)[0]
     required = set(names)
-    if not required:
-        return False
+    if not required or not chunks:
+        return 0
 
-    existing = {}
-    if cond_path.exists():
-        try:
-            with np.load(str(cond_path)) as data:
-                existing = {k: data[k] for k in data.keys()}
-        except Exception:
-            existing = {}
-        if not force and required.issubset(existing.keys()):
-            return False
+    existing, missing = [], []
+    for cond_path in cond_paths:
+        old = {}
+        if cond_path.exists():
+            try:
+                with np.load(str(cond_path)) as data:
+                    old = {k: data[k] for k in data.keys()}
+            except Exception:
+                old = {}
+        existing.append(old)
+        missing.append(required if force else required - set(old.keys()))
 
-    missing = required if force else (required - set(existing.keys()))
-    if not missing:
-        return False
-
-    new = {}
-    for name in missing:
+    new = [{} for _ in chunks]
+    for name in sorted(set().union(*missing)):
+        idx = [i for i, m in enumerate(missing) if name in m]
         ext, kind = _chunk_extractor(registry, name)
         if kind == "frame":
             if _companion_suffixes(ext):
-                if companion is None:
+                if companions is None:
                     raise RuntimeError(
                         f"'{name}' is read from the file next to the source "
                         f"audio ({'/'.join(_companion_suffixes(ext))}), not "
                         f"from the chunk: it can only be extracted inside "
                         f"preprocess_stream's chunking loop.")
-                arr = ext.from_companion(companion.data(name), companion.t0,
-                                         n_frames)
+                arrs = [ext.from_companion(companions[i][0].data(name),
+                                           companions[i][1], n_frames)
+                        for i in idx]
             else:
-                arr = ext.extract(chunk_audio_np, sr, n_frames)
-            arr = np.asarray(arr, dtype=np.float32)
-            if arr.ndim != 2 or arr.shape[0] != int(n_frames):
-                raise RuntimeError(
-                    f"frame condition '{name}' produced {arr.shape} for "
-                    f"{cond_path.name}; expected ({n_frames}, dim).")
+                arrs = ext.extract_batch([chunks[i] for i in idx], sr, n_frames)
         else:
-            arr = np.asarray(ext.encode_audio(chunk_audio_np, sr),
-                             dtype=np.float32).reshape(-1)
-            if arr.size == 0:
+            batch_fn = getattr(ext, "encode_audio_batch", None)
+            arrs = (batch_fn([chunks[i] for i in idx], sr) if batch_fn
+                    else [ext.encode_audio(chunks[i], sr) for i in idx])
+        for i, arr in zip(idx, arrs):
+            cond_path = cond_paths[i]
+            if kind == "frame":
+                arr = np.asarray(arr, dtype=np.float32)
+                if arr.ndim != 2 or arr.shape[0] != int(n_frames):
+                    raise RuntimeError(
+                        f"frame condition '{name}' produced {arr.shape} for "
+                        f"{cond_path.name}; expected ({n_frames}, dim).")
+            else:
+                arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+                if arr.size == 0:
+                    raise RuntimeError(
+                        f"global condition '{name}' produced an empty embedding "
+                        f"for {cond_path.name}.")
+            if not np.isfinite(arr).all():
                 raise RuntimeError(
-                    f"global condition '{name}' produced an empty embedding "
-                    f"for {cond_path.name}.")
-        if not np.isfinite(arr).all():
-            raise RuntimeError(
-                f"condition '{name}' contains NaN/Inf for {cond_path.name}.")
-        new[name] = arr
+                    f"condition '{name}' contains NaN/Inf for {cond_path.name}.")
+            new[i][name] = arr
 
-    final = {**existing, **new}
-    _atomic_save_npz(cond_path, final)
-    return True
+    n = 0
+    for old, add, cond_path in zip(existing, new, cond_paths):
+        if add:
+            _atomic_save_npz(cond_path, {**old, **add})
+            n += 1
+    return n
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -1714,17 +1721,15 @@ def _process_gpu_batch(encoder, batch, sr, n_frames: int,
         encoder, [it for it in batch if it.get("latent_path")], sr, n_frames)
 
     n_cond = 0
-    if registry is not None and gpu_names:
-        for it in batch:
-            cp = it.get("cond_path")
-            if not cp:
-                continue
-            audio = it["audio"]
-            chunk_np = audio.numpy() if hasattr(audio, "numpy") else np.asarray(audio)
-            extract_and_merge_chunk_conditions(
-                registry, chunk_np, sr, n_frames, Path(cp),
-                force=force, names=gpu_names)
-            n_cond += 1
+    todo = [it for it in batch if it.get("cond_path")]
+    if registry is not None and gpu_names and todo:
+        extract_and_merge_chunk_conditions(
+            registry,
+            [it["audio"].numpy() if hasattr(it["audio"], "numpy")
+             else np.asarray(it["audio"]) for it in todo],
+            sr, n_frames, [Path(it["cond_path"]) for it in todo],
+            force=force, names=gpu_names)
+        n_cond = len(todo)
     return n_lat, n_cond
 
 
@@ -1762,9 +1767,10 @@ class StreamingChunkDataset(IterableDataset):
                  sr, wav_sources, force, n_frames_fixed,
                  acoustic, acoustic_kw, silence_thresh_db, tmp_dir,
                  cpu_cond_names=None, gpu_cond_names=None, companions=None,
-                 codec_name=lc.DEFAULT_CODEC):
+                 codec_name=lc.DEFAULT_CODEC, cpu_batch_size=8):
         self.files = files
         self.codec_name = codec_name
+        self.cpu_batch_size = max(1, int(cpu_batch_size))
         self.chunker = chunker
         self.registry = registry
         self.cpu_cond_names = list(cpu_cond_names or [])
@@ -1796,6 +1802,7 @@ class StreamingChunkDataset(IterableDataset):
 
         has_cpu_conditions = self.registry is not None and bool(self.cpu_cond_names)
         has_gpu_conditions = self.registry is not None and bool(self.gpu_cond_names)
+        pending, done = [], []
 
         for path, rel_parent, _leaf, src_hash, rel_src in shard:
             want_wav = (self.wav_sources == "all"
@@ -1824,46 +1831,26 @@ class StreamingChunkDataset(IterableDataset):
                         if self.acoustic and \
                                 _chunk_mean_dbfs(chunk) < self.silence_thresh_db:
                             continue
-                        if companion is not None:
-                            companion.t0 = (trim_start + offset
-                                            / float(self.chunker.audio_sr))
 
                         name = (f"{sanitize_filename(Path(path).name)}_{src_hash}"
                                 f"{ch_suffix}__c{idx:04d}")
                         rel_chunk = f"{rel_parent.as_posix()}/{name}"
                         produced_chunks.append(rel_chunk)
-                        latent_path = self.latent_root / rel_parent / f"{name}.npy"
-                        wav_path = self.wav_root / rel_parent / f"{name}.wav"
-                        cond_path = self.cond_root / rel_parent / f"{name}.npz"
-
-                        if has_cpu_conditions:
-                            chunk_np = chunk.squeeze(0).cpu().numpy()
-                            extract_and_merge_chunk_conditions(
-                                self.registry, chunk_np, self.sr,
-                                self.n_frames_fixed, cond_path,
-                                force=self.force, names=self.cpu_cond_names,
-                                companion=companion)
-
-                        if want_wav and (self.force or not wav_path.exists()):
-                            _atomic_save_wav(
-                                wav_path, chunk.squeeze(0).cpu().numpy(), self.sr
-                            )
-
-                        needs_latent = (
-                            self.force
-                            or not _latent_file_is_valid(
-                                latent_path, self.n_frames_fixed
-                            )
-                        )
-                        needs_gpu_cond = has_gpu_conditions and _npz_missing(
-                            cond_path, self.gpu_cond_names, force=self.force)
-                        if needs_latent or needs_gpu_cond:
-                            audio = chunk.squeeze(0).detach().clone()
-                            yield {"audio": audio,
-                                   "latent_path": (str(latent_path)
-                                                   if needs_latent else None),
-                                   "cond_path": (str(cond_path)
-                                                 if needs_gpu_cond else None)}
+                        pending.append({
+                            "audio": chunk.squeeze(0).detach().clone(),
+                            "latent_path": self.latent_root / rel_parent / f"{name}.npy",
+                            "wav_path": self.wav_root / rel_parent / f"{name}.wav",
+                            "cond_path": self.cond_root / rel_parent / f"{name}.npz",
+                            "want_wav": want_wav,
+                            "companion": (companion, trim_start + offset
+                                          / float(self.chunker.audio_sr)),
+                        })
+                        if len(pending) >= self.cpu_batch_size:
+                            yield from self._flush_chunks(
+                                pending, has_cpu_conditions, has_gpu_conditions)
+                            pending = []
+                            yield from done
+                            done = []
             finally:
                 for w in cleanup:
                     Path(w).unlink(missing_ok=True)
@@ -1872,8 +1859,43 @@ class StreamingChunkDataset(IterableDataset):
                 ident = _source_identity(Path(path))
             except OSError:
                 ident = {"size": None, "mtime_ns": None}
-            yield {"file_done": 1, "src": rel_src,
-                   "ident": {**ident, "chunks": produced_chunks}}
+            done.append({"file_done": 1, "src": rel_src,
+                         "ident": {**ident, "chunks": produced_chunks}})
+            if not pending:
+                yield from done
+                done = []
+
+        if pending:
+            yield from self._flush_chunks(pending, has_cpu_conditions,
+                                          has_gpu_conditions)
+        yield from done
+
+    def _flush_chunks(self, pending, has_cpu_conditions, has_gpu_conditions):
+        if has_cpu_conditions:
+            extract_and_merge_chunk_conditions(
+                self.registry, [p["audio"].numpy() for p in pending], self.sr,
+                self.n_frames_fixed, [p["cond_path"] for p in pending],
+                force=self.force, names=self.cpu_cond_names,
+                companions=[p["companion"] for p in pending])
+
+        for p in pending:
+            if p["want_wav"] and (self.force or not p["wav_path"].exists()):
+                _atomic_save_wav(p["wav_path"], p["audio"].numpy(), self.sr)
+
+            needs_latent = (
+                self.force
+                or not _latent_file_is_valid(
+                    p["latent_path"], self.n_frames_fixed
+                )
+            )
+            needs_gpu_cond = has_gpu_conditions and _npz_missing(
+                p["cond_path"], self.gpu_cond_names, force=self.force)
+            if needs_latent or needs_gpu_cond:
+                yield {"audio": p["audio"],
+                       "latent_path": (str(p["latent_path"])
+                                       if needs_latent else None),
+                       "cond_path": (str(p["cond_path"])
+                                     if needs_gpu_cond else None)}
 
 
 def _meta_dict(args, chunk_length, chunk_overlap, latent_frames_per_chunk=None):
@@ -2162,7 +2184,13 @@ def build_parser():
                              "worker loads one condition model when conditions "
                              "are enabled.")
     parser.add_argument("--batch_size", type=int, default=8,
-                        help="Chunks encoded per encoder forward pass (default: 8).")
+                        help="Chunks per GPU batch: one encoder forward pass and "
+                             "one batched extraction of each GPU condition "
+                             "(f0, rhythm, per-chunk text) (default: 8).")
+    parser.add_argument("--cpu_batch_size", type=int, default=8,
+                        help="Chunks per batched extraction of the CPU "
+                             "conditions (chroma, energy, chord) in each worker "
+                             "(default: 8).")
     parser.add_argument("--loader_batch_size", type=int, default=8,
                         help="Chunks transported in each worker IPC batch "
                              "(default: 8). Kept separate from --batch_size so "
@@ -2293,6 +2321,8 @@ def main():
         raise SystemExit("[preprocess_stream] --num_workers must be >= 0.")
     if args.batch_size < 1:
         raise SystemExit("[preprocess_stream] --batch_size must be >= 1.")
+    if args.cpu_batch_size < 1:
+        raise SystemExit("[preprocess_stream] --cpu_batch_size must be >= 1.")
     if args.loader_batch_size < 1:
         raise SystemExit("[preprocess_stream] --loader_batch_size must be >= 1.")
     if args.prefetch_factor < 1:
@@ -2599,6 +2629,7 @@ def main():
         acoustic=args.acoustic_rules, acoustic_kw=acoustic_kw,
         silence_thresh_db=args.silence_thresh_db, tmp_dir=tmp_dir,
         companions=companions, codec_name=codec.name,
+        cpu_batch_size=args.cpu_batch_size,
     )
     loader_kw = dict(
         dataset=dataset,
@@ -2616,7 +2647,8 @@ def main():
     loader = DataLoader(**loader_kw)
     print(f"[run] num_workers={args.num_workers}, "
           f"loader_batch_size={args.loader_batch_size}, "
-          f"encoder_batch_size={args.batch_size}, "
+          f"batch_size={args.batch_size}, "
+          f"cpu_batch_size={args.cpu_batch_size}, "
           f"prefetch_factor={args.prefetch_factor if args.num_workers else 0}, "
           f"start_method={args.worker_start_method if args.num_workers else 'none'}, "
           f"skip_encoder={args.skip_encoder}")

@@ -54,6 +54,32 @@ def hcqt(y: np.ndarray, sr: int) -> np.ndarray:
     return np.transpose(np.asarray(mags).astype(np.float32), (2, 1, 0))
 
 
+def hcqt_batch(ys, sr: int) -> np.ndarray:
+    import librosa
+
+    y = np.stack([np.asarray(v) for v in ys])
+    if y.ndim != 2:
+        raise ValueError(f"hcqt_batch expects mono signals of one length, got {y.shape}")
+    if sr != CREMA_SR:
+        y = librosa.resample(y, orig_sr=sr, target_sr=CREMA_SR)
+    n_frames = int(librosa.time_to_frames(
+        librosa.get_duration(y=y[0], sr=CREMA_SR),
+        sr=CREMA_SR, hop_length=CREMA_HOP))
+    if n_frames <= 0:
+        return np.zeros((len(y), 0, CREMA_N_BINS, len(CREMA_HARMONICS)),
+                        np.float32)
+
+    fmin = librosa.note_to_hz(CREMA_FMIN_NOTE)
+    mags = []
+    for h in CREMA_HARMONICS:
+        C = librosa.cqt(y=y, sr=CREMA_SR, hop_length=CREMA_HOP,
+                        fmin=fmin * h, n_bins=CREMA_N_BINS,
+                        bins_per_octave=CREMA_BINS_PER_OCTAVE)
+        C = librosa.util.fix_length(C, size=n_frames)
+        mags.append([librosa.amplitude_to_db(np.abs(c), ref=np.max) for c in C])
+    return np.transpose(np.asarray(mags).astype(np.float32), (1, 3, 2, 0))
+
+
 def _hard_sigmoid(x: torch.Tensor) -> torch.Tensor:
     return torch.clamp(0.2 * x + 0.5, 0.0, 1.0)
 
@@ -264,6 +290,16 @@ class CremaChord:
 
     def outputs(self, y: np.ndarray, sr: int) -> Dict[str, np.ndarray]:
         return self.outputs_from_features(hcqt(y, sr))
+
+    @torch.inference_mode()
+    def outputs_batch(self, ys, sr: int) -> List[Dict[str, np.ndarray]]:
+        feats = hcqt_batch(ys, sr)
+        if feats.shape[1] == 0:
+            return [self.outputs_from_features(f) for f in feats]
+        x = torch.from_numpy(np.ascontiguousarray(feats, np.float32))
+        out = self.net(x.to(self.device))
+        return [{k: v[i].float().cpu().numpy() for k, v in out.items()}
+                for i in range(len(feats))]
 
     def chord_segments(self, y: np.ndarray, sr: int):
         tags = self.outputs(y, sr)["chord_tag"].argmax(axis=1)

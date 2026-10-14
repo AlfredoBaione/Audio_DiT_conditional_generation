@@ -31,6 +31,9 @@ class FrameConditionExtractor(ABC):
     def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
         ...
 
+    def extract_batch(self, audios, sr: int, n_frames: int) -> List[np.ndarray]:
+        return [self.extract(a, sr, n_frames) for a in audios]
+
     @staticmethod
     def _resample_to_frames(x: np.ndarray, target_len: int) -> np.ndarray:
         if x.shape[0] == target_len:
@@ -85,9 +88,22 @@ class ChromaExtractor(FrameConditionExtractor):
         ).T
         return self._resample_to_frames(chroma, n_frames).astype(np.float32)
 
+    def extract_batch(self, audios, sr: int, n_frames: int) -> List[np.ndarray]:
+        if len({len(a) for a in audios}) != 1:
+            return super().extract_batch(audios, sr, n_frames)
+        import librosa
+        chroma = librosa.feature.chroma_cqt(
+            y=np.stack(audios), sr=sr, tuning=0.0,
+            hop_length=_lc.active().hop_length, n_chroma=12,
+        )
+        return [self._resample_to_frames(c.T, n_frames).astype(np.float32)
+                for c in chroma]
+
 
 class RhythmExtractor(FrameConditionExtractor):
     BEAT_THIS_FPS = 50.0
+    BEAT_THIS_CHUNK = 1500
+    BEAT_THIS_BORDER = 6
 
     _model = None
 
@@ -120,7 +136,26 @@ class RhythmExtractor(FrameConditionExtractor):
         model = self._get_model(self.checkpoint, self._device)
 
         beat_logits, downbeat_logits = model(audio.astype(np.float32), sr)
+        return self._curves(beat_logits, downbeat_logits, n_frames)
 
+    def extract_batch(self, audios, sr: int, n_frames: int) -> List[np.ndarray]:
+        model = self._get_model(self.checkpoint, self._device)
+        specs = [model.signal2spect(np.asarray(a).astype(np.float32), sr)
+                 for a in audios]
+        b = self.BEAT_THIS_BORDER
+        if (len({s.shape[0] for s in specs}) != 1
+                or specs[0].shape[0] > self.BEAT_THIS_CHUNK - 2 * b):
+            return super().extract_batch(audios, sr, n_frames)
+        x = torch.stack([torch.nn.functional.pad(s, (0, 0, b, b)) for s in specs])
+        with torch.inference_mode():
+            with torch.autocast(enabled=model.float16,
+                                device_type=model.device.type):
+                out = model.model(x)
+        return [self._curves(out["beat"][i][b:-b].float(),
+                             out["downbeat"][i][b:-b].float(), n_frames)
+                for i in range(len(specs))]
+
+    def _curves(self, beat_logits, downbeat_logits, n_frames: int) -> np.ndarray:
         beat = torch.sigmoid(beat_logits.detach().float()).cpu().numpy()
         downbeat = torch.sigmoid(downbeat_logits.detach().float()).cpu().numpy()
 
@@ -186,6 +221,15 @@ class EnergyExtractor(FrameConditionExtractor):
         return savgol_filter(x, window_length=win, polyorder=self.polyorder)
 
     def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
+        return self._from_rms(self._rms(audio, sr)[0], sr, n_frames)
+
+    def extract_batch(self, audios, sr: int, n_frames: int) -> List[np.ndarray]:
+        if len({len(a) for a in audios}) != 1:
+            return super().extract_batch(audios, sr, n_frames)
+        return [self._from_rms(r[0], sr, n_frames)
+                for r in self._rms(np.stack(audios), sr)]
+
+    def _rms(self, audio: np.ndarray, sr: int) -> np.ndarray:
         import librosa
         hop = _lc.active().hop_length
         S = np.abs(librosa.stft(y=audio.astype(np.float32),
@@ -194,9 +238,11 @@ class EnergyExtractor(FrameConditionExtractor):
         gain = self._frequency_gain(sr)
         S_w = S * np.sqrt(gain)[:, None]
 
-        rms = librosa.feature.rms(S=S_w, frame_length=self.n_fft,
-                                  hop_length=hop)[0]
+        return librosa.feature.rms(S=S_w, frame_length=self.n_fft,
+                                   hop_length=hop)
 
+    def _from_rms(self, rms: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
+        hop = _lc.active().hop_length
         energy_db = 20.0 * np.log10(rms + 1e-7)
 
         energy_db = self._savgol(energy_db, fps=sr / hop)
@@ -207,7 +253,99 @@ class EnergyExtractor(FrameConditionExtractor):
         return energy_norm.reshape(n_frames, 1).astype(np.float32)
 
 
+_CREPE_VITERBI = {}
+
+
+def _banded_viterbi(log_prob, log_trans, log_p_init, lo, hi, off):
+    T, S = log_prob.shape
+    value = np.empty((T, S), np.float64)
+    ptr = np.empty((T, S), np.uint16)
+    for j in range(S):
+        value[0, j] = log_prob[0, j] + log_p_init[j]
+    s = np.empty(S, np.float64)
+    pm = np.empty(S, np.float64)
+    pi = np.empty(S, np.int64)
+    sm = np.empty(S, np.float64)
+    si = np.empty(S, np.int64)
+    for t in range(1, T):
+        for k in range(S):
+            s[k] = value[t - 1, k] + off
+        pm[0] = s[0]
+        pi[0] = 0
+        for k in range(1, S):
+            if s[k] > pm[k - 1]:
+                pm[k] = s[k]
+                pi[k] = k
+            else:
+                pm[k] = pm[k - 1]
+                pi[k] = pi[k - 1]
+        sm[S - 1] = s[S - 1]
+        si[S - 1] = S - 1
+        for k in range(S - 2, -1, -1):
+            if s[k] >= sm[k + 1]:
+                sm[k] = s[k]
+                si[k] = k
+            else:
+                sm[k] = sm[k + 1]
+                si[k] = si[k + 1]
+        for j in range(S):
+            best = -np.inf
+            arg = -1
+            if lo[j] > 0:
+                best = pm[lo[j] - 1]
+                arg = pi[lo[j] - 1]
+            for k in range(lo[j], hi[j]):
+                c = value[t - 1, k] + log_trans[k, j]
+                if c > best:
+                    best = c
+                    arg = k
+            if hi[j] < S and sm[hi[j]] > best:
+                best = sm[hi[j]]
+                arg = si[hi[j]]
+            ptr[t, j] = arg
+            value[t, j] = log_prob[t, j] + best
+    state = np.empty(T, np.int64)
+    arg = 0
+    for j in range(1, S):
+        if value[T - 1, j] > value[T - 1, arg]:
+            arg = j
+    state[T - 1] = arg
+    for t in range(T - 2, -1, -1):
+        state[t] = ptr[t + 1, state[t + 1]]
+    return state
+
+
+def crepe_viterbi(logits):
+    import torchcrepe
+    if not _CREPE_VITERBI:
+        import numba
+        n = torchcrepe.PITCH_BINS
+        xx, yy = np.meshgrid(range(n), range(n))
+        transition = np.maximum(12 - abs(xx - yy), 0)
+        transition = transition / transition.sum(axis=1, keepdims=True)
+        eps = np.finfo(np.float32).tiny
+        nz = transition > 0
+        log_trans = np.log(transition + eps)
+        _CREPE_VITERBI.update(
+            kernel=numba.njit(_banded_viterbi), eps=eps, log_trans=log_trans,
+            log_p_init=np.log(np.full(n, 1.0 / n) + eps),
+            lo=np.argmax(nz, axis=0).astype(np.int64),
+            hi=(n - np.argmax(nz[::-1], axis=0)).astype(np.int64),
+            off=float(log_trans[0, n - 1]))
+    v = _CREPE_VITERBI
+    with torch.no_grad():
+        probs = torch.nn.functional.softmax(logits, dim=1)
+    bins = np.array([
+        v["kernel"](np.ascontiguousarray(np.log(seq + v["eps"]).T),
+                    v["log_trans"], v["log_p_init"], v["lo"], v["hi"], v["off"])
+        for seq in probs.cpu().numpy()])
+    bins = torch.tensor(bins, device=probs.device)
+    return bins, torchcrepe.convert.bins_to_frequency(bins)
+
+
 class CrepeF0Extractor(FrameConditionExtractor):
+    SR = 16000
+
     def __init__(self,
                  fmin: float = 50.0,
                  fmax: float = 1000.0,
@@ -244,27 +382,67 @@ class CrepeF0Extractor(FrameConditionExtractor):
     def dim(self) -> int:
         return 2 if self.with_periodicity else 1
 
-    def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
-        import torch
-        import torchcrepe
-        CR = 16000
-
+    def _to_crepe_sr(self, audio: np.ndarray, sr: int) -> np.ndarray:
         y = np.asarray(audio, dtype=np.float32)
-        if sr != CR:
+        if sr != self.SR:
             import librosa
-            y = librosa.resample(y, orig_sr=sr, target_sr=CR)
-        wav = torch.from_numpy(y).unsqueeze(0)
+            y = librosa.resample(y, orig_sr=sr, target_sr=self.SR)
+        return y
 
-        hop = max(1, int(round(self.hop_ms / 1000.0 * CR)))
+    def _hop(self) -> int:
+        return max(1, int(round(self.hop_ms / 1000.0 * self.SR)))
+
+    def _dev(self) -> str:
         dev = self.device
         if dev in (None, "auto"):
             dev = "cuda" if torch.cuda.is_available() else "cpu"
+        return dev
 
+    def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
+        import torchcrepe
+        y = self._to_crepe_sr(audio, sr)
+        hop = self._hop()
         pitch, periodicity = torchcrepe.predict(
-            wav, CR, hop_length=hop, fmin=self.fmin, fmax=self.fmax,
-            model=self.model, return_periodicity=True,
-            batch_size=self.batch_size, device=dev,
+            torch.from_numpy(y).unsqueeze(0), self.SR, hop_length=hop,
+            fmin=self.fmin, fmax=self.fmax, model=self.model,
+            decoder=crepe_viterbi, return_periodicity=True,
+            batch_size=self.batch_size, device=self._dev(),
         )
+        return self._features(pitch, periodicity, y, hop, n_frames)
+
+    def extract_batch(self, audios, sr: int, n_frames: int) -> List[np.ndarray]:
+        import torchcrepe
+        dev = self._dev()
+        hop = self._hop()
+        ys = [self._to_crepe_sr(a, sr) for a in audios]
+        out = []
+        with torch.no_grad():
+            frames = [next(torchcrepe.preprocess(torch.from_numpy(y).unsqueeze(0),
+                                                 self.SR, hop, None, dev, True))
+                      for y in ys]
+            counts = [f.shape[0] for f in frames]
+            frames = torch.cat(frames)
+            probs = torch.cat([
+                torchcrepe.infer(frames[i:i + self.batch_size], self.model, dev)
+                for i in range(0, frames.shape[0], self.batch_size)])
+            start = 0
+            for y, n in zip(ys, counts):
+                pitch, periodicity = [], []
+                for s in range(start, start + n, self.batch_size):
+                    seg = probs[s:min(s + self.batch_size, start + n)]
+                    p, q = torchcrepe.postprocess(
+                        seg.reshape(1, -1, torchcrepe.PITCH_BINS).transpose(1, 2),
+                        self.fmin, self.fmax, crepe_viterbi, False, True)
+                    pitch.append(p.cpu())
+                    periodicity.append(q.cpu())
+                out.append(self._features(torch.cat(pitch, 1),
+                                          torch.cat(periodicity, 1), y, hop,
+                                          n_frames))
+                start += n
+        return out
+
+    def _features(self, pitch, periodicity, y: np.ndarray, hop: int,
+                  n_frames: int) -> np.ndarray:
         pitch = pitch.squeeze(0).cpu().numpy().astype(np.float64)
         periodicity = periodicity.squeeze(0).cpu().numpy().astype(np.float64)
         F = pitch.shape[0]
@@ -372,9 +550,21 @@ class CremaChordExtractor(FrameConditionExtractor):
         return model
 
     def extract(self, audio: np.ndarray, sr: int, n_frames: int) -> np.ndarray:
-        from crema_chord import CREMA_FPS
         y = np.asarray(audio, dtype=np.float32)
-        pitch = self._get_model().outputs(y, sr)["chord_pitch"]
+        return self._to_frames(self._get_model().outputs(y, sr)["chord_pitch"],
+                               y, sr, n_frames)
+
+    def extract_batch(self, audios, sr: int, n_frames: int) -> List[np.ndarray]:
+        if len({len(a) for a in audios}) != 1:
+            return super().extract_batch(audios, sr, n_frames)
+        ys = [np.asarray(a, dtype=np.float32) for a in audios]
+        outs = self._get_model().outputs_batch(ys, sr)
+        return [self._to_frames(o["chord_pitch"], y, sr, n_frames)
+                for o, y in zip(outs, ys)]
+
+    def _to_frames(self, pitch: np.ndarray, y: np.ndarray, sr: int,
+                   n_frames: int) -> np.ndarray:
+        from crema_chord import CREMA_FPS
         if pitch.shape[0] == 0:
             return np.zeros((n_frames, self.dim), dtype=np.float32)
         t_src = np.arange(pitch.shape[0]) / CREMA_FPS
@@ -599,6 +789,10 @@ class CLAPTextCondition(GlobalConditionExtractor):
     def encode_audio(self, wav_np: np.ndarray, sr: int) -> np.ndarray:
         return self._audio_side().embed(wav_np, sr)
 
+    @torch.no_grad()
+    def encode_audio_batch(self, wavs, sr: int) -> List[np.ndarray]:
+        return self._audio_side().embed_batch(wavs, sr)
+
     def unload(self):
         if self._audio_embedder is not None:
             self._audio_embedder.unload()
@@ -639,24 +833,30 @@ class ClapAudioEmbedder:
 
     @torch.no_grad()
     def embed(self, wav_np: np.ndarray, sr: int) -> np.ndarray:
-        self._load()
-        if wav_np.ndim > 1:
-            wav_np = wav_np.squeeze()
-        wav_np = np.asarray(wav_np, dtype=np.float32)
+        return self.embed_batch([wav_np], sr)[0]
 
+    @torch.no_grad()
+    def embed_batch(self, wavs, sr: int) -> List[np.ndarray]:
+        self._load()
         want_sr = int(getattr(self._processor, "feature_extractor",
                               self._processor).sampling_rate)
-        if int(sr) != want_sr:
-            wav_np = torchaudio.functional.resample(
-                torch.from_numpy(wav_np), int(sr), want_sr).numpy()
+        items = []
+        for wav_np in wavs:
+            if wav_np.ndim > 1:
+                wav_np = wav_np.squeeze()
+            wav_np = np.asarray(wav_np, dtype=np.float32)
+            if int(sr) != want_sr:
+                wav_np = torchaudio.functional.resample(
+                    torch.from_numpy(wav_np), int(sr), want_sr).numpy()
+            items.append(wav_np)
 
         inputs = self._processor(sampling_rate=want_sr, return_tensors="pt",
-                                 **{self._audio_kw: wav_np})
+                                 **{self._audio_kw: items})
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         out = self._model(**inputs)
         feat = out.audio_embeds
         feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
-        return feat.squeeze(0).cpu().numpy().astype(np.float32)
+        return [f.cpu().numpy().astype(np.float32) for f in feat]
 
     def unload(self):
         if self._model is not None:
