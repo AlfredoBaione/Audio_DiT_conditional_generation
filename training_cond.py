@@ -122,6 +122,30 @@ def decode_frames_to_wav(frames, normalizer, dac_model):
     return dac_model.decode(z_q).squeeze().detach().cpu()
 
 
+_FITTING_GROUP = {}
+
+
+def run_in_fitting_groups(label, n, size, fn):
+    size = max(1, min(int(size), _FITTING_GROUP.get(label, int(size))))
+    out, lo = [], 0
+    while lo < n:
+        hi = min(lo + size, n)
+        try:
+            part = fn(lo, hi)
+        except RuntimeError as e:
+            if "out of memory" not in str(e) or hi - lo == 1:
+                raise
+            size = (hi - lo) // 2
+            _FITTING_GROUP[label] = size
+            torch.cuda.empty_cache()
+            print(f"    [metrics] {label}: {hi - lo} at a time do not fit in "
+                  f"GPU memory -> {size}")
+            continue
+        out.extend(part)
+        lo = hi
+    return out
+
+
 def _load_dataset_meta(latent_root):
     p = Path(latent_root).parent / "dataset_meta.json"
     if p.exists():
@@ -1183,18 +1207,25 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
     if guidance > 1.0:
         for s in range(0, n_plot, spf):
             grp = list(range(s, min(s + spf, n_plot)))
-            gc, _gu = euler_sample_cfg_paired(
-                model, n_frames, device,
-                steps=sampling_cfg.euler_steps,
-                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                t_schedule=t_schedule_of(sampling_cfg),
-                use_amp=use_amp,
-                frame_cond=_frame_cond(grp), global_cond=_global_cond(grp),
-                guidance=guidance,
-                frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng, text_ctx=_text_ctx(grp),
-            )
-            cond_lat.extend(gc)
+            x0 = torch.stack([
+                torch.randn(n_frames, lc.active().latent_dim, device=device,
+                            generator=gen_rng)
+                for _ in grp])
+            cond_lat.extend(run_in_fitting_groups(
+                "generation", len(grp), len(grp),
+                lambda lo, hi: euler_sample_cfg_paired(
+                    model, n_frames, device,
+                    steps=sampling_cfg.euler_steps,
+                    t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
+                    t_schedule=t_schedule_of(sampling_cfg),
+                    use_amp=use_amp,
+                    frame_cond=_frame_cond(grp[lo:hi]),
+                    global_cond=_global_cond(grp[lo:hi]),
+                    guidance=guidance,
+                    frame_dims=frame_dims, global_configs=global_configs,
+                    gen_rng=gen_rng, text_ctx=_text_ctx(grp[lo:hi]),
+                    x0=x0[lo:hi],
+                )[0]))
     else:
         for i in range(n_plot):
             cond_lat.append(euler_sample_cfg(
@@ -1524,18 +1555,25 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
         if spf >= 1 and guidance > 1.0:
             for s in range(0, n, spf):
                 grp = list(range(s, min(s + spf, n)))
-                gen_c, _gen_u = euler_sample_cfg_paired(
-                    model, n_frames, device,
-                    steps=sampling_cfg.euler_steps,
-                    t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                    t_schedule=t_schedule_of(sampling_cfg),
-                    use_amp=use_amp,
-                    frame_cond=_fc(grp, subset), global_cond=_gc(grp),
-                    guidance=guidance,
-                    frame_dims=frame_dims, global_configs=global_configs,
-                    gen_rng=gen_rng, text_ctx=_ctx(grp),
-                )
-                out.extend(gen_c)
+                x0 = torch.stack([
+                    torch.randn(n_frames, lc.active().latent_dim, device=device,
+                                generator=gen_rng)
+                    for _ in grp])
+                out.extend(run_in_fitting_groups(
+                    "generation", len(grp), len(grp),
+                    lambda lo, hi: euler_sample_cfg_paired(
+                        model, n_frames, device,
+                        steps=sampling_cfg.euler_steps,
+                        t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
+                        t_schedule=t_schedule_of(sampling_cfg),
+                        use_amp=use_amp,
+                        frame_cond=_fc(grp[lo:hi], subset),
+                        global_cond=_gc(grp[lo:hi]),
+                        guidance=guidance,
+                        frame_dims=frame_dims, global_configs=global_configs,
+                        gen_rng=gen_rng, text_ctx=_ctx(grp[lo:hi]),
+                        x0=x0[lo:hi],
+                    )[0]))
         else:
             for j in range(n):
                 out.append(euler_sample_cfg(
@@ -1901,7 +1939,7 @@ def evaluate_and_log_metrics(
             lat_list.append(gen)
         return lat_list, targets, global_targets
 
-    def _generate_paired_dist(spf):
+    def _generate_paired(spf):
         n = len(indices)
         cond_list, unc_list = [None] * n, [None] * n
         targets, global_targets = [None] * n, [None] * n
@@ -1910,13 +1948,16 @@ def evaluate_and_log_metrics(
             gen_rng = torch.Generator(device=device)
             gen_rng.manual_seed(int(metrics_seed))
         x0_of = {}
-        for j in range(n):
-            x = torch.randn(n_frames, lc.active().latent_dim, device=device, generator=gen_rng)
-            if _mine(j):
-                x0_of[j] = x
+        drawn = 0
         own = [j for j in range(n) if _mine(j)]
         for start in range(0, len(own), spf):
             grp = own[start:start + spf]
+            while drawn <= grp[-1]:
+                x = torch.randn(n_frames, lc.active().latent_dim, device=device,
+                                generator=gen_rng)
+                if _mine(drawn):
+                    x0_of[drawn] = x
+                drawn += 1
             fcs, gcs, ctxs = [], [], []
             for j in grp:
                 idx = indices[j]
@@ -1938,64 +1979,30 @@ def evaluate_and_log_metrics(
                 gc["text"] = torch.stack([t for t, _ in gcs]).to(device)
             if "image" in global_configs:
                 gc["image"] = torch.stack([i for _, i in gcs]).to(device)
-            gen_c, gen_u = euler_sample_cfg_paired(
-                model, n_frames, device,
-                steps=sampling_cfg.euler_steps,
-                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                t_schedule=t_schedule_of(sampling_cfg),
-                use_amp=use_amp,
-                frame_cond=fc, global_cond=gc, guidance=guidance,
-                frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng, text_ctx=_stack_ctx(ctxs),
-                x0=torch.stack([x0_of.pop(j) for j in grp]),
-            )
-            for j, c, u in zip(grp, gen_c, gen_u):
-                cond_list[j], unc_list[j] = c, u
-        return cond_list, targets, global_targets, unc_list
+            ctx = _stack_ctx(ctxs)
+            x0 = torch.stack([x0_of.pop(j) for j in grp])
 
-    def _generate_paired(spf):
-        if _di is not None:
-            return _generate_paired_dist(spf)
-        cond_list, unc_list = [], []
-        targets, global_targets = [], []
-        gen_rng = None
-        if metrics_seed is not None:
-            gen_rng = torch.Generator(device=device)
-            gen_rng.manual_seed(int(metrics_seed))
-        for start in range(0, len(indices), spf):
-            group = indices[start:start + spf]
-            fcs, gcs, ctxs = [], [], []
-            for idx in group:
-                (_frames_real, frame_cond_real, _lab, text_emb, image_emb,
-                 text_ctx) = val_dataset[idx]
-                text_emb = _text_vec_for(val_dataset, idx, text_emb)
-                fcs.append(frame_cond_real)
-                gcs.append((text_emb, image_emb))
-                ctxs.append(text_ctx)
-                targets.append({k: v.cpu().numpy() for k, v in frame_cond_real.items()})
-                global_targets.append({
-                    "text":  text_emb.cpu().numpy()  if "text"  in global_configs else None,
-                    "image": image_emb.cpu().numpy() if "image" in global_configs else None,
-                })
-            fc = {k: torch.stack([d[k] for d in fcs]).to(device).float()
-                  for k in (fcs[0].keys() if fcs else [])}
-            gc = {}
-            if "text" in global_configs:
-                gc["text"] = torch.stack([t for t, _ in gcs]).to(device)
-            if "image" in global_configs:
-                gc["image"] = torch.stack([i for _, i in gcs]).to(device)
-            gen_c, gen_u = euler_sample_cfg_paired(
-                model, n_frames, device,
-                steps=sampling_cfg.euler_steps,
-                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                t_schedule=t_schedule_of(sampling_cfg),
-                use_amp=use_amp,
-                frame_cond=fc, global_cond=gc, guidance=guidance,
-                frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng, text_ctx=_stack_ctx(ctxs),
-            )
-            cond_list.extend(gen_c)
-            unc_list.extend(gen_u)
+            def _part(lo, hi):
+                gen_c, gen_u = euler_sample_cfg_paired(
+                    model, n_frames, device,
+                    steps=sampling_cfg.euler_steps,
+                    t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
+                    t_schedule=t_schedule_of(sampling_cfg),
+                    use_amp=use_amp,
+                    frame_cond={k: v[lo:hi] for k, v in fc.items()},
+                    global_cond={k: v[lo:hi] for k, v in gc.items()},
+                    guidance=guidance,
+                    frame_dims=frame_dims, global_configs=global_configs,
+                    gen_rng=gen_rng,
+                    text_ctx=(None if ctx is None
+                              else {k: v[lo:hi] for k, v in ctx.items()}),
+                    x0=x0[lo:hi],
+                )
+                return list(zip(gen_c, gen_u))
+
+            for j, (c, u) in zip(grp, run_in_fitting_groups(
+                    "generation", len(grp), len(grp), _part)):
+                cond_list[j], unc_list[j] = c, u
         return cond_list, targets, global_targets, unc_list
 
     has_ref = fd_dac_ref_stats is not None
