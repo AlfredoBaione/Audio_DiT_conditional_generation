@@ -2745,6 +2745,34 @@ def dist_dac_metrics(lat_list, ref_stats, enabled, device, di, block_size=16):
     return out
 
 
+@torch.no_grad()
+def dist_reference_stats(vectors, n_items, dim, device, di, desc):
+    sum_x = torch.zeros(dim, dtype=torch.float64, device=device)
+    sum_xx = torch.zeros(dim, dim, dtype=torch.float64, device=device)
+    count = torch.zeros((), dtype=torch.float64, device=device)
+    for v in tqdm(vectors, total=n_items, desc=desc, disable=not di.is_main):
+        v = v.to(device=device, dtype=torch.float64)
+        sum_x = sum_x + v.sum(dim=0)
+        sum_xx = sum_xx + v.T @ v
+        count = count + v.shape[0]
+        del v
+    sum_x, sum_xx, count = dist_sum_tensors([sum_x, sum_xx, count], di)
+    mu, sigma, n = compute_mu_sigma(sum_x, sum_xx, count)
+    return {"mu": mu.cpu(), "sigma": sigma.cpu(), "n_total": int(n)}
+
+
+def wav_clips(paths):
+    for p in paths:
+        data, sr = sf.read(str(p), dtype="float32", always_2d=True)
+        yield torch.from_numpy(data.T.copy()).unsqueeze(0), sr
+
+
+def save_reference(stats, path):
+    tmp = path + ".tmp"
+    torch.save(stats, tmp)
+    os.replace(tmp, path)
+
+
 class NullWriter:
     log_dir = None
 
@@ -3018,20 +3046,33 @@ if __name__ == "__main__":
     print("\nPre-computation of reference statistics for the metrics...")
     metrics_val_ds = MetricsAdapter(val_dataset)
 
-    if metrics_enabled and not DIST.is_main:
+    if (metrics_enabled and DIST.enabled and dist_broadcast_object(
+            not os.path.exists(fd_dac_cache_path), DIST)):
+        _own = range(DIST.rank, len(metrics_val_ds), DIST.world)
+        if DIST.is_main:
+            print(f"[Latent Reference] Accumulation on {len(metrics_val_ds)} "
+                  f"samples, over {DIST.world} GPUs...")
+        fd_dac_ref_stats = dist_reference_stats(
+            (metrics_val_ds[i][0] for i in _own), len(_own),
+            lc.active().latent_dim, device, DIST, "Latent reference")
+        if DIST.is_main:
+            save_reference(fd_dac_ref_stats, fd_dac_cache_path)
+            print(f"[Latent Reference] Cache saved in: {fd_dac_cache_path}")
+    elif metrics_enabled and not DIST.is_main:
         fd_dac_ref_stats = None
     elif metrics_enabled:
         fd_dac_ref_stats = precompute_latent_reference(
             metrics_val_ds,
             cache_path=fd_dac_cache_path,
         )
-        print(f"Reference stats ready: FD-{lc.active().label} + KL on "
-              f"{fd_dac_ref_stats['n_total']} latent frames "
-              f"({len(val_dataset)} val samples)\n")
     else:
         fd_dac_ref_stats = None
         print("Reference stats SKIPPED: no distributional metric enabled "
               "(metrics.enabled is empty).\n")
+    if metrics_enabled and DIST.is_main:
+        print(f"Reference stats ready: FD-{lc.active().label} + KL on "
+              f"{fd_dac_ref_stats['n_total']} latent frames "
+              f"({len(val_dataset)} val samples)\n")
 
     fad_embedder = None
     fad_ref_stats = None
@@ -3050,7 +3091,9 @@ if __name__ == "__main__":
               f"n_fad_samples={n_fad} | reference={_fad_ref_mode}")
 
         _val_npy = sorted({str(smp[0]) for smp in val_dataset.samples})
-        if not DIST.is_main:
+        _split = DIST.enabled and dist_broadcast_object(
+            not os.path.exists(fad_cache_path), DIST)
+        if not (_split or DIST.is_main):
             pass
         elif _fad_ref_mode == "wav":
             _lat_root = Path(cfg.paths.dataset_root)
@@ -3069,19 +3112,45 @@ if __name__ == "__main__":
                     f"latents through DAC instead. NB: 'decoded' compares two "
                     f"DAC-decoded distributions, which isolates the model from the "
                     f"codec but is NOT comparable with published FAD values.")
-            fad_ref_stats = precompute_audio_reference(
-                _val_wavs, fad_embedder, cache_path=fad_cache_path,
-                device=fad_device)
+            if _split:
+                _own = _val_wavs[DIST.rank::DIST.world]
+                if DIST.is_main:
+                    print(f"[Audio ref] embedding {len(_val_wavs)} real val wavs "
+                          f"(NO DAC), over {DIST.world} GPUs...")
+                fad_ref_stats = dist_reference_stats(
+                    (fad_embedder.embed(w, audio_sr=sr) for w, sr in wav_clips(_own)),
+                    len(_own), fad_embedder.embedding_dim, fad_device, DIST,
+                    "Audio ref")
+                if DIST.is_main:
+                    save_reference(fad_ref_stats, fad_cache_path)
+                    print(f"[Audio ref] cache saved: {fad_cache_path}")
+            else:
+                fad_ref_stats = precompute_audio_reference(
+                    _val_wavs, fad_embedder, cache_path=fad_cache_path,
+                    device=fad_device)
         elif _fad_ref_mode == "decoded":
             _dac = get_dac()
 
-            def _real_clips():
-                for i in range(len(val_dataset)):
+            def _real_clips(idxs):
+                for i in idxs:
                     frames = val_dataset[i][0]
                     yield (decode_frames_to_wav(frames, normalizer, _dac)
                            .view(1, 1, -1), lc.active().sample_rate)
 
-            if os.path.exists(fad_cache_path):
+            if _split:
+                _own = range(DIST.rank, len(val_dataset), DIST.world)
+                if DIST.is_main:
+                    print(f"[Audio ref] embedding {len(val_dataset)} DAC-decoded val "
+                          f"latents (metrics.fad_reference='decoded'), over "
+                          f"{DIST.world} GPUs...")
+                fad_ref_stats = dist_reference_stats(
+                    (fad_embedder.embed(w, audio_sr=sr) for w, sr in _real_clips(_own)),
+                    len(_own), fad_embedder.embedding_dim, fad_device, DIST,
+                    "FAD ref")
+                if DIST.is_main:
+                    save_reference(fad_ref_stats, fad_cache_path)
+                    print(f"[Audio ref] cache saved: {fad_cache_path}")
+            elif os.path.exists(fad_cache_path):
                 print(f"[Audio ref] loading cache: {fad_cache_path}")
                 fad_ref_stats = torch.load(fad_cache_path, map_location="cpu",
                                            weights_only=False)
@@ -3089,12 +3158,10 @@ if __name__ == "__main__":
                 print(f"[Audio ref] embedding {len(val_dataset)} DAC-decoded val "
                       f"latents (metrics.fad_reference='decoded')...")
                 _mu, _sig, _n = compute_audio_mu_sigma(
-                    _real_clips(), len(val_dataset), fad_embedder,
-                    device=fad_device, desc="FAD ref")
+                    _real_clips(range(len(val_dataset))), len(val_dataset),
+                    fad_embedder, device=fad_device, desc="FAD ref")
                 fad_ref_stats = {"mu": _mu.cpu(), "sigma": _sig.cpu(), "n_total": _n}
-                _tmp = fad_cache_path + ".tmp"
-                torch.save(fad_ref_stats, _tmp)
-                os.replace(_tmp, fad_cache_path)
+                save_reference(fad_ref_stats, fad_cache_path)
                 print(f"[Audio ref] cache saved: {fad_cache_path}")
         else:
             raise SystemExit(
