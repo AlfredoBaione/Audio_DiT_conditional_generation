@@ -317,6 +317,8 @@ class VGGishEmbedder:
             return
         model = torch.hub.load('harritaylor/torchvggish', 'vggish',
                                postprocess=False, trust_repo=True)
+        model.embeddings = torch.nn.Sequential(
+            *list(model.embeddings.children())[:-1])
         model.eval().to(self.device)
         model.device = self.device
         self._model = model
