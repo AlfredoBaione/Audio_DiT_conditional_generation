@@ -104,8 +104,10 @@ class ConditionedAudioDataset(Dataset):
         strict_conditions: bool = True,
         text_source:     str   = "audio",
         text_mix_p:      float = 0.5,
+        file_checks_dist=None,
     ):
         self.files          = [Path(f) for f in files]
+        self._file_checks_dist = file_checks_dist
         self.latent_root    = Path(latent_root)
         self.condition_root = Path(condition_root) if condition_root else None
         self.split          = split
@@ -219,7 +221,8 @@ class ConditionedAudioDataset(Dataset):
                       f"latent_frames_per_chunk does not match the sampled files "
                       f"-> reading every latent header (slower).")
 
-        for f in self.files:
+        checks = self._file_checks(uniform)
+        for i, f in enumerate(self.files):
             if f.suffix.lower() not in SUPPORTED_EXTS:
                 continue
             n_files_total += 1
@@ -228,16 +231,12 @@ class ConditionedAudioDataset(Dataset):
             if label_idx is None:
                 continue
 
-            if uniform is not None:
-                file_frames = uniform
-            else:
-                try:
-                    file_frames = np.load(str(f), mmap_mode="r").shape[1]
-                except Exception as e:
-                    n_files_unreadable += 1
-                    print(f"[CondDataset/{self.split}] WARNING: unreadable latent "
-                          f"{f.name} ({type(e).__name__}: {e}) -> skipped")
-                    continue
+            file_frames, has_cond = checks[i]
+            if isinstance(file_frames, str):
+                n_files_unreadable += 1
+                print(f"[CondDataset/{self.split}] WARNING: unreadable latent "
+                      f"{f.name} ({file_frames}) -> skipped")
+                continue
 
             n_chunks_file = file_frames // self.n_frames
             if n_chunks_file == 0:
@@ -246,10 +245,9 @@ class ConditionedAudioDataset(Dataset):
 
             cond_path = None
             if self.condition_root:
-                rel = f.relative_to(self.latent_root).with_suffix(".npz")
-                cand = self.condition_root / rel
-                if cand.exists():
-                    cond_path = cand
+                if has_cond:
+                    cond_path = (self.condition_root
+                                 / f.relative_to(self.latent_root).with_suffix(".npz"))
                 elif want_cond:
                     n_files_no_cond += 1
 
@@ -277,6 +275,33 @@ class ConditionedAudioDataset(Dataset):
                           "training.strict_conditions=false to allow it.)")
             print("[CondDataset/" + self.split + "] WARNING: " + msg
                   + " -> these samples will use NULL (zero) conditions.")
+
+    def _file_checks(self, uniform):
+        def check(i):
+            f = self.files[i]
+            if (f.suffix.lower() not in SUPPORTED_EXTS
+                    or self.label_to_idx.get(_class_of_file(f)) is None):
+                return None
+            frames = uniform
+            if frames is None:
+                try:
+                    frames = np.load(str(f), mmap_mode="r").shape[1]
+                except Exception as e:
+                    return (f"{type(e).__name__}: {e}", None)
+            has_cond = None
+            if self.condition_root and frames // self.n_frames > 0:
+                has_cond = (self.condition_root
+                            / f.relative_to(self.latent_root).with_suffix(".npz")).exists()
+            return (frames, has_cond)
+
+        if self._file_checks_dist is None:
+            return [check(i) for i in range(len(self.files))]
+        rank, world, gather = self._file_checks_dist
+        out = [None] * len(self.files)
+        for part in gather({i: check(i) for i in range(rank, len(self.files), world)}):
+            for i, v in part.items():
+                out[i] = v
+        return out
 
     def _warn_cond_once(self, msg: str):
         if not self._cond_warned:
@@ -622,6 +647,9 @@ def build_conditioned_datasets(
     splits_path:     Optional[str] = None,
     text_source:     str = "audio",
     text_mix_p:      float = 0.5,
+    normalizer_shard: Optional[Tuple[int, int]] = None,
+    normalizer_merge=None,
+    file_checks_dist=None,
 ):
     split = load_source_split(latent_root, splits_path=splits_path)
     splits = split["splits"]
@@ -632,7 +660,10 @@ def build_conditioned_datasets(
     if normalizer_path and Path(normalizer_path).exists():
         normalizer.load(normalizer_path)
     else:
-        print("[build_conditioned_datasets] Computing normalizer on the train split...")
+        _over = (f", over {normalizer_shard[1]} GPUs"
+                 if normalizer_shard is not None else "")
+        print(f"[build_conditioned_datasets] Computing normalizer on the train "
+              f"split{_over}...")
         n_frames = frames_per_chunk(latent_root, duration_s)
         chunks = _chunks_from_files(
             splits["train"], n_frames,
@@ -641,7 +672,11 @@ def build_conditioned_datasets(
         )
         if not chunks:
             raise RuntimeError("No train chunks available to fit the normalizer.")
-        normalizer.fit_from_chunks(chunks, n_frames=n_frames)
+        if normalizer_shard is not None:
+            chunks = chunks[normalizer_shard[0]::normalizer_shard[1]]
+        normalizer.fit_from_chunks(
+            chunks, n_frames=n_frames, merge=normalizer_merge,
+            progress=normalizer_shard is None or normalizer_shard[0] == 0)
         del chunks
 
     if image_root:
@@ -661,6 +696,7 @@ def build_conditioned_datasets(
         strict_conditions=strict_conditions,
         text_source=text_source,
         text_mix_p=text_mix_p,
+        file_checks_dist=file_checks_dist,
     )
 
     train = ConditionedAudioDataset(files=splits["train"], split="train",

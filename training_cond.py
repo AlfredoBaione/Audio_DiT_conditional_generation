@@ -156,14 +156,36 @@ def _load_dataset_meta(latent_root):
     return None
 
 
-def _latent_file_list_hash(latent_root):
+def _latent_file_list_hash(latent_root, di=None):
     import hashlib
     root = Path(latent_root)
+    files = sorted(root.rglob("*.npy"))
+    stats = None
+    if di is not None and di.enabled:
+        own = range(di.rank, len(files), di.world)
+        sts = [files[i].stat() for i in own]
+        part = (len(files),
+                np.array([s.st_size for s in sts], dtype=np.int64),
+                np.array([s.st_mtime_ns for s in sts], dtype=np.int64))
+        parts = dist_all_gather_object(part, di)
+        if any(p[0] != len(files) for p in parts):
+            raise RuntimeError(
+                f"[cache] the ranks found different numbers of latents under "
+                f"{root} ({[p[0] for p in parts]}): the folder changed while "
+                f"they were reading it. Is a preprocessing still writing there?")
+        stats = [None] * len(files)
+        for r, (_n, sizes, mtimes) in enumerate(parts):
+            for j, i in enumerate(range(r, len(files), di.world)):
+                stats[i] = (int(sizes[j]), int(mtimes[j]))
     hasher = hashlib.sha256()
     n = 0
-    for p in sorted(root.rglob("*.npy")):
-        st = p.stat()
-        entry = f"{p.relative_to(root).as_posix()}|{st.st_size}|{st.st_mtime_ns}"
+    for i, p in enumerate(files):
+        if stats is None:
+            st = p.stat()
+            size, mtime = st.st_size, st.st_mtime_ns
+        else:
+            size, mtime = stats[i]
+        entry = f"{p.relative_to(root).as_posix()}|{size}|{mtime}"
         if n:
             hasher.update(b"\n")
         hasher.update(entry.encode("utf-8"))
@@ -191,8 +213,8 @@ def _splits_fingerprint(cfg):
     }
 
 
-def _cache_fingerprint(cfg, n_frames):
-    flist_hash, flist_count = _latent_file_list_hash(cfg.paths.dataset_root)
+def _cache_fingerprint(cfg, n_frames, di=None):
+    flist_hash, flist_count = _latent_file_list_hash(cfg.paths.dataset_root, di)
     return {
         "latent_root": os.path.abspath(cfg.paths.dataset_root),
         "dataset_meta": _load_dataset_meta(cfg.paths.dataset_root),
@@ -905,6 +927,9 @@ FIXED_CARDS_FILE = ".fixed_cards_logged"
 
 def fixed_card_pending(writer, tag):
     d = getattr(writer, "log_dir", None)
+    marks = getattr(writer, "marks", None)
+    if not d and marks is not None:
+        d = getattr(writer, "fixed_dir", None)
     if not d:
         return True
     cache = getattr(fixed_card_pending, "_cache", None)
@@ -922,6 +947,9 @@ def fixed_card_pending(writer, tag):
     if key in seen:
         return False
     seen.add(key)
+    if marks is not None:
+        marks.append(key)
+        return True
     try:
         with open(os.path.join(d, FIXED_CARDS_FILE), "a", encoding="utf-8") as fh:
             fh.write(key + "\n")
@@ -1054,7 +1082,7 @@ def test_panel_indices(n_test, n_panels):
 def generate_and_log_uncond_cards(
     model, normalizer, n_frames, step, writer, device, output_dir, n_cards,
     sampling_cfg, use_amp, frame_dims, global_configs, metrics_seed=None,
-    prefix="EMA",
+    prefix="EMA", mine=None,
 ):
     n_cards = max(0, int(n_cards or 0))
     if n_cards <= 0:
@@ -1065,6 +1093,11 @@ def generate_and_log_uncond_cards(
         gen_rng = torch.Generator(device=device)
         gen_rng.manual_seed(int(metrics_seed))
     for k in range(n_cards):
+        if mine is not None and not mine(k):
+            if gen_rng is not None:
+                torch.randn(1, n_frames, lc.active().latent_dim, device=device,
+                            generator=gen_rng)
+            continue
         gen = euler_sample_cfg(
             model, n_frames, device,
             steps=sampling_cfg.euler_steps,
@@ -1090,7 +1123,8 @@ def generate_and_log_uncond_cards(
 @torch.no_grad()
 def log_real_audio_samples(test_dataset, normalizer, writer,
                            n_samples, sampling_cfg=None, frame_dims=None,
-                           global_configs=None, output_dir=None):
+                           global_configs=None, output_dir=None, dist_info=None):
+    mine = dist_mine(dist_info)
     dac_model = get_dac()
     conditioned = bool(frame_dims or global_configs)
     if conditioned:
@@ -1108,6 +1142,8 @@ def log_real_audio_samples(test_dataset, normalizer, writer,
 
     written = 0
     for k, idx in enumerate(indices):
+        if mine is not None and not mine(k):
+            continue
         tag = audio_panel_tags(family, k, suffix=sfx.get(k, ""),
                                conditioned=conditioned)["real"]
         pending = fixed_card_pending(writer, tag)
@@ -1128,6 +1164,8 @@ def log_real_audio_samples(test_dataset, normalizer, writer,
         writer.add_audio(tag, wn, global_step=0, sample_rate=lc.active().sample_rate)
         written += 1
 
+    if mine is not None:
+        written = int(dist_sum([written], dist_info)[0])
     print(f"  {written} real audios logged on TensorBoard"
           + ("" if written == len(indices)
              else f" ({len(indices) - written} already on this board)"))
@@ -1139,7 +1177,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                     output_dir, use_amp, sampling_cfg, guidance,
                     frame_dims, global_configs, fidelity_evaluator,
                     dac_model, prefix, n_plot,
-                    metrics_seed=None):
+                    metrics_seed=None, mine=None):
     from probe_conditions import plot_condition_comparison
 
     names = [c for c in (frame_dims or {}) if c in (probe_sets or {})]
@@ -1202,16 +1240,18 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         gen_rng = torch.Generator(device=device)
         gen_rng.manual_seed(int(metrics_seed))
 
+    own = [i for i in range(n_plot) if mine is None or mine(i)]
+    own_set = set(own)
     spf = max(1, int(sampling_cfg.get("metrics_samples_per_forward", 1) or 1))
-    cond_lat = []
+    cond_lat = {}
     if guidance > 1.0:
-        for s in range(0, n_plot, spf):
-            grp = list(range(s, min(s + spf, n_plot)))
-            x0 = torch.stack([
-                torch.randn(n_frames, lc.active().latent_dim, device=device,
-                            generator=gen_rng)
-                for _ in grp])
-            cond_lat.extend(run_in_fitting_groups(
+        x0_all = [torch.randn(n_frames, lc.active().latent_dim, device=device,
+                              generator=gen_rng)
+                  for _ in range(n_plot)]
+        for s in range(0, len(own), spf):
+            grp = own[s:s + spf]
+            x0 = torch.stack([x0_all[i] for i in grp])
+            cond_lat.update(zip(grp, run_in_fitting_groups(
                 "generation", len(grp), len(grp),
                 lambda lo, hi: euler_sample_cfg_paired(
                     model, n_frames, device,
@@ -1225,10 +1265,15 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                     frame_dims=frame_dims, global_configs=global_configs,
                     gen_rng=gen_rng, text_ctx=_text_ctx(grp[lo:hi]),
                     x0=x0[lo:hi],
-                )[0]))
+                )[0])))
     else:
         for i in range(n_plot):
-            cond_lat.append(euler_sample_cfg(
+            if i not in own_set:
+                if gen_rng is not None:
+                    torch.randn(1, n_frames, lc.active().latent_dim,
+                                device=device, generator=gen_rng)
+                continue
+            cond_lat[i] = euler_sample_cfg(
                 model, n_frames, device,
                 steps=sampling_cfg.euler_steps,
                 t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
@@ -1238,23 +1283,23 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                 guidance=guidance,
                 frame_dims=frame_dims, global_configs=global_configs,
                 gen_rng=gen_rng, text_ctx=_text_ctx([i]),
-            ))
+            )
 
     fidelity_evaluator.reset()
-    fidelity_evaluator.keep_contours_for(range(n_plot))
-    wavs = []
-    for i, lat in enumerate(cond_lat):
+    fidelity_evaluator.keep_contours_for(own)
+    wavs = {}
+    for i, lat in cond_lat.items():
         wav = decode_frames_to_wav(lat, normalizer, dac_model)
         if names:
             fidelity_evaluator.add_sample(
                 wav.numpy(), lc.active().sample_rate, n_frames,
                 {c: targets[c][i] for c in names}, sample_id=i)
-        wavs.append(wav)
+        wavs[i] = wav
     ps_cond = fidelity_evaluator.per_sample() if names else {}
     cont_cond = ({c: fidelity_evaluator.contours(c) for c in names}
                  if names else {})
 
-    for i in range(n_plot):
+    for i in own:
         _suffix = (f" [{probe_sets['text'].text(i)[:48]}]"
                    if "text" in gnames else "")
         _blk = f"probe_{i:02d}{_suffix}"
@@ -1506,13 +1551,15 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     step, writer, device, output_dir, use_amp, sampling_cfg,
                     guidance, frame_dims, global_configs, fidelity_evaluator,
                     dac_model, prefix, metrics_seed=None, text_vec_for=None,
-                    subset_specs=(), image_root=None):
+                    subset_specs=(), image_root=None, mine=None):
     from probe_conditions import plot_condition_comparison
     from condition_metrics import sonify_condition
 
     n = len(ds_indices)
     if n == 0:
         return
+    own = [j for j in range(n) if mine is None or mine(j)]
+    own_set = set(own)
     names = list(frame_dims or {})
     gnames = list(global_configs or {})
     sfx = panel_suffixes(test_dataset, ds_indices, global_configs)
@@ -1551,15 +1598,15 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
         if metrics_seed is not None:
             gen_rng = torch.Generator(device=device)
             gen_rng.manual_seed(int(metrics_seed))
-        out = []
+        out = {}
         if spf >= 1 and guidance > 1.0:
-            for s in range(0, n, spf):
-                grp = list(range(s, min(s + spf, n)))
-                x0 = torch.stack([
-                    torch.randn(n_frames, lc.active().latent_dim, device=device,
-                                generator=gen_rng)
-                    for _ in grp])
-                out.extend(run_in_fitting_groups(
+            x0_all = [torch.randn(n_frames, lc.active().latent_dim, device=device,
+                                  generator=gen_rng)
+                      for _ in range(n)]
+            for s in range(0, len(own), spf):
+                grp = own[s:s + spf]
+                x0 = torch.stack([x0_all[j] for j in grp])
+                out.update(zip(grp, run_in_fitting_groups(
                     "generation", len(grp), len(grp),
                     lambda lo, hi: euler_sample_cfg_paired(
                         model, n_frames, device,
@@ -1573,10 +1620,15 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                         frame_dims=frame_dims, global_configs=global_configs,
                         gen_rng=gen_rng, text_ctx=_ctx(grp[lo:hi]),
                         x0=x0[lo:hi],
-                    )[0]))
+                    )[0])))
         else:
             for j in range(n):
-                out.append(euler_sample_cfg(
+                if j not in own_set:
+                    if gen_rng is not None:
+                        torch.randn(1, n_frames, lc.active().latent_dim,
+                                    device=device, generator=gen_rng)
+                    continue
+                out[j] = euler_sample_cfg(
                     model, n_frames, device,
                     steps=sampling_cfg.euler_steps,
                     t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
@@ -1586,7 +1638,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     guidance=guidance,
                     frame_dims=frame_dims, global_configs=global_configs,
                     gen_rng=gen_rng, text_ctx=_ctx([j]),
-                ))
+                )
         return out
 
     lat = _generate()
@@ -1594,16 +1646,16 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
         and fidelity_evaluator.active
     if use_ev:
         fidelity_evaluator.reset()
-        fidelity_evaluator.keep_contours_for(range(n))
-    wavs = []
-    for j, z in enumerate(lat):
+        fidelity_evaluator.keep_contours_for(own)
+    wavs = {}
+    for j, z in lat.items():
         wav = decode_frames_to_wav(z, normalizer, dac_model)
         if use_ev:
             fidelity_evaluator.add_sample(
                 wav.numpy(), lc.active().sample_rate, n_frames,
                 {k: v.cpu().numpy() for k, v in items[j][1].items()},
                 sample_id=j)
-        wavs.append(wav)
+        wavs[j] = wav
     ps = fidelity_evaluator.per_sample() if use_ev else {}
     cont = fidelity_evaluator.contours() if use_ev else {}
 
@@ -1612,11 +1664,11 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
     for _lab, _names in (subset_specs or ()):
         if tuple(_names) == _full:
             continue
-        ladder[_lab] = [decode_frames_to_wav(z, normalizer, dac_model)
-                        for z in _generate(subset=set(_names))]
+        ladder[_lab] = {j: decode_frames_to_wav(z, normalizer, dac_model)
+                        for j, z in _generate(subset=set(_names)).items()}
 
     img_failed, img_shown = None, 0
-    for k in range(n):
+    for k in own:
         blk = f"test_{k:02d}{sfx.get(k, '')}"
         img_file = None
 
@@ -1753,9 +1805,15 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                          sampling_cfg, conditioning_cfg, use_amp, frame_dims,
                          global_configs, fidelity_evaluator, test_dataset,
                          probe_sets, n_frames, prefix="EMA", metrics_seed=None,
-                         image_root=None, text_vec_for=None):
+                         image_root=None, text_vec_for=None, dist_info=None):
     guidance = float(conditioning_cfg.guidance_scale)
     any_cond_active = bool(frame_dims) or bool(global_configs)
+    di = dist_info if (dist_info is not None and dist_info.enabled) else None
+    mine = dist_mine(di)
+    mine_probe = mine
+    if di is not None and not all(dist_all_gather_object(bool(probe_sets), di)):
+        mine_probe = None
+    dist_record(writer, di)
     dac_model = get_dac()
     subset_specs = []
     if fidelity_evaluator is not None and fidelity_evaluator.active:
@@ -1780,7 +1838,7 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                     fidelity_evaluator=fidelity_evaluator, dac_model=dac_model,
                     prefix=prefix, metrics_seed=metrics_seed,
                     text_vec_for=text_vec_for, subset_specs=subset_specs,
-                    image_root=image_root)
+                    image_root=image_root, mine=mine)
             except Exception as _e:
                 print(f"    [test panels] SKIPPED at step {step}: "
                       f"{type(_e).__name__}: {_e}")
@@ -1805,7 +1863,7 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                     global_configs=global_configs,
                     fidelity_evaluator=fidelity_evaluator, dac_model=dac_model,
                     prefix=prefix, n_plot=_npanel,
-                    metrics_seed=metrics_seed,
+                    metrics_seed=metrics_seed, mine=mine_probe,
                 )
             except Exception as _e:
                 print(f"    [probe] SKIPPED at step {step}: "
@@ -1819,8 +1877,9 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
         n_cards=int(sampling_cfg.get("n_audio_samples", 4) or 0),
         sampling_cfg=sampling_cfg, use_amp=use_amp,
         frame_dims=frame_dims, global_configs=global_configs,
-        metrics_seed=metrics_seed, prefix=prefix)
+        metrics_seed=metrics_seed, prefix=prefix, mine=mine)
 
+    dist_replay(writer, di)
     if device == "cuda":
         torch.cuda.empty_cache()
 
@@ -2362,8 +2421,6 @@ def evaluate_and_log_metrics(
             "influence_coverage": _cov_named,
         })
 
-    if not is_main:
-        return fd_dac_cond, kl_cond["kl_real_gen"], kl_cond["kl_gen_real"]
     log_listening_panels(
         model=model, normalizer=normalizer, step=step, writer=writer,
         device=device, output_dir=output_dir, sampling_cfg=sampling_cfg,
@@ -2372,7 +2429,7 @@ def evaluate_and_log_metrics(
         fidelity_evaluator=fidelity_evaluator, test_dataset=test_dataset,
         probe_sets=probe_sets, n_frames=n_frames, prefix=prefix,
         metrics_seed=metrics_seed, image_root=image_root,
-        text_vec_for=_text_vec_for)
+        text_vec_for=_text_vec_for, dist_info=_di)
 
     return fd_dac_cond, kl_cond["kl_real_gen"], kl_cond["kl_gen_real"]
 
@@ -2444,8 +2501,7 @@ def build_condition_scorers(cfg, frame_dims, global_configs, registry,
 
 
 def build_probe_sets(cfg, registry, fidelity_evaluator, dataset,
-                     frame_dims, global_configs):
-    probe_sets = {}
+                     frame_dims, global_configs, di=None):
     _n_probes = panel_count(cfg.sampling, "probe")
     _rng_guard = (
         torch.get_rng_state(),
@@ -2454,44 +2510,33 @@ def build_probe_sets(cfg, registry, fidelity_evaluator, dataset,
         torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     )
     _probe_names = list(frame_dims) + list(global_configs)
-    for _cond in _probe_names:
-        if _n_probes <= 0:
-            continue
-        try:
-            from probe_conditions import (build_condition_probe_set,
-                                          text_probe_bank)
-            if _cond == "f0":
-                _probe_root = (cfg.paths.get("f0_probe_dir", None)
-                               or os.path.join(cfg.paths.cache_dir, "f0_probe"))
+    built = {}
+    if _n_probes > 0 and di is not None and di.enabled:
+        for j, _cond in enumerate(_probe_names):
+            if j % di.world == di.rank:
+                built[_cond] = _build_probe_set(cfg, registry, fidelity_evaluator,
+                                                dataset, global_configs, _cond,
+                                                _n_probes)
+        done = {}
+        for part in dist_all_gather_object(
+                {c: ps is not None for c, ps in built.items()}, di):
+            done.update(part)
+        for j, _cond in enumerate(_probe_names):
+            if _cond in built:
+                continue
+            if done.get(_cond):
+                built[_cond] = _build_probe_set(cfg, registry, fidelity_evaluator,
+                                                dataset, global_configs, _cond,
+                                                _n_probes)
             else:
-                _probe_root = os.path.join(cfg.paths.cache_dir,
-                                           f"probe_{_cond}")
-            if _cond in global_configs:
-                _probe_extractor = registry.global_extractors[_cond]
-            else:
-                _probe_extractor = fidelity_evaluator.extractors.get(
-                    _cond, registry.frame_extractors[_cond])
-            _probe_dev = getattr(_probe_extractor, "device",
-                                 getattr(_probe_extractor, "_device", "cpu"))
-            _bank = None
-            if _cond == "text":
-                _bank, _why = text_probe_bank(
-                    load_caption_table(dataset.latent_root),
-                    n_panels=_n_probes)
-                print(f"[text-probe] {_why}")
-            _ps = build_condition_probe_set(
-                _cond, _probe_root, dataset.n_frames,
-                extractor=_probe_extractor,
-                n_probes=_n_probes,
-                duration_s=float(cfg.model.duration_s),
-                sr=lc.active().sample_rate,
-                bank=_bank,
-            )
-            probe_sets[_cond] = _ps
-            print(f"{_cond} probe: {len(_ps)} elementary stimuli, "
-                  f"all plotted on TB | device={_probe_dev} | dir={_ps.dir}")
-        except Exception as e:
-            print(f"[{_cond}-probe] disabled -- could not build it: {e}")
+                print(f"[{_cond}-probe] disabled -- not built on rank "
+                      f"{j % di.world} (see its log)")
+    elif _n_probes > 0:
+        for _cond in _probe_names:
+            built[_cond] = _build_probe_set(cfg, registry, fidelity_evaluator,
+                                            dataset, global_configs, _cond,
+                                            _n_probes)
+    probe_sets = {c: built[c] for c in _probe_names if built.get(c) is not None}
     torch.set_rng_state(_rng_guard[0])
     np.random.set_state(_rng_guard[1])
     random.setstate(_rng_guard[2])
@@ -2506,6 +2551,46 @@ def build_probe_sets(cfg, registry, fidelity_evaluator, dataset,
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return probe_sets
+
+
+def _build_probe_set(cfg, registry, fidelity_evaluator, dataset,
+                     global_configs, _cond, _n_probes):
+    try:
+        from probe_conditions import (build_condition_probe_set,
+                                      text_probe_bank)
+        if _cond == "f0":
+            _probe_root = (cfg.paths.get("f0_probe_dir", None)
+                           or os.path.join(cfg.paths.cache_dir, "f0_probe"))
+        else:
+            _probe_root = os.path.join(cfg.paths.cache_dir,
+                                       f"probe_{_cond}")
+        if _cond in global_configs:
+            _probe_extractor = registry.global_extractors[_cond]
+        else:
+            _probe_extractor = fidelity_evaluator.extractors.get(
+                _cond, registry.frame_extractors[_cond])
+        _probe_dev = getattr(_probe_extractor, "device",
+                             getattr(_probe_extractor, "_device", "cpu"))
+        _bank = None
+        if _cond == "text":
+            _bank, _why = text_probe_bank(
+                load_caption_table(dataset.latent_root),
+                n_panels=_n_probes)
+            print(f"[text-probe] {_why}")
+        _ps = build_condition_probe_set(
+            _cond, _probe_root, dataset.n_frames,
+            extractor=_probe_extractor,
+            n_probes=_n_probes,
+            duration_s=float(cfg.model.duration_s),
+            sr=lc.active().sample_rate,
+            bank=_bank,
+        )
+        print(f"{_cond} probe: {len(_ps)} elementary stimuli, "
+              f"all plotted on TB | device={_probe_dev} | dir={_ps.dir}")
+        return _ps
+    except Exception as e:
+        print(f"[{_cond}-probe] disabled -- could not build it: {e}")
+        return None
 
 
 class MetricsAdapter:
@@ -2773,13 +2858,80 @@ def save_reference(stats, path):
     os.replace(tmp, path)
 
 
+def dist_normalizer_merge(di):
+    def merge(n_total, mean_acc, m2_acc, n_used, n_chunks, rejected,
+              rejected_paths):
+        n = torch.tensor(float(n_total), dtype=torch.float64, device=mean_acc.device)
+        n_all, s_all = dist_sum_tensors([n, mean_acc * n], di)
+        mean = s_all / n_all if float(n_all) > 0 else torch.zeros_like(mean_acc)
+        m2_all, = dist_sum_tensors([m2_acc + n * (mean_acc - mean) ** 2], di)
+        used, total = dist_sum([n_used, n_chunks], di)
+        rej, paths = {}, []
+        for r, p in dist_all_gather_object((rejected, rejected_paths), di):
+            for k, v in r.items():
+                rej[k] = rej.get(k, 0) + v
+            paths.extend(p)
+        return (int(float(n_all)), mean, m2_all, int(used), int(total), rej,
+                paths[:10])
+    return merge
+
+
+def _to_cpu(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu()
+    if isinstance(x, (list, tuple)):
+        return type(x)(_to_cpu(v) for v in x)
+    if isinstance(x, dict):
+        return {k: _to_cpu(v) for k, v in x.items()}
+    return x
+
+
 class NullWriter:
     log_dir = None
 
+    def __init__(self, fixed_dir=None):
+        self.fixed_dir = fixed_dir
+        self.calls = None
+        self.marks = None
+
+    def record(self):
+        self.calls, self.marks = [], []
+
+    def take(self):
+        out = (self.calls or [], self.marks or [])
+        self.calls = self.marks = None
+        return out
+
     def __getattr__(self, name):
-        def _noop(*args, **kwargs):
+        def _call(*args, **kwargs):
+            if self.calls is not None:
+                self.calls.append((name, _to_cpu(args), _to_cpu(kwargs)))
             return None
-        return _noop
+        return _call
+
+
+def dist_mine(di):
+    if di is None or not di.enabled:
+        return None
+    return lambda k: k % di.world == di.rank
+
+
+def dist_record(writer, di):
+    if di is not None and di.enabled and not di.is_main:
+        writer.record()
+
+
+def dist_replay(writer, di):
+    if di is None or not di.enabled:
+        return
+    own = ([], []) if di.is_main else writer.take()
+    for r, (calls, marks) in enumerate(dist_all_gather_object(own, di)):
+        if not di.is_main or r == di.rank:
+            continue
+        for key in marks:
+            fixed_card_pending(writer, key)
+        for name, args, kwargs in calls:
+            getattr(writer, name)(*args, **kwargs)
 
 
 if __name__ == "__main__":
@@ -2817,9 +2969,10 @@ if __name__ == "__main__":
     fad_cache_path = os.path.join(cache_dir, f"fad_vggish_ref_{_fad_ref_mode}.pt")
 
     _n_frames_fp = frames_per_chunk(cfg.paths.dataset_root, cfg.model.duration_s)
+    _fingerprint = _cache_fingerprint(cfg, _n_frames_fp, DIST)
     if DIST.enabled and not DIST.is_main:
         dist_barrier(DIST)
-    _validate_cache(cache_dir, _cache_fingerprint(cfg, _n_frames_fp),
+    _validate_cache(cache_dir, _fingerprint,
                     guarded_files=[normalizer_path, fd_dac_cache_path,
                                    fad_cache_path])
     if DIST.enabled and DIST.is_main:
@@ -2945,8 +3098,8 @@ if __name__ == "__main__":
     print(f"Global cond configs: {GLOBAL_CONFIGS}\n")
 
     print("Loading datasets...")
-    if DIST.enabled and not DIST.is_main:
-        dist_barrier(DIST)
+    _norm_split = DIST.enabled and dist_broadcast_object(
+        not os.path.exists(normalizer_path), DIST)
     cond_root = cfg.paths.condition_root if Path(cfg.paths.condition_root).exists() else None
     img_root  = cfg.paths.image_root     if Path(cfg.paths.image_root).exists()     else None
 
@@ -2957,13 +3110,19 @@ if __name__ == "__main__":
             image_root=img_root,
             duration_s=cfg.model.duration_s,
             normalizer_path=(normalizer_path
-                             if os.path.exists(normalizer_path) else None),
+                             if os.path.exists(normalizer_path) and not _norm_split
+                             else None),
             registry=registry,
             preload=False,
             strict_conditions=strict_conditions,
             text_source=cfg.conditioning.get("text_source", "audio"),
             text_mix_p=cfg.conditioning.get("text_mix_p", 0.5),
             splits_path=cfg.paths.get("splits_path", None),
+            normalizer_shard=(DIST.rank, DIST.world) if _norm_split else None,
+            normalizer_merge=dist_normalizer_merge(DIST) if _norm_split else None,
+            file_checks_dist=((DIST.rank, DIST.world,
+                               lambda obj: dist_all_gather_object(obj, DIST))
+                              if DIST.enabled else None),
         )
 
     n_classes = len(label_map)
@@ -2976,8 +3135,6 @@ if __name__ == "__main__":
 
     if DIST.is_main and not os.path.exists(normalizer_path):
         normalizer.save(normalizer_path)
-    if DIST.enabled and DIST.is_main:
-        dist_barrier(DIST)
 
     n_workers = int(cfg.data.get("num_workers", 4))
     train_sampler = None
@@ -3191,10 +3348,9 @@ if __name__ == "__main__":
                  if panel_count(cfg.sampling, "test") and not len(test_dataset)
                  else "")
               + f" | probe {_n_probes if _n_probes > 0 else 'off'}")
-    probe_sets = (build_probe_sets(cfg, registry, fidelity_evaluator,
-                                   val_dataset, FRAME_COND_DIMS,
-                                   GLOBAL_CONFIGS)
-                  if DIST.is_main else None)
+    probe_sets = build_probe_sets(cfg, registry, fidelity_evaluator,
+                                  val_dataset, FRAME_COND_DIMS,
+                                  GLOBAL_CONFIGS, di=DIST)
     if probe_sets:
         print()
 
@@ -3254,7 +3410,7 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler    = torch.amp.GradScaler('cuda', enabled=cfg.training.use_amp)
 
-    writer = SummaryWriter(run_dir) if DIST.is_main else NullWriter()
+    writer = SummaryWriter(run_dir) if DIST.is_main else NullWriter(fixed_dir=run_dir)
 
     _cfg_log = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     OmegaConf.set_struct(_cfg_log, False)
@@ -3584,17 +3740,19 @@ if __name__ == "__main__":
     print(f"RUN DIR:        {run_dir}")
     print(f"{'='*60}\n")
 
-    if DIST.is_main:
-        log_real_audio_samples(
-            test_dataset=test_dataset,
-            normalizer=normalizer,
-            writer=writer,
-            n_samples=cfg.sampling.n_audio_samples,
-            sampling_cfg=cfg.sampling,
-            frame_dims=FRAME_COND_DIMS,
-            global_configs=GLOBAL_CONFIGS,
-            output_dir=audio_dir,
-        )
+    dist_record(writer, DIST)
+    log_real_audio_samples(
+        test_dataset=test_dataset,
+        normalizer=normalizer,
+        writer=writer,
+        n_samples=cfg.sampling.n_audio_samples,
+        sampling_cfg=cfg.sampling,
+        frame_dims=FRAME_COND_DIMS,
+        global_configs=GLOBAL_CONFIGS,
+        output_dir=audio_dir,
+        dist_info=DIST,
+    )
+    dist_replay(writer, DIST)
 
 
     val_loss = None
@@ -3753,12 +3911,12 @@ if __name__ == "__main__":
                     pbar.write(f"  -> Best model: {save_path}")
 
             if (step > 0 and step % cfg.intervals.audio == 0
-                    and step % cfg.intervals.metrics != 0 and n_uncond_cards
-                    and DIST.is_main):
+                    and step % cfg.intervals.metrics != 0 and n_uncond_cards):
                 pbar.write(f"\n  Uncond preview step {step}...")
                 gen_model = (ema.model
                               if cfg.training.use_ema and step >= cfg.training.ema_start
                               else model)
+                dist_record(writer, DIST)
                 generate_and_log_uncond_cards(
                     model=gen_model, normalizer=normalizer,
                     n_frames=n_frames, step=step, writer=writer,
@@ -3772,7 +3930,9 @@ if __name__ == "__main__":
                     prefix=("EMA"
                             if cfg.training.use_ema and step >= cfg.training.ema_start
                             else "Model"),
+                    mine=dist_mine(DIST),
                 )
+                dist_replay(writer, DIST)
                 pbar.write(f"  Uncond preview logged (step {step})\n")
                 model.train()
 

@@ -240,7 +240,8 @@ def main():
                   f"nothing to split, GPU 0 makes them and the other "
                   f"{DIST.world - 1} GPU(s) stay idle.")
 
-    writer = SummaryWriter(str(log_dir)) if DIST.is_main else tc.NullWriter()
+    writer = (SummaryWriter(str(log_dir)) if DIST.is_main
+              else tc.NullWriter(fixed_dir=str(log_dir)))
 
     tc.set_dac_device(cfg.metrics.get("dac_device", "cpu"))
 

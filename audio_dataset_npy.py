@@ -89,6 +89,8 @@ class LatentNormalizer:
         batch_accum: int = 50,
         io_workers: int = 16,
         latent_dim: Optional[int] = None,
+        merge=None,
+        progress: bool = True,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -126,7 +128,8 @@ class LatentNormalizer:
         rejected_paths = []
 
         with ThreadPoolExecutor(max_workers=max(1, io_workers)) as ex:
-            with tqdm(total=n_chunks, desc="Normalizer fit", unit="chunk") as pbar:
+            with tqdm(total=n_chunks, desc="Normalizer fit", unit="chunk",
+                      disable=not progress) as pbar:
                 for b0 in range(0, n_chunks, batch_accum):
                     block = chunks[b0:b0 + batch_accum]
                     arrs = []
@@ -158,6 +161,16 @@ class LatentNormalizer:
                     batch_m2    = ((batch - batch_mean) ** 2).sum(dim=1, keepdim=True)
                     m2_acc      = m2_acc + batch_m2 + (delta ** 2) * (n_total * n_new / n_total_new)
                     n_total     = n_total_new
+
+        if merge is not None:
+            if mean_acc is None:
+                mean_acc = torch.zeros(latent_dim, 1, dtype=torch.float64, device=device)
+                m2_acc   = torch.zeros(latent_dim, 1, dtype=torch.float64, device=device)
+            (n_total, mean_acc, m2_acc, n_used, n_chunks, rejected,
+             rejected_paths) = merge(n_total, mean_acc, m2_acc, n_used, n_chunks,
+                                     rejected, rejected_paths)
+            if n_total == 0:
+                mean_acc = None
 
         if mean_acc is None:
             raise RuntimeError(
