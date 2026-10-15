@@ -59,7 +59,7 @@ sampling:
   validation_text_from_caption: true
   influence_subsets: []      # [] = off | ["all", "loo"] | ["all", "loo", "singletons"] | [["f0"], ["f0", "energy"]]
   metrics_uncond: false      # true = also FD / KL / FAD of the generations without conditions
-  metrics_samples_per_forward: 1   # 0 = serial sampler; N = N samples per forward
+  metrics_samples_per_forward: 16   # 0 = serial sampler; N = N samples per forward
   n_fad_samples: 512
 
 metrics:

@@ -18,7 +18,6 @@ from conditions import (
     CremaChordExtractor,
     MidiExtractor,
     MIDI_N_KEYS,
-    MIDI_LOWEST_KEY,
     MIDI_DRUM_CLASSES,
     midi_roll_to_events,
     CONDITION_CONFIG,

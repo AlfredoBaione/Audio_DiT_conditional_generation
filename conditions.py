@@ -1,5 +1,6 @@
 # Conditions: registry and extractors (f0, chroma, rhythm, energy, chord, midi, text, image).
 
+import contextlib
 import torch
 import torch.nn as nn
 import torchaudio
@@ -343,6 +344,16 @@ def crepe_viterbi(logits):
     return bins, torchcrepe.convert.bins_to_frequency(bins)
 
 
+@contextlib.contextmanager
+def _cudnn_benchmark():
+    prev = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = True
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = prev
+
+
 class CrepeF0Extractor(FrameConditionExtractor):
     SR = 16000
 
@@ -402,12 +413,13 @@ class CrepeF0Extractor(FrameConditionExtractor):
         import torchcrepe
         y = self._to_crepe_sr(audio, sr)
         hop = self._hop()
-        pitch, periodicity = torchcrepe.predict(
-            torch.from_numpy(y).unsqueeze(0), self.SR, hop_length=hop,
-            fmin=self.fmin, fmax=self.fmax, model=self.model,
-            decoder=crepe_viterbi, return_periodicity=True,
-            batch_size=self.batch_size, device=self._dev(),
-        )
+        with _cudnn_benchmark():
+            pitch, periodicity = torchcrepe.predict(
+                torch.from_numpy(y).unsqueeze(0), self.SR, hop_length=hop,
+                fmin=self.fmin, fmax=self.fmax, model=self.model,
+                decoder=crepe_viterbi, return_periodicity=True,
+                batch_size=self.batch_size, device=self._dev(),
+            )
         return self._features(pitch, periodicity, y, hop, n_frames)
 
     def extract_batch(self, audios, sr: int, n_frames: int) -> List[np.ndarray]:
@@ -416,7 +428,7 @@ class CrepeF0Extractor(FrameConditionExtractor):
         hop = self._hop()
         ys = [self._to_crepe_sr(a, sr) for a in audios]
         out = []
-        with torch.no_grad():
+        with torch.no_grad(), _cudnn_benchmark():
             frames = [next(torchcrepe.preprocess(torch.from_numpy(y).unsqueeze(0),
                                                  self.SR, hop, None, dev, True))
                       for y in ys]

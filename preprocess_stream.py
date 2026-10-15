@@ -30,7 +30,7 @@ import subprocess
 import tempfile
 import faulthandler
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -1792,7 +1792,6 @@ class StreamingChunkDataset(IterableDataset):
         self.tmp_dir = tmp_dir
 
     def __iter__(self):
-        import soundfile as sf
         lc.activate(self.codec_name)
         wi = torch.utils.data.get_worker_info()
         if wi is None:

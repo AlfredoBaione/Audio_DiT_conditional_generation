@@ -159,7 +159,8 @@ OUT/
 Useful flags: `--codec` (see below), `--chunk_duration`, `--chunk_overlap`,
 `--global_conds text,image` (+ `--image_root`), `--label_source` (where the class
 comes from, see below), `--num_workers` (parallel CPU work; keep **0 on
-Windows**), `--batch_size` (encoder batch), `--force`, and `--config` to keep all
+Windows**), `--batch_size` (GPU batch: encoder + f0/rhythm/text), `--cpu_batch_size`
+(batch of the CPU conditions in each worker), `--force`, and `--config` to keep all
 of it in a YAML instead. `--sr` follows the codec and is best left unset.
 
 ### Which autoencoder makes the latents — `--codec`
