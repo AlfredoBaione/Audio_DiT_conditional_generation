@@ -29,6 +29,9 @@ import argparse
 import subprocess
 import tempfile
 import faulthandler
+import queue
+import signal
+import multiprocessing
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
@@ -1666,6 +1669,14 @@ def _shard_files(files, worker_id: int, num_workers: int):
     return files[worker_id::num_workers] if num_workers and num_workers > 1 else files
 
 
+def _visible_gpu_ids() -> List[str]:
+    n = torch.cuda.device_count()
+    env = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if env:
+        return [d.strip() for d in env.split(",")][:n]
+    return [str(i) for i in range(n)]
+
+
 def _extractor_device_attr(ext) -> Optional[str]:
     for attr in ("device", "_device"):
         if hasattr(ext, attr):
@@ -1895,6 +1906,167 @@ class StreamingChunkDataset(IterableDataset):
                                        if needs_latent else None),
                        "cond_path": (str(p["cond_path"])
                                      if needs_gpu_cond else None)}
+
+
+def _stream_files(args, dataset, encoder, registry, gpu_cond_names,
+                  n_frames_fixed, on_file_done, poll=None):
+    loader_kw = dict(
+        dataset=dataset,
+        batch_size=args.loader_batch_size,
+        num_workers=args.num_workers,
+        collate_fn=_identity_collate,
+        persistent_workers=False,
+    )
+    if args.num_workers > 0:
+        loader_kw.update(
+            prefetch_factor=args.prefetch_factor,
+            multiprocessing_context=args.worker_start_method,
+            worker_init_fn=_worker_init_fn,
+        )
+    loader = DataLoader(**loader_kw)
+
+    n_lat = 0
+    n_gcond = 0
+    pending = []
+    _encode_on = not (args.skip_encoder or encoder is None)
+    _gpu_work = _encode_on or bool(gpu_cond_names)
+
+    def _flush(items):
+        nonlocal n_lat, n_gcond
+        a, b = _process_gpu_batch(
+            encoder if _encode_on else None, items, args.sr, n_frames_fixed,
+            registry=registry, gpu_names=gpu_cond_names, force=args.force)
+        n_lat += a
+        n_gcond += b
+
+    for batch in loader:
+        for it in batch:
+            if "file_done" in it:
+                on_file_done(it)
+                continue
+            pending.append(it)
+        if poll is not None:
+            poll()
+        if not _gpu_work:
+            pending.clear()
+            continue
+        while len(pending) >= args.batch_size:
+            _flush(pending[:args.batch_size])
+            del pending[:args.batch_size]
+    if pending and _gpu_work:
+        _flush(pending)
+        pending.clear()
+    return n_lat, n_gcond
+
+
+def _die_with_parent():
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _gpu_process_main(g, args, dataset_kw, messages):
+    _die_with_parent()
+    try:
+        faulthandler.enable(all_threads=True)
+    except Exception:
+        pass
+    lc.activate(dataset_kw["codec_name"])
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"[gpus] the process of GPU {os.environ.get('CUDA_VISIBLE_DEVICES')} "
+            f"sees no GPU.")
+    encoder = None
+    if not args.skip_encoder:
+        encoder = CodecEncoder(device=args.device, codec=dataset_kw["codec_name"])
+    n_lat, n_gcond = _stream_files(
+        args, StreamingChunkDataset(**dataset_kw), encoder,
+        dataset_kw["registry"], dataset_kw["gpu_cond_names"],
+        dataset_kw["n_frames_fixed"], lambda it: messages.put(("file", it)))
+    messages.put(("done", g, n_lat, n_gcond))
+
+
+class _GpuProcesses:
+    def __init__(self, gpu_ids, on_file_done):
+        self.ctx = multiprocessing.get_context("spawn")
+        self.messages = self.ctx.Queue()
+        self.gpu_ids = list(gpu_ids)
+        self.on_file_done = on_file_done
+        self.procs = {}
+        self.counts = {}
+
+    def start(self, args, dataset_kw, shards):
+        saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        try:
+            for g in range(1, len(shards)):
+                if not shards[g]:
+                    continue
+                os.environ["CUDA_VISIBLE_DEVICES"] = self.gpu_ids[g]
+                p = self.ctx.Process(
+                    target=_gpu_process_main, name=f"gpu{g}",
+                    args=(g, args, dict(dataset_kw, files=shards[g]),
+                          self.messages))
+                p.start()
+                self.procs[g] = p
+        finally:
+            if saved is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+        print("[gpus] started: " + ", ".join(
+            f"GPU {self.gpu_ids[g]} pid {p.pid} ({len(shards[g])} file(s))"
+            for g, p in self.procs.items()), flush=True)
+
+    def _drain(self, timeout=None):
+        while True:
+            try:
+                msg = (self.messages.get(timeout=timeout) if timeout
+                       else self.messages.get_nowait())
+            except queue.Empty:
+                return
+            timeout = None
+            if msg[0] == "file":
+                self.on_file_done(msg[1])
+            else:
+                self.counts[msg[1]] = msg[2:]
+
+    def poll(self, timeout=None):
+        ended = all(p.exitcode is not None for p in self.procs.values())
+        self._drain(timeout)
+        for g, p in self.procs.items():
+            if g in self.counts or p.exitcode is None:
+                continue
+            if p.exitcode != 0 or ended:
+                raise RuntimeError(
+                    f"[gpus] the process of GPU {self.gpu_ids[g]} (pid {p.pid}) "
+                    f"stopped with exit code {p.exitcode} before finishing its "
+                    f"files (its error is printed above); the other processes "
+                    f"are stopped too. Re-run the same command: what is already "
+                    f"written is kept and skipped.")
+
+    def wait(self):
+        while len(self.counts) < len(self.procs):
+            self.poll(timeout=1.0)
+        for p in self.procs.values():
+            p.join(timeout=60)
+        return (sum(c[0] for c in self.counts.values()),
+                sum(c[1] for c in self.counts.values()))
+
+    def stop(self):
+        try:
+            self._drain()
+        except Exception:
+            pass
+        alive = [p for p in self.procs.values() if p.is_alive()]
+        for p in alive:
+            p.terminate()
+        for p in alive:
+            p.join(timeout=30)
+            if p.is_alive():
+                p.kill()
+                p.join()
 
 
 def _meta_dict(args, chunk_length, chunk_overlap, latent_frames_per_chunk=None):
@@ -2175,6 +2347,15 @@ def build_parser():
                              "corresponding to nothing. Only files the manifest "
                              "attributes to those sources are removed.")
 
+    parser.add_argument("--num_gpus", type=int, default=1,
+                        help="GPUs to use (default: 1). With N > 1: one "
+                             "process per GPU, each with its own codec, GPU "
+                             "conditions and --num_workers workers, the source "
+                             "files divided between them; splits.json, "
+                             "dataset_meta.json, the manifest and the global "
+                             "sidecars are written once. On the IRCAM servers "
+                             "lock the same number: python_gpu_lock -n N -- "
+                             "python preprocess_stream.py ... --num_gpus N.")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader workers doing the CPU work (load, "
                              "acoustic, chunking, condition extraction) in "
@@ -2326,6 +2507,8 @@ def main():
         raise SystemExit("[preprocess_stream] --loader_batch_size must be >= 1.")
     if args.prefetch_factor < 1:
         raise SystemExit("[preprocess_stream] --prefetch_factor must be >= 1.")
+    if args.num_gpus < 1:
+        raise SystemExit("[preprocess_stream] --num_gpus must be >= 1.")
 
     try:
         codec = lc.activate(CODEC_CHOICES[args.codec])
@@ -2395,6 +2578,29 @@ def main():
         print(f"\nDONE (split only)\n  output: {out_root / SPLITS_NAME}")
         print_chunk_counts(out_root, groups)
         return
+
+    gpu_ids = _visible_gpu_ids() if args.device.startswith("cuda") else []
+    if args.num_gpus > 1:
+        if (args.device not in ("cuda", "cuda:0")
+                or args.cond_device not in (None, "cpu", "cuda", "cuda:0")):
+            raise SystemExit(
+                f"[gpus] --num_gpus {args.num_gpus} runs one process per GPU and "
+                f"each one sees its own GPU as 'cuda': pass --device cuda "
+                f"(--cond_device cuda, cpu or unset), not --device {args.device}"
+                + (f" --cond_device {args.cond_device}" if args.cond_device
+                   else "") + ".")
+        if len(gpu_ids) < args.num_gpus:
+            raise SystemExit(
+                f"[gpus] --num_gpus {args.num_gpus}, but {len(gpu_ids)} GPU(s) "
+                f"visible (CUDA_VISIBLE_DEVICES="
+                f"{os.environ.get('CUDA_VISIBLE_DEVICES')!r}). On the IRCAM "
+                f"servers lock them together: python_gpu_lock -n "
+                f"{args.num_gpus} -- python preprocess_stream.py ... "
+                f"--num_gpus {args.num_gpus}")
+    if len(gpu_ids) > args.num_gpus:
+        print(f"[gpus] {len(gpu_ids)} GPUs visible, this run uses "
+              f"{args.num_gpus} (--num_gpus {args.num_gpus})")
+    gpu_ids = gpu_ids[:args.num_gpus]
 
     enabled_frame = None
     if args.conditions is not None:
@@ -2619,7 +2825,7 @@ def main():
               f"trim={args.silence_trim_db}dB, gate={args.silence_thresh_db}dB, "
               f"stereo_split={not args.no_stereo_split}) tmp={tmp_dir}")
 
-    dataset = StreamingChunkDataset(
+    dataset_kw = dict(
         files=files, chunker=chunker, registry=registry,
         latent_root=latent_root, wav_root=wav_root, cond_root=cond_root,
         sr=args.sr, wav_sources=wav_sources, force=args.force,
@@ -2630,20 +2836,8 @@ def main():
         companions=companions, codec_name=codec.name,
         cpu_batch_size=args.cpu_batch_size,
     )
-    loader_kw = dict(
-        dataset=dataset,
-        batch_size=args.loader_batch_size,
-        num_workers=args.num_workers,
-        collate_fn=_identity_collate,
-        persistent_workers=False,
-    )
-    if args.num_workers > 0:
-        loader_kw.update(
-            prefetch_factor=args.prefetch_factor,
-            multiprocessing_context=args.worker_start_method,
-            worker_init_fn=_worker_init_fn,
-        )
-    loader = DataLoader(**loader_kw)
+    shards = [files[g::args.num_gpus] for g in range(args.num_gpus)]
+    dataset = StreamingChunkDataset(**dict(dataset_kw, files=shards[0]))
     print(f"[run] num_workers={args.num_workers}, "
           f"loader_batch_size={args.loader_batch_size}, "
           f"batch_size={args.batch_size}, "
@@ -2651,49 +2845,41 @@ def main():
           f"prefetch_factor={args.prefetch_factor if args.num_workers else 0}, "
           f"start_method={args.worker_start_method if args.num_workers else 'none'}, "
           f"skip_encoder={args.skip_encoder}")
+    if args.num_gpus > 1:
+        print(f"[gpus] {args.num_gpus} GPUs ({', '.join(gpu_ids)}): one process "
+              f"per GPU, each with its own {args.num_workers} worker(s); "
+              f"{len(files)} source file(s) -> "
+              f"{' | '.join(str(len(s)) for s in shards)}")
 
-    try:
-        from tqdm import tqdm
-        file_bar = tqdm(total=len(files), desc="Files", unit="file")
-    except Exception:
-        file_bar = None
-
-    n_lat = 0
-    n_gcond = 0
-    pending = []
+    file_bar = None
     produced = {}
-    _encode_on = not (args.skip_encoder or encoder is None)
-    _gpu_work = _encode_on or bool(gpu_cond_names)
 
-    def _flush(items):
-        nonlocal n_lat, n_gcond
-        a, b = _process_gpu_batch(
-            encoder if _encode_on else None, items, args.sr, n_frames_fixed,
-            registry=registry, gpu_names=gpu_cond_names, force=args.force)
-        n_lat += a
-        n_gcond += b
+    def _file_done(it):
+        if file_bar is not None:
+            file_bar.update(1)
+        src = it.get("src")
+        if src is not None:
+            produced[src] = it["ident"]
 
+    others = _GpuProcesses(gpu_ids, _file_done) if any(shards[1:]) else None
     try:
-        for batch in loader:
-            for it in batch:
-                if "file_done" in it:
-                    if file_bar is not None:
-                        file_bar.update(1)
-                    src = it.get("src")
-                    if src is not None:
-                        produced[src] = it["ident"]
-                    continue
-                pending.append(it)
-            if not _gpu_work:
-                pending.clear()
-                continue
-            while len(pending) >= args.batch_size:
-                _flush(pending[:args.batch_size])
-                del pending[:args.batch_size]
-        if pending and _gpu_work:
-            _flush(pending)
-            pending.clear()
+        if others is not None:
+            others.start(args, dataset_kw, shards)
+        try:
+            from tqdm import tqdm
+            file_bar = tqdm(total=len(files), desc="Files", unit="file")
+        except Exception:
+            file_bar = None
+        n_lat, n_gcond = _stream_files(
+            args, dataset, encoder, registry, gpu_cond_names, n_frames_fixed,
+            _file_done, poll=others.poll if others is not None else None)
+        if others is not None:
+            n_more = others.wait()
+            n_lat += n_more[0]
+            n_gcond += n_more[1]
     finally:
+        if others is not None:
+            others.stop()
         if file_bar is not None:
             file_bar.close()
         if produced or prev_manifest:

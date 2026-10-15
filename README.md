@@ -25,7 +25,7 @@ it (there are still no split folders on disk).
 
 | File | Role |
 |------|------|
-| `preprocess_stream.py` | Streaming preprocessing: chunk → DAC/ENCODEC-encode on the fly → save latents (+ optional per-split WAV / conditions). **Decides the train/val/test split** (`splits.json`). Incremental, acoustic rules, parallel workers, batched DAC/ENCODEC. Driven by flags or `--config`. |
+| `preprocess_stream.py` | Streaming preprocessing: chunk → DAC/ENCODEC-encode on the fly → save latents (+ optional per-split WAV / conditions). **Decides the train/val/test split** (`splits.json`). Incremental, acoustic rules, parallel workers, batched DAC/ENCODEC, one process per GPU with `--num_gpus N`. Driven by flags or `--config`. |
 | `configs/preprocess_default.yaml` | Preprocessing config: every long flag as a key. Precedence: defaults < file < CLI. |
 | `conditions.py` | Condition registry + extractors (f0/chroma/rhythm/energy/chord/midi, CLAP-text, CLIP-image) and the `FrameConditionEncoder`. |
 | `crema_chord.py` + `crema_chord_weights.npz` | PyTorch port of crema's chord model, with its original weights: the backbone of the `chord` condition (see §1, *The `chord` condition*). |
@@ -158,10 +158,42 @@ OUT/
 
 Useful flags: `--codec` (see below), `--chunk_duration`, `--chunk_overlap`,
 `--global_conds text,image` (+ `--image_root`), `--label_source` (where the class
-comes from, see below), `--num_workers` (parallel CPU work; keep **0 on
-Windows**), `--batch_size` (GPU batch: encoder + f0/rhythm/text), `--cpu_batch_size`
-(batch of the CPU conditions in each worker), `--force`, and `--config` to keep all
-of it in a YAML instead. `--sr` follows the codec and is best left unset.
+comes from, see below), `--num_gpus` (one process per GPU, see below),
+`--num_workers` (parallel CPU work; keep **0 on Windows**), `--batch_size` (GPU
+batch: encoder + f0/rhythm/text), `--cpu_batch_size` (batch of the CPU conditions
+in each worker), `--force`, and `--config` to keep all of it in a YAML instead.
+`--sr` follows the codec and is best left unset.
+
+### Several GPUs — `--num_gpus N`
+
+```bash
+python_gpu_lock -n 2 -- python preprocess_stream.py <SRC> <OUT> --device cuda \
+    --conditions f0,energy,chroma --acoustic_rules --num_workers 4 --num_gpus 2
+```
+
+- **One GPU does not change.** `--num_gpus 1` (the default) runs in one process,
+  as before (checked on 15 Oct 2026: the old and the new code write the same
+  files byte for byte, f0 aside, which already differs by about 0.005 between
+  two runs of the old code).
+- **N GPUs:** one process per GPU, each with its own codec, its own GPU
+  conditions and its own `--num_workers` workers (so N × `--num_workers` workers
+  and about N times the RAM). The source files still to do are divided between
+  them (file i to GPU i mod N), and each file is done entirely by one GPU.
+- **Once, by the first process:** `splits.json` and `dataset_meta.json` before
+  the others start; after all of them have finished, `source_manifest.json`, the
+  per-class image bank, the text vocabulary and `text_labels`, the chunk counts.
+- **Same dataset as on one GPU:** same files, same split, meta, manifest and
+  wavs. The values move as when `--batch_size` changes, because a chunk shares
+  its GPU batch with other chunks: on the 15 Oct test (56 chunks) 10 latents
+  differed from the 1-GPU run, all 56 when only `--batch_size` went from 4 to 3.
+- **Locks (IRCAM):** `python_gpu_lock -n N` locks N GPUs and gives them to every
+  sub-process through `CUDA_VISIBLE_DEVICES` (LAB rules, "python_gpu_lock"); pass
+  the same N to `--num_gpus`. A `--num_gpus` larger than the GPUs visible stops
+  the run at once; more GPUs visible than used is printed.
+- **If one process stops** (an error, or its soft lock taken: LAB rules, "GPU
+  lock levels"), the others are stopped and the manifest is written; re-running
+  the same command goes on from there. Ctrl+C stops all of them the same way.
+- `--device` must be `cuda`: every process sees its own GPU as `cuda`.
 
 ### Which autoencoder makes the latents — `--codec`
 
@@ -1819,6 +1851,11 @@ pass `--allow_null_frame_conditions` / `--allow_null_global_conditions`.
   python launch_test_cond.py --ckpt <ckpt> [--config configs/test_cond_default.yaml] [overrides]
   ```
   Elsewhere run `python test_cond.py` directly.
+- Launch the preprocessing through the lab's lock wrapper (LAB rules,
+  "python_gpu_lock"); for N GPUs `-n N` and `--num_gpus N` (see §1):
+  ```bash
+  python_gpu_lock -n 1 -- python preprocess_stream.py <SRC> <OUT> [flags]
+  ```
 - Model caches (DAC / EnCodec / CREPE / beat_this / HuggingFace) are auto-redirected to the
   machine-local disk when `/data/anasynth_nonbp/baione` exists, to avoid the NFS HOME quota.
 - The default `paths.runs_dir` / `paths.cache_dir` are **relative** (`./runs`,
@@ -1829,8 +1866,9 @@ pass `--allow_null_frame_conditions` / `--allow_null_global_conditions`.
       paths.cache_dir=/data2/anasynth_nonbp/baione/cache
   ```
 - Several GPUs: `python launch_training_cond.py --num-gpus N ...` (see
-  "Several GPUs" in §3) and `python launch_test_cond.py --num-gpus N ...`
-  (§4). With `--num-gpus 1` nothing changes.
+  "Several GPUs" in §3), `python launch_test_cond.py --num-gpus N ...`
+  (§4) and `python_gpu_lock -n N -- python preprocess_stream.py ...
+  --num_gpus N` (§1). With 1 GPU nothing changes.
 
 ---
 

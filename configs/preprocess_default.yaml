@@ -57,6 +57,7 @@ label_csv:    null             # for label_source: csv
 device:      "cuda"
 cond_device: null              # null = same as device
 skip_encoder: false            # true = everything but the codec encode
+num_gpus:          1           # N = one process per GPU (servers: python_gpu_lock -n N)
 num_workers:       4
 batch_size:        16
 cpu_batch_size:    8
