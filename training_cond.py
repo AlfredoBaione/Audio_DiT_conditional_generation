@@ -48,7 +48,8 @@ from audio_dataset_npy import frames_per_chunk
 
 import latent_codec as lc
 from network_cond import (ConditionedAudioDiT, check_ckpt_reinject_gate,
-                          ckpt_attention, ckpt_qk_norm, ATTENTION_KINDS)
+                          ckpt_attention, ckpt_qk_norm, ckpt_inpainting,
+                          ATTENTION_KINDS)
 from audio_dataset_cond import (
     build_conditioned_datasets, collate_conditioned, load_caption_table,
 )
@@ -373,12 +374,14 @@ def load_config():
                   "(older checkpoint without full config; other params come "
                   "from the YAML/CLI).")
         cfg.model.qk_norm = ckpt_qk_norm(_meta)
+        cfg.training.inpainting = ckpt_inpainting(_meta)
         _ck_trn = (_meta.get("config") or {}).get("training") or {}
         _legacy = {k: v for k, v in LEGACY_TRAINING_KEYS.items()
                    if k not in _ck_trn}
         for _k, _v in _legacy.items():
             cfg.training[_k] = _v
-        print(f"[RESUME] model.qk_norm={cfg.model.qk_norm} (read off the weights)"
+        print(f"[RESUME] model.qk_norm={cfg.model.qk_norm}, "
+              f"training.inpainting={cfg.training.inpainting} (read off the weights)"
               + (f" | absent from this checkpoint, set to what it was trained "
                  f"with: {_legacy}" if _legacy else ""))
         del _meta
@@ -435,6 +438,8 @@ def load_config():
             f"{list(T_SAMPLERS)}. Nothing was run.")
     t_schedule_of(cfg.get("sampling", None))
     del _att, _tsm
+    if bool(cfg.training.get("inpainting", False)):
+        inpaint_mask_probs(cfg.training)
 
     _trn = cfg.training
     _sch = _trn.get("lr_schedule", "cosine")
@@ -595,6 +600,25 @@ def sample_logit_normal(batch_size, device, t_min, t_max, mean=0.0, std=1.0):
 T_SAMPLERS = ("logit_normal", "truncated_logit")
 T_SAMPLER_RENAMED = {"sa3": "truncated_logit"}
 
+INPAINT_MASKS_DEFAULT = (0.8, 0.1, 0.1)
+
+
+def inpaint_mask_probs(train_cfg):
+    v = train_cfg.get("inpaint_masks", None) if train_cfg is not None else None
+    if v is None:
+        return INPAINT_MASKS_DEFAULT
+    try:
+        p = tuple(float(x) for x in v)
+    except (TypeError, ValueError):
+        p = ()
+    if len(p) != 3 or min(p) < 0.0 or not math.isclose(sum(p), 1.0, abs_tol=1e-6):
+        raise SystemExit(
+            f"[config] training.inpaint_masks = {v!r}, must be three "
+            f"probabilities [full mask, random spans, continuation] that sum "
+            f"to 1, e.g. [0.8, 0.1, 0.1]. Nothing was run.")
+    return p
+
+
 T_TRUNC = 0.075
 SHIFT_MU_MIN, SHIFT_MU_MAX = 0.5, 1.15
 SHIFT_LEN_MIN, SHIFT_LEN_MAX = 256, 4096
@@ -693,11 +717,45 @@ def apply_cfg_dropout(frame_cond, global_cond, device, global_configs, B,
 
 VALIDATION_PROTOCOL = "fixed_subset_common_noise_sample_weighted_v2"
 
+INPAINT_WINDOWS = ("1_start", "2_middle", "3_end")
+INPAINT_MAX_SPANS = 10
+
+
+def inpaint_thirds(n_frames):
+    b = [int(round(k * n_frames / 3)) for k in range(4)]
+    return [(b[k], b[k + 1]) for k in range(3)]
+
+
+def inpaint_keep_window(B, n_frames, lo, hi):
+    keep = torch.ones(B, n_frames)
+    keep[:, lo:hi] = 0.0
+    return keep
+
+
+def random_inpaint_keep(B, n_frames, probs):
+    keep = torch.ones(B, n_frames)
+    p_full, p_spans, _ = probs
+    for i in range(B):
+        u = float(torch.rand(()))
+        if u < p_full:
+            keep[i] = 0.0
+        elif u < p_full + p_spans:
+            n = int(torch.randint(1, INPAINT_MAX_SPANS + 1, ()))
+            max_len = max(1, n_frames // n)
+            for _ in range(n):
+                ln = int(torch.randint(1, max_len + 1, ()))
+                s = int(torch.randint(0, n_frames - ln + 1, ()))
+                keep[i, s:s + ln] = 0.0
+        else:
+            keep[i, int(torch.randint(0, n_frames + 1, ())):] = 0.0
+    return keep
+
 
 def compute_loss(model, batch, device, use_amp, t_min, t_max,
                  global_configs, p_drop_all, p_drop_frame, p_drop_global,
                  training=True, x0=None, t=None, p_drop_each_frame=0.0,
-                 t_sampler="logit_normal"):
+                 t_sampler="logit_normal", inpaint_probs=None,
+                 inpaint_keep=None, parts=None):
     frames, frame_cond, _labels, text_embs, image_embs, text_ctx = batch
 
     x1 = frames.to(device).float()
@@ -746,11 +804,31 @@ def compute_loss(model, batch, device, use_amp, t_min, t_max,
             text_ctx_mask=ctx_mask,
         )
 
+    keep = inpaint_keep
+    if keep is None and inpaint_probs is not None:
+        keep = random_inpaint_keep(B, x1.shape[1], inpaint_probs)
+    if keep is None:
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            pred = model(xt, t, frame_conditions=fc, global_conditions=gc,
+                         text_context=ctx, text_context_mask=ctx_mask)
+            loss = F.mse_loss(pred, target)
+        return loss
+
+    m = keep.to(device=device, dtype=x1.dtype).unsqueeze(-1)
     with torch.amp.autocast('cuda', enabled=use_amp):
         pred = model(xt, t, frame_conditions=fc, global_conditions=gc,
-                     text_context=ctx, text_context_mask=ctx_mask)
-        loss = F.mse_loss(pred, target)
-    return loss
+                     text_context=ctx, text_context_mask=ctx_mask,
+                     inpaint_context=torch.cat([m, x1 * m], dim=-1))
+    err = (pred.float() - target.float()).pow(2)
+    n_ch = err.shape[-1]
+    loss_gen = ((err * (1 - m)).sum(dim=(1, 2))
+                / ((1 - m).sum(dim=(1, 2)) * n_ch + 1e-8)).mean()
+    loss_ctx = ((err * m).sum(dim=(1, 2))
+                / (m.sum(dim=(1, 2)) * n_ch + 1e-8)).mean()
+    if parts is not None:
+        parts["generated"] = loss_gen.detach()
+        parts["context"] = loss_ctx.detach()
+    return loss_gen + loss_ctx
 
 
 def t_schedule_of(sampling_cfg) -> str:
@@ -764,11 +842,17 @@ def t_schedule_of(sampling_cfg) -> str:
     return v
 
 
+def inpaint_context_of(keep, latent, device):
+    m = keep.to(device=device, dtype=torch.float32).unsqueeze(-1)
+    lat = latent.to(device=device, dtype=torch.float32)
+    return m, lat, torch.cat([m, lat * m], dim=-1)
+
+
 @torch.no_grad()
 def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
                       frame_cond, global_cond, guidance,
                       frame_dims, global_configs, gen_rng=None,
-                      text_ctx=None, t_schedule="uniform"):
+                      text_ctx=None, t_schedule="uniform", inpaint=None):
     model.eval()
     x = torch.randn(1, n_frames, lc.active().latent_dim, device=device, generator=gen_rng)
 
@@ -780,6 +864,11 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
         ctx = text_ctx["tokens"].to(device)
         ctx_mask = text_ctx["mask"].to(device)
 
+    ip_m = ip_lat = ip_ctx = None
+    if inpaint is not None:
+        ip_m, ip_lat, ip_ctx = inpaint_context_of(
+            inpaint[0].view(1, n_frames), inpaint[1].view(1, n_frames, -1), device)
+
     has_cond = bool(frame_cond) or bool(global_cond) or (ctx is not None)
     use_cfg = (guidance > 1.0) and has_cond
 
@@ -790,17 +879,21 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
                 fc = frame_cond if frame_cond else null_fc
                 gc = global_cond if global_cond else null_gc
                 v_c = model(x, t, frame_conditions=fc,      global_conditions=gc,
-                            text_context=ctx, text_context_mask=ctx_mask)
+                            text_context=ctx, text_context_mask=ctx_mask,
+                            inpaint_context=ip_ctx)
                 v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc,
-                            text_context=None)
+                            text_context=None, inpaint_context=ip_ctx)
                 v = v_u + guidance * (v_c - v_u)
             else:
                 v = model(x, t,
                           frame_conditions=frame_cond or null_fc,
                           global_conditions=global_cond or null_gc,
-                          text_context=ctx, text_context_mask=ctx_mask)
+                          text_context=ctx, text_context_mask=ctx_mask,
+                          inpaint_context=ip_ctx)
         x = x + v.float() * dt
 
+    if ip_m is not None:
+        x = ip_m * ip_lat + (1 - ip_m) * x
     return x[0].cpu()
 
 
@@ -808,7 +901,8 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
 def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_amp,
                             frame_cond, global_cond, guidance,
                             frame_dims, global_configs, gen_rng=None,
-                            text_ctx=None, x0=None, t_schedule="uniform"):
+                            text_ctx=None, x0=None, t_schedule="uniform",
+                            inpaint=None):
     model.eval()
     null_fc_1 = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
     null_gc_1 = make_null_global_conditions(1, global_configs or {}, device)
@@ -855,6 +949,14 @@ def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_am
         ctx_mask_batch = torch.cat(
             [msk, torch.zeros_like(msk), torch.zeros_like(msk)], dim=0)
 
+    ip_m = ip_lat = ip_batch = None
+    if inpaint is not None:
+        ip_m, ip_lat, _ip = inpaint_context_of(inpaint[0], inpaint[1], device)
+        if tuple(_ip.shape[:2]) != (B, n_frames):
+            raise ValueError(f"inpaint has shape {tuple(_ip.shape[:2])}, expected "
+                             f"{(B, n_frames)}")
+        ip_batch = torch.cat([_ip, _ip, _ip], dim=0)
+
     for tv, dt in euler_grid(steps, t_min, t_max, t_schedule):
         t = torch.ones(3 * B, device=device) * tv
         xb = torch.cat([x_cond, x_cond, x_unc], dim=0)
@@ -862,7 +964,8 @@ def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_am
             vb = model(xb, t, frame_conditions=frame_batch,
                        global_conditions=global_batch,
                        text_context=ctx_batch,
-                       text_context_mask=ctx_mask_batch)
+                       text_context_mask=ctx_mask_batch,
+                       inpaint_context=ip_batch)
         v_c    = vb[0:B].float()
         v_null = vb[B:2 * B].float()
         v_u    = vb[2 * B:3 * B].float()
@@ -870,6 +973,9 @@ def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_am
         x_cond = x_cond + v_guided * dt
         x_unc = x_unc + v_u * dt
 
+    if ip_m is not None:
+        x_cond = ip_m * ip_lat + (1 - ip_m) * x_cond
+        x_unc = ip_m * ip_lat + (1 - ip_m) * x_unc
     return ([x_cond[b].cpu() for b in range(B)],
             [x_unc[b].cpu() for b in range(B)])
 
@@ -885,11 +991,11 @@ def norm_wav(x):
 
 
 def uncond_card_tag(k):
-    return f"{UNCOND_AUDIO_GROUP}/uncond_{int(k):02d}"
+    return f"{UNCOND_AUDIO_GROUP}/{int(k):02d}"
 
 
 def audio_panel_tags(family, idx, active_conditions=(), suffix="",
-                     conditioned=None):
+                     conditioned=None, generation=True, context=False):
     active = sorted(active_conditions)
     lead = "f0" if "f0" in active else (active[0] if active else None)
     if conditioned is None:
@@ -901,17 +1007,22 @@ def audio_panel_tags(family, idx, active_conditions=(), suffix="",
     first = 2 if panel_real else 1
 
     ordered = ([lead] + [n for n in active if n != lead]) if lead else []
-    conditions = {c: f"{block}/{j + first}_{c}_{tail}"
+    conditions = {c: f"{block}/{j + first}_{c}"
                   for j, c in enumerate(ordered)}
-    gen_slot = len(ordered) + first
+    ctx_slot = len(ordered) + first
+    gen_slot = ctx_slot + 1 if context else ctx_slot
+    ip_slot = gen_slot + 1 if generation else gen_slot
 
-    real = (f"{block}/1_real_{tail}" if panel_real
+    real = (f"{block}/1_real" if panel_real
             else f"{REAL_AUDIO_GROUP}/real_{tail}")
 
     return {
         "conditions": conditions,
-        "generation": f"{block}/{gen_slot}_generation_{tail}",
+        "context": f"{block}/{ctx_slot}_inpaint_context",
+        "generation": f"{block}/{gen_slot}_generation",
         "real": real,
+        "inpaint": {w: f"{block}/{ip_slot}_inpaint_{w}"
+                    for w in INPAINT_WINDOWS},
     }
 
 
@@ -919,7 +1030,7 @@ def subset_generation_tag(family, idx, label, suffix="", n_conditions=0,
                           has_real=False):
     return (f"{family}_{idx:02d}{suffix}"
             f"/{int(n_conditions) + (2 if has_real else 1)}"
-            f"_gen_{label}_{family}_{idx:02d}")
+            f"_gen_{label}")
 
 
 FIXED_CARDS_FILE = ".fixed_cards_logged"
@@ -1078,6 +1189,20 @@ def test_panel_indices(n_test, n_panels):
     return torch.linspace(0, int(n_test) - 1, n).long().tolist()
 
 
+def real_test_indices(n_test, n_samples):
+    total = max(0, int(n_test or 0))
+    n = max(0, min(int(n_samples or 0), total))
+    return torch.linspace(0, total - 1, n).long().tolist() if n else []
+
+
+def inpaint_panel_info(n_frames, context):
+    fps = lc.active().frames_per_s
+    return {"context": context,
+            "regenerated_s": {w: [round(lo / fps, 3), round(hi / fps, 3)]
+                              for w, (lo, hi) in zip(INPAINT_WINDOWS,
+                                                     inpaint_thirds(n_frames))}}
+
+
 @torch.no_grad()
 def generate_and_log_uncond_cards(
     model, normalizer, n_frames, step, writer, device, output_dir, n_cards,
@@ -1109,7 +1234,7 @@ def generate_and_log_uncond_cards(
             gen_rng=gen_rng,
         )
         if not torch.isfinite(gen).all():
-            print(f"    [uncond] uncond_{k:02d}: non-finite generation, "
+            print(f"    [uncond] {uncond_card_tag(k)}: non-finite generation, "
                   f"not logged")
             continue
         wav = decode_frames_to_wav(gen, normalizer, dac_model)
@@ -1123,10 +1248,12 @@ def generate_and_log_uncond_cards(
 @torch.no_grad()
 def log_real_audio_samples(test_dataset, normalizer, writer,
                            n_samples, sampling_cfg=None, frame_dims=None,
-                           global_configs=None, output_dir=None, dist_info=None):
+                           global_configs=None, output_dir=None, dist_info=None,
+                           inpainting=False):
     mine = dist_mine(dist_info)
     dac_model = get_dac()
     conditioned = bool(frame_dims or global_configs)
+    panel = conditioned or bool(inpainting)
     if conditioned:
         ds, family = test_dataset, "test"
         indices = test_panel_indices(len(ds) if ds is not None else 0,
@@ -1134,10 +1261,8 @@ def log_real_audio_samples(test_dataset, normalizer, writer,
         sfx = panel_suffixes(ds, indices, global_configs)
     else:
         ds, family = test_dataset, "test"
-        total = len(ds) if ds is not None else 0
-        n = max(0, min(int(n_samples or 0), total))
-        indices = (torch.linspace(0, total - 1, n).long().tolist()
-                   if n else [])
+        indices = real_test_indices(len(ds) if ds is not None else 0,
+                                    n_samples)
         sfx = {}
 
     written = 0
@@ -1145,11 +1270,11 @@ def log_real_audio_samples(test_dataset, normalizer, writer,
         if mine is not None and not mine(k):
             continue
         tag = audio_panel_tags(family, k, suffix=sfx.get(k, ""),
-                               conditioned=conditioned)["real"]
+                               conditioned=panel)["real"]
         pending = fixed_card_pending(writer, tag)
         disk = (os.path.join(output_dir, "ground_truth",
                              f"real_test_{k:02d}.wav")
-                if output_dir is not None and not conditioned else None)
+                if output_dir is not None and not panel else None)
         if not pending and disk is None:
             continue
         frames = ds[idx][0]
@@ -1171,13 +1296,51 @@ def log_real_audio_samples(test_dataset, normalizer, writer,
              else f" ({len(indices) - written} already on this board)"))
 
 
+PROBE_CONTEXT_PEAK = 0.25
+_PROBE_CONTEXT_CACHE = {}
+
+
+@torch.no_grad()
+def probe_inpaint_context(probe_sets, names, i, n_frames, normalizer, dac_model):
+    from probe_conditions import _normalize
+    spec = lc.active()
+    key = (tuple((c, probe_sets[c].dir, probe_sets[c].names[i]) for c in names),
+           int(n_frames), spec.name)
+    if key in _PROBE_CONTEXT_CACHE:
+        return _PROBE_CONTEXT_CACHE[key]
+    n = int(n_frames) * spec.hop_length
+    mix = np.zeros(n, dtype=np.float64)
+    for c in names:
+        y = np.asarray(probe_sets[c].wav(i), dtype=np.float64).reshape(-1)
+        if int(probe_sets[c].sr) != spec.sample_rate:
+            import librosa
+            y = librosa.resample(y, orig_sr=int(probe_sets[c].sr),
+                                 target_sr=spec.sample_rate)
+        y = np.pad(y[:n], (0, max(0, n - len(y))))
+        rms = float(np.sqrt(np.mean(y ** 2)))
+        if rms > 0:
+            mix += y / rms
+    wav = _normalize(mix, PROBE_CONTEXT_PEAK)
+    dev = next(dac_model.parameters()).device
+    z = lc.encode(dac_model, torch.from_numpy(wav).view(1, 1, -1).to(dev),
+                  spec.sample_rate)
+    frames = normalizer.normalize(z[0].float().cpu()).T.contiguous()
+    if frames.shape[0] != int(n_frames):
+        raise RuntimeError(f"probe {i:02d} context: the codec gave "
+                           f"{frames.shape[0]} frames for {n} samples, expected "
+                           f"{int(n_frames)}")
+    _PROBE_CONTEXT_CACHE[key] = (frames, wav)
+    return frames, wav
+
+
 @torch.no_grad()
 def run_joint_probe(probe_sets, model, normalizer, n_frames,
                     step, writer, device,
                     output_dir, use_amp, sampling_cfg, guidance,
                     frame_dims, global_configs, fidelity_evaluator,
                     dac_model, prefix, n_plot,
-                    metrics_seed=None, mine=None):
+                    metrics_seed=None, mine=None, inpainting=False,
+                    inpaint_only=False):
     from probe_conditions import plot_condition_comparison
 
     names = [c for c in (frame_dims or {}) if c in (probe_sets or {})]
@@ -1235,55 +1398,70 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         return {"tokens": torch.cat([c["tokens"] for c in items], dim=0),
                 "mask":   torch.cat([c["mask"]   for c in items], dim=0)}
 
-    gen_rng = None
-    if metrics_seed is not None:
-        gen_rng = torch.Generator(device=device)
-        gen_rng.manual_seed(int(metrics_seed))
-
     own = [i for i in range(n_plot) if mine is None or mine(i)]
     own_set = set(own)
     spf = max(1, int(sampling_cfg.get("metrics_samples_per_forward", 1) or 1))
-    cond_lat = {}
-    if guidance > 1.0:
-        x0_all = [torch.randn(n_frames, lc.active().latent_dim, device=device,
-                              generator=gen_rng)
-                  for _ in range(n_plot)]
-        for s in range(0, len(own), spf):
-            grp = own[s:s + spf]
-            x0 = torch.stack([x0_all[i] for i in grp])
-            cond_lat.update(zip(grp, run_in_fitting_groups(
-                "generation", len(grp), len(grp),
-                lambda lo, hi: euler_sample_cfg_paired(
+
+    def _generate(contexts=None, window=None):
+        gen_rng = None
+        if metrics_seed is not None:
+            gen_rng = torch.Generator(device=device)
+            gen_rng.manual_seed(int(metrics_seed))
+
+        def _ip(idxs):
+            if window is None:
+                return None
+            return (inpaint_keep_window(len(idxs), n_frames, *window),
+                    torch.stack([contexts[i] for i in idxs]))
+
+        out = {}
+        if guidance > 1.0:
+            x0_all = [torch.randn(n_frames, lc.active().latent_dim, device=device,
+                                  generator=gen_rng)
+                      for _ in range(n_plot)]
+            for s in range(0, len(own), spf):
+                grp = own[s:s + spf]
+                x0 = torch.stack([x0_all[i] for i in grp])
+                ip = _ip(grp)
+                out.update(zip(grp, run_in_fitting_groups(
+                    "generation", len(grp), len(grp),
+                    lambda lo, hi: euler_sample_cfg_paired(
+                        model, n_frames, device,
+                        steps=sampling_cfg.euler_steps,
+                        t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
+                        t_schedule=t_schedule_of(sampling_cfg),
+                        use_amp=use_amp,
+                        frame_cond=_frame_cond(grp[lo:hi]),
+                        global_cond=_global_cond(grp[lo:hi]),
+                        guidance=guidance,
+                        frame_dims=frame_dims, global_configs=global_configs,
+                        gen_rng=gen_rng, text_ctx=_text_ctx(grp[lo:hi]),
+                        x0=x0[lo:hi],
+                        inpaint=(None if ip is None
+                                 else (ip[0][lo:hi], ip[1][lo:hi])),
+                    )[0])))
+        else:
+            for i in range(n_plot):
+                if i not in own_set:
+                    if gen_rng is not None:
+                        torch.randn(1, n_frames, lc.active().latent_dim,
+                                    device=device, generator=gen_rng)
+                    continue
+                out[i] = euler_sample_cfg(
                     model, n_frames, device,
                     steps=sampling_cfg.euler_steps,
                     t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
                     t_schedule=t_schedule_of(sampling_cfg),
                     use_amp=use_amp,
-                    frame_cond=_frame_cond(grp[lo:hi]),
-                    global_cond=_global_cond(grp[lo:hi]),
+                    frame_cond=_frame_cond([i]), global_cond=_global_cond([i]),
                     guidance=guidance,
                     frame_dims=frame_dims, global_configs=global_configs,
-                    gen_rng=gen_rng, text_ctx=_text_ctx(grp[lo:hi]),
-                    x0=x0[lo:hi],
-                )[0])))
-    else:
-        for i in range(n_plot):
-            if i not in own_set:
-                if gen_rng is not None:
-                    torch.randn(1, n_frames, lc.active().latent_dim,
-                                device=device, generator=gen_rng)
-                continue
-            cond_lat[i] = euler_sample_cfg(
-                model, n_frames, device,
-                steps=sampling_cfg.euler_steps,
-                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                t_schedule=t_schedule_of(sampling_cfg),
-                use_amp=use_amp,
-                frame_cond=_frame_cond([i]), global_cond=_global_cond([i]),
-                guidance=guidance,
-                frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng, text_ctx=_text_ctx([i]),
-            )
+                    gen_rng=gen_rng, text_ctx=_text_ctx([i]),
+                    inpaint=_ip([i]),
+                )
+        return out
+
+    cond_lat = {} if inpaint_only else _generate()
 
     fidelity_evaluator.reset()
     fidelity_evaluator.keep_contours_for(own)
@@ -1295,9 +1473,20 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                 wav.numpy(), lc.active().sample_rate, n_frames,
                 {c: targets[c][i] for c in names}, sample_id=i)
         wavs[i] = wav
-    ps_cond = fidelity_evaluator.per_sample() if names else {}
+    ps_cond = (fidelity_evaluator.per_sample()
+               if names and not inpaint_only else {})
     cont_cond = ({c: fidelity_evaluator.contours(c) for c in names}
-                 if names else {})
+                 if names and not inpaint_only else {})
+
+    ip_wavs, ctx_wavs = {}, {}
+    if inpainting and names:
+        contexts = {}
+        for i in own:
+            contexts[i], ctx_wavs[i] = probe_inpaint_context(
+                probe_sets, names, i, n_frames, normalizer, dac_model)
+        for w, window in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
+            ip_wavs[w] = {i: decode_frames_to_wav(z, normalizer, dac_model)
+                          for i, z in _generate(contexts, window).items()}
 
     for i in own:
         _suffix = (f" [{probe_sets['text'].text(i)[:48]}]"
@@ -1332,7 +1521,9 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                       f"{type(_e).__name__}: {_e}")
 
         tags = audio_panel_tags("probe", i, names, suffix=_suffix,
-                                conditioned=bool(names or gnames))
+                                conditioned=bool(names or gnames),
+                                generation=not inpaint_only,
+                                context=bool(ip_wavs))
 
         for c in names:
             if not fixed_card_pending(writer, tags["conditions"][c]):
@@ -1340,8 +1531,15 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
             writer.add_audio(tags["conditions"][c],
                              norm_wav(probe_sets[c].wav(i)),
                              global_step=0, sample_rate=probe_sets[c].sr)
-        writer.add_audio(tags["generation"], norm_wav(wavs[i]),
-                         global_step=step, sample_rate=lc.active().sample_rate)
+        if ip_wavs and fixed_card_pending(writer, tags["context"]):
+            writer.add_audio(tags["context"], norm_wav(ctx_wavs[i]),
+                             global_step=0, sample_rate=lc.active().sample_rate)
+        if not inpaint_only:
+            writer.add_audio(tags["generation"], norm_wav(wavs[i]),
+                             global_step=step, sample_rate=lc.active().sample_rate)
+        for w, _w in ip_wavs.items():
+            writer.add_audio(tags["inpaint"][w], norm_wav(_w[i]),
+                             global_step=step, sample_rate=lc.active().sample_rate)
 
         arrays = {c: targets[c][i] for c in names}
         arrays.update({c: gtargets[c][i] for c in gnames})
@@ -1359,6 +1557,11 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                 "frame_conditions": names, "global_conditions": gnames,
                 "null_conditions": missing, "guidance": guidance,
                 "noise": {"metrics_seed": metrics_seed, "draw": i}}
+        if ip_wavs:
+            info["inpainting"] = inpaint_panel_info(
+                n_frames, f"inpaint_context.wav: the sum of the sonifications "
+                          f"of {', '.join(names)}, each at the same RMS, then "
+                          f"peak {PROBE_CONTEXT_PEAK}")
         pdir = _panel_dir(output_dir, "probe", i)
         write_panel_conditions(
             pdir, info, arrays,
@@ -1366,8 +1569,16 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
             text_lines=text_lines,
             image_file=(probe_sets["image"].image_path(i) if "image" in gnames
                         else None))
-        sf.write(os.path.join(pdir, _generation_name(step, prefix)),
-                 wavs[i].numpy(), lc.active().sample_rate)
+        if not inpaint_only:
+            sf.write(os.path.join(pdir, _generation_name(step, prefix)),
+                     wavs[i].numpy(), lc.active().sample_rate)
+        if ip_wavs:
+            sf.write(os.path.join(pdir, "inpaint_context.wav"), ctx_wavs[i],
+                     lc.active().sample_rate)
+        for w, _w in ip_wavs.items():
+            sf.write(os.path.join(pdir, _generation_name(step, prefix,
+                                                         f"inpaint_{w}")),
+                     _w[i].numpy(), lc.active().sample_rate)
 
 
 def load_text_label_vocab(latent_root):
@@ -1551,7 +1762,8 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     step, writer, device, output_dir, use_amp, sampling_cfg,
                     guidance, frame_dims, global_configs, fidelity_evaluator,
                     dac_model, prefix, metrics_seed=None, text_vec_for=None,
-                    subset_specs=(), image_root=None, mine=None):
+                    subset_specs=(), image_root=None, mine=None,
+                    inpainting=False, inpaint_only=False):
     from probe_conditions import plot_condition_comparison
     from condition_metrics import sonify_condition
 
@@ -1593,7 +1805,13 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
 
     spf = int(sampling_cfg.get("metrics_samples_per_forward", 1))
 
-    def _generate(subset=None):
+    def _ip(grp, window):
+        if window is None:
+            return None
+        return (inpaint_keep_window(len(grp), n_frames, *window),
+                torch.stack([items[j][0] for j in grp]))
+
+    def _generate(subset=None, window=None):
         gen_rng = None
         if metrics_seed is not None:
             gen_rng = torch.Generator(device=device)
@@ -1606,6 +1824,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
             for s in range(0, len(own), spf):
                 grp = own[s:s + spf]
                 x0 = torch.stack([x0_all[j] for j in grp])
+                ip = _ip(grp, window)
                 out.update(zip(grp, run_in_fitting_groups(
                     "generation", len(grp), len(grp),
                     lambda lo, hi: euler_sample_cfg_paired(
@@ -1620,6 +1839,8 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                         frame_dims=frame_dims, global_configs=global_configs,
                         gen_rng=gen_rng, text_ctx=_ctx(grp[lo:hi]),
                         x0=x0[lo:hi],
+                        inpaint=(None if ip is None
+                                 else (ip[0][lo:hi], ip[1][lo:hi])),
                     )[0])))
         else:
             for j in range(n):
@@ -1638,12 +1859,15 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     guidance=guidance,
                     frame_dims=frame_dims, global_configs=global_configs,
                     gen_rng=gen_rng, text_ctx=_ctx([j]),
+                    inpaint=_ip([j], window),
                 )
         return out
 
-    lat = _generate()
+    lat = {} if inpaint_only else _generate()
+    if inpaint_only:
+        subset_specs = ()
     use_ev = bool(names) and fidelity_evaluator is not None \
-        and fidelity_evaluator.active
+        and fidelity_evaluator.active and not inpaint_only
     if use_ev:
         fidelity_evaluator.reset()
         fidelity_evaluator.keep_contours_for(own)
@@ -1666,6 +1890,12 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
             continue
         ladder[_lab] = {j: decode_frames_to_wav(z, normalizer, dac_model)
                         for j, z in _generate(subset=set(_names)).items()}
+
+    ip_wavs = {}
+    if inpainting:
+        for w, window in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
+            ip_wavs[w] = {j: decode_frames_to_wav(z, normalizer, dac_model)
+                          for j, z in _generate(window=window).items()}
 
     img_failed, img_shown = None, 0
     for k in own:
@@ -1705,7 +1935,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     img_failed = f"{ref[0]}/{ref[1]}: {type(e).__name__}: {e}"
 
         tags = audio_panel_tags("test", k, names, suffix=sfx.get(k, ""),
-                                conditioned=True)
+                                conditioned=True, generation=not inpaint_only)
         sons = {}
         for cname, carr in sorted(items[k][1].items()):
             if cname not in tags["conditions"]:
@@ -1721,13 +1951,17 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
         if fixed_card_pending(writer, tags["real"]):
             writer.add_audio(tags["real"], norm_wav(real),
                              global_step=0, sample_rate=lc.active().sample_rate)
-        writer.add_audio(tags["generation"], norm_wav(wavs[k]),
-                         global_step=step, sample_rate=lc.active().sample_rate)
+        if not inpaint_only:
+            writer.add_audio(tags["generation"], norm_wav(wavs[k]),
+                             global_step=step, sample_rate=lc.active().sample_rate)
         for _lab, _w in ladder.items():
             writer.add_audio(
                 subset_generation_tag("test", k, _lab, suffix=sfx.get(k, ""),
                                       n_conditions=len(names), has_real=True),
                 norm_wav(_w[k]), global_step=step, sample_rate=lc.active().sample_rate)
+        for w, _w in ip_wavs.items():
+            writer.add_audio(tags["inpaint"][w], norm_wav(_w[k]),
+                             global_step=step, sample_rate=lc.active().sample_rate)
 
         idx = int(ds_indices[k])
         npy_path, _cp, start, _lab_i, class_name = test_dataset.samples[idx]
@@ -1758,17 +1992,93 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
             "noise": {"metrics_seed": metrics_seed, "draw": k},
             "subsets": {lab: list(nm) for lab, nm in (subset_specs or ())
                         if lab in ladder}})
+        if ip_wavs:
+            info["inpainting"] = inpaint_panel_info(
+                n_frames, "real.wav: the real audio of this chunk")
         pdir = _panel_dir(output_dir, "test", k)
         write_panel_conditions(pdir, info, arrays, sons, real_wav=real.numpy(),
                                text_lines=text_lines, image_file=img_file)
-        sf.write(os.path.join(pdir, _generation_name(step, prefix)),
-                 wavs[k].numpy(), lc.active().sample_rate)
+        if not inpaint_only:
+            sf.write(os.path.join(pdir, _generation_name(step, prefix)),
+                     wavs[k].numpy(), lc.active().sample_rate)
         for _lab, _w in ladder.items():
             sf.write(os.path.join(pdir, _generation_name(step, prefix, _lab)),
+                     _w[k].numpy(), lc.active().sample_rate)
+        for w, _w in ip_wavs.items():
+            sf.write(os.path.join(pdir, _generation_name(step, prefix,
+                                                         f"inpaint_{w}")),
                      _w[k].numpy(), lc.active().sample_rate)
     if img_failed is not None and img_shown == 0:
         print(f"    [test panels] image cards unavailable ({img_failed}); "
               f"is paths.image_root still pointing at the right folder?")
+
+
+@torch.no_grad()
+def run_uncond_inpaint_panels(test_dataset, ds_indices, model, normalizer,
+                              n_frames, step, writer, device, output_dir,
+                              use_amp, sampling_cfg, frame_dims, global_configs,
+                              dac_model, prefix, metrics_seed=None, mine=None):
+    n = len(ds_indices)
+    if n == 0:
+        return
+    own = [j for j in range(n) if mine is None or mine(j)]
+    own_set = set(own)
+    sr = lc.active().sample_rate
+    frames = {j: test_dataset[ds_indices[j]][0] for j in own}
+
+    ip_wavs = {}
+    for w, (lo, hi) in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
+        keep = inpaint_keep_window(1, n_frames, lo, hi)
+        gen_rng = None
+        if metrics_seed is not None:
+            gen_rng = torch.Generator(device=device)
+            gen_rng.manual_seed(int(metrics_seed))
+        ip_wavs[w] = {}
+        for j in range(n):
+            if j not in own_set:
+                if gen_rng is not None:
+                    torch.randn(1, n_frames, lc.active().latent_dim,
+                                device=device, generator=gen_rng)
+                continue
+            z = euler_sample_cfg(
+                model, n_frames, device,
+                steps=sampling_cfg.euler_steps,
+                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
+                t_schedule=t_schedule_of(sampling_cfg),
+                use_amp=use_amp,
+                frame_cond=None, global_cond=None, guidance=1.0,
+                frame_dims=frame_dims, global_configs=global_configs,
+                gen_rng=gen_rng, inpaint=(keep, frames[j]))
+            ip_wavs[w][j] = decode_frames_to_wav(z, normalizer, dac_model)
+
+    for k in own:
+        tags = audio_panel_tags("test", k, conditioned=True, generation=False)
+        real = decode_frames_to_wav(frames[k], normalizer, dac_model)
+        if fixed_card_pending(writer, tags["real"]):
+            writer.add_audio(tags["real"], norm_wav(real), global_step=0,
+                             sample_rate=sr)
+        for w, _w in ip_wavs.items():
+            writer.add_audio(tags["inpaint"][w], norm_wav(_w[k]),
+                             global_step=step, sample_rate=sr)
+        idx = int(ds_indices[k])
+        npy_path, _cp, start, _lab_i, class_name = test_dataset.samples[idx]
+        try:
+            latent = Path(npy_path).relative_to(
+                test_dataset.latent_root).as_posix()
+        except ValueError:
+            latent = Path(npy_path).name
+        info = {"panel": f"test_{k:02d}", "tensorboard_block": f"test_{k:02d}",
+                "split": "test", "dataset_index": idx, "latent": latent,
+                "start_frame": int(start), "class": class_name,
+                "inpainting": inpaint_panel_info(
+                    n_frames, "real.wav: the real audio of this chunk"),
+                "noise": {"metrics_seed": metrics_seed, "draw": k}}
+        pdir = _panel_dir(output_dir, "test", k)
+        write_panel_conditions(pdir, info, {}, {}, real_wav=real.numpy())
+        for w, _w in ip_wavs.items():
+            sf.write(os.path.join(pdir, _generation_name(step, prefix,
+                                                         f"inpaint_{w}")),
+                     _w[k].numpy(), sr)
 
 
 def caption_text_vec_fn(latent_root, sampling_cfg, global_configs):
@@ -1805,9 +2115,11 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                          sampling_cfg, conditioning_cfg, use_amp, frame_dims,
                          global_configs, fidelity_evaluator, test_dataset,
                          probe_sets, n_frames, prefix="EMA", metrics_seed=None,
-                         image_root=None, text_vec_for=None, dist_info=None):
+                         image_root=None, text_vec_for=None, dist_info=None,
+                         inpaint_only=False):
     guidance = float(conditioning_cfg.guidance_scale)
     any_cond_active = bool(frame_dims) or bool(global_configs)
+    inpainting = bool(getattr(model, "inpainting", False))
     di = dist_info if (dist_info is not None and dist_info.enabled) else None
     mine = dist_mine(di)
     mine_probe = mine
@@ -1838,9 +2150,29 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                     fidelity_evaluator=fidelity_evaluator, dac_model=dac_model,
                     prefix=prefix, metrics_seed=metrics_seed,
                     text_vec_for=text_vec_for, subset_specs=subset_specs,
-                    image_root=image_root, mine=mine)
+                    image_root=image_root, mine=mine, inpainting=inpainting,
+                    inpaint_only=inpaint_only)
             except Exception as _e:
                 print(f"    [test panels] SKIPPED at step {step}: "
+                      f"{type(_e).__name__}: {_e}")
+            if device == "cuda":
+                torch.cuda.empty_cache()
+    elif inpainting and test_dataset is not None:
+        _u_idx = real_test_indices(len(test_dataset),
+                                   sampling_cfg.get("n_audio_samples", 4))
+        if _u_idx:
+            print(f"    inpainting panels: {len(_u_idx)} samples of the test "
+                  f"split...")
+            try:
+                run_uncond_inpaint_panels(
+                    test_dataset, _u_idx, model=model, normalizer=normalizer,
+                    n_frames=n_frames, step=step, writer=writer, device=device,
+                    output_dir=output_dir, use_amp=use_amp,
+                    sampling_cfg=sampling_cfg, frame_dims=frame_dims,
+                    global_configs=global_configs, dac_model=dac_model,
+                    prefix=prefix, metrics_seed=metrics_seed, mine=mine)
+            except Exception as _e:
+                print(f"    [inpainting panels] SKIPPED at step {step}: "
                       f"{type(_e).__name__}: {_e}")
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -1850,6 +2182,11 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                    if c in probe_sets]
         _npanel = min(panel_count(sampling_cfg, "probe"),
                       min([len(probe_sets[c]) for c in _pnames], default=0))
+        if _npanel and inpaint_only and not any(c in probe_sets
+                                                for c in (frame_dims or {})):
+            print("    joint probe: skipped -- inpainting only, and these "
+                  "probes have no sonification to give as context")
+            _npanel = 0
         if _npanel:
             print(f"    joint probe: {_npanel} panels over {_pnames}...")
             try:
@@ -1864,6 +2201,7 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                     fidelity_evaluator=fidelity_evaluator, dac_model=dac_model,
                     prefix=prefix, n_plot=_npanel,
                     metrics_seed=metrics_seed, mine=mine_probe,
+                    inpainting=inpainting, inpaint_only=inpaint_only,
                 )
             except Exception as _e:
                 print(f"    [probe] SKIPPED at step {step}: "
@@ -1871,13 +2209,14 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
             if device == "cuda":
                 torch.cuda.empty_cache()
 
-    generate_and_log_uncond_cards(
-        model=model, normalizer=normalizer, n_frames=n_frames, step=step,
-        writer=writer, device=device, output_dir=output_dir,
-        n_cards=int(sampling_cfg.get("n_audio_samples", 4) or 0),
-        sampling_cfg=sampling_cfg, use_amp=use_amp,
-        frame_dims=frame_dims, global_configs=global_configs,
-        metrics_seed=metrics_seed, prefix=prefix, mine=mine)
+    if not inpaint_only:
+        generate_and_log_uncond_cards(
+            model=model, normalizer=normalizer, n_frames=n_frames, step=step,
+            writer=writer, device=device, output_dir=output_dir,
+            n_cards=int(sampling_cfg.get("n_audio_samples", 4) or 0),
+            sampling_cfg=sampling_cfg, use_amp=use_amp,
+            frame_dims=frame_dims, global_configs=global_configs,
+            metrics_seed=metrics_seed, prefix=prefix, mine=mine)
 
     dist_replay(writer, di)
     if device == "cuda":
@@ -1892,6 +2231,416 @@ MIR_CURVE_METRICS = {
     "midi":   ("note_f1", "drum_f1", "note_precision"),
 }
 
+INPAINT_LEGEND = (
+    "- **Inpainting blocks** — one per third of the clip: every validation "
+    "clip has that third regenerated, the rest is given as context and kept. "
+    "with-cond, null and Δ are measured on the frames of that third only; "
+    "null = the same context without conditions.\n")
+
+_INPAINT_REF_CACHE = {}
+
+
+def _inpaint_real_wav(val_dataset, idx, normalizer, dac_model, fad_reference,
+                      wav_root, n_frames):
+    if fad_reference == "wav" and wav_root:
+        npy_path, _cp, start, _lab, _cls = val_dataset.samples[idx]
+        p = (Path(wav_root) / Path(npy_path).relative_to(val_dataset.latent_root)
+             .with_suffix(".wav"))
+        data, sr = sf.read(str(p), dtype="float32", always_2d=True)
+        per_frame = lc.active().hop_length * sr / lc.active().sample_rate
+        a = int(round(int(start) * per_frame))
+        b = int(round((int(start) + n_frames) * per_frame))
+        return torch.from_numpy(data[a:b].mean(axis=1).copy()), sr, per_frame
+    return (decode_frames_to_wav(val_dataset[idx][0], normalizer, dac_model),
+            lc.active().sample_rate, float(lc.active().hop_length))
+
+
+def _fad_add(acc, e):
+    e = e.detach().to("cpu", torch.float64)
+    if acc["sx"] is None:
+        acc["sx"] = torch.zeros(e.shape[-1], dtype=torch.float64)
+        acc["sxx"] = torch.zeros(e.shape[-1], e.shape[-1], dtype=torch.float64)
+    acc["sx"] = acc["sx"] + e.sum(dim=0)
+    acc["sxx"] = acc["sxx"] + e.T @ e
+    acc["n"] = acc["n"] + e.shape[0]
+
+
+def _fad_reduce(acc, di):
+    got = [a for a in dist_all_gather_object(
+        None if acc["sx"] is None else (acc["sx"], acc["sxx"], acc["n"]), di)
+        if a is not None]
+    if not got:
+        return None
+    return {"sx": sum(a[0] for a in got), "sxx": sum(a[1] for a in got),
+            "n": sum(a[2] for a in got)}
+
+
+def _fad_stats(acc):
+    if acc is None or acc["n"] < 2:
+        return None
+    mu, sig, n = compute_mu_sigma(acc["sx"], acc["sxx"], acc["n"])
+    return {"mu": mu, "sigma": sig, "n_total": n}
+
+
+@torch.no_grad()
+def evaluate_inpainting(
+    model, normalizer, val_dataset, indices, step, writer, device,
+    sampling_cfg, guidance, use_amp, frame_dims, global_configs,
+    fidelity_evaluator=None, global_embedders=None, compute_uncond=True,
+    metrics_seed=None, metrics_enabled=COND_METRICS, fad_embedder=None,
+    n_fad=0, fad_device="cuda", fad_reference="decoded", wav_root=None,
+    text_vec_for=None, dist_info=None, subset_specs=(), mir_curves=False,
+    tag_prefix="Validation", split_name="validation", prefix="EMA",
+):
+    from condition_metrics import (pair_influence, pair_scalar,
+                                   format_influence_panel,
+                                   format_influence_matrix)
+    di = dist_info if (dist_info is not None and dist_info.enabled) else DistInfo()
+    is_main = di.is_main
+    n = len(indices)
+    n_frames = val_dataset.n_frames
+    D = lc.active().latent_dim
+    sr = lc.active().sample_rate
+    hop = lc.active().hop_length
+    fps = lc.active().frames_per_s
+    thirds = inpaint_thirds(n_frames)
+    any_cond = bool(frame_dims) or bool(global_configs)
+    frame_active = fidelity_evaluator is not None and fidelity_evaluator.active
+    gsim_names = sorted(c for c in (global_configs or {})
+                        if (global_embedders or {}).get(c) is not None)
+    scoring = any_cond and (frame_active or bool(gsim_names))
+    need_null = any_cond and (scoring or compute_uncond)
+    want_lat = "fd_dac" in metrics_enabled or "kl_dac" in metrics_enabled
+    fad_on = fad_embedder is not None and "fad_vggish" in metrics_enabled
+    own = [j for j in range(n) if j % di.world == di.rank]
+    n_fad_use = min(int(n_fad or 0), n) if fad_on else 0
+    fad_pos = (set(torch.linspace(0, n - 1, n_fad_use).round().long().tolist())
+               if n_fad_use > 0 else set())
+    spf = int(sampling_cfg.get("metrics_samples_per_forward", 1))
+    paired = spf >= 1 and guidance > 1.0 and any_cond
+    wants_ctx = bool(getattr(model, "text_cross_layers", None))
+    if text_vec_for is None:
+        text_vec_for = caption_text_vec_fn(val_dataset.latent_root, sampling_cfg,
+                                           global_configs)
+    dac_model = get_dac()
+    _mi = f"{tag_prefix}/Inpainting"
+    _fd = "dac" if lc.active().name == "dac_44khz" else "encodec"
+
+    if is_main:
+        print(f"\n  Inpainting metrics @ step {step}: {len(thirds)} thirds x {n} "
+              f"clips, the rest of each clip as context"
+              + (" (+ the same without conditions)" if need_null else ""))
+
+    items = {}
+    for j in own:
+        idx = indices[j]
+        frames_real, fcond, _lab, text_emb, image_emb, text_ctx = val_dataset[idx]
+        items[j] = (frames_real, fcond, text_vec_for(val_dataset, idx, text_emb),
+                    image_emb, text_ctx)
+
+    key = (str(val_dataset.latent_root), tuple(int(i) for i in indices), n_frames,
+           fad_reference, n_fad_use, di.world, di.rank, want_lat, fad_on)
+    ref = _INPAINT_REF_CACHE.get(key)
+    if ref is None:
+        ref = {"lat": [None] * len(thirds), "full": None,
+               "seg": [None] * len(thirds)}
+        if want_lat:
+            for w, (lo, hi) in enumerate(thirds):
+                ref["lat"][w] = dist_latent_stats(
+                    [items[j][0][lo:hi] for j in own], device, di)
+        if fad_on:
+            acc_full = {"sx": None, "sxx": None, "n": 0}
+            acc_seg = [{"sx": None, "sxx": None, "n": 0} for _ in thirds]
+            for j in sorted(p for p in fad_pos if p in items):
+                wav, wsr, per_frame = _inpaint_real_wav(
+                    val_dataset, indices[j], normalizer, dac_model,
+                    fad_reference, wav_root, n_frames)
+                _fad_add(acc_full, fad_embedder.embed(wav.view(1, 1, -1), wsr))
+                for w, (lo, hi) in enumerate(thirds):
+                    seg = wav[int(round(lo * per_frame)):int(round(hi * per_frame))]
+                    _fad_add(acc_seg[w], fad_embedder.embed(seg.reshape(1, 1, -1), wsr))
+            ref["full"] = _fad_stats(_fad_reduce(acc_full, di))
+            ref["seg"] = [_fad_stats(_fad_reduce(a, di)) for a in acc_seg]
+        _INPAINT_REF_CACHE[key] = ref
+
+    def _rng():
+        if metrics_seed is None:
+            return None
+        g = torch.Generator(device=device)
+        g.manual_seed(int(metrics_seed))
+        return g
+
+    def _fc(js, subset=None):
+        return {k: torch.stack([items[j][1][k] for j in js]).to(device).float()
+                for k in items[js[0]][1] if subset is None or k in subset}
+
+    def _gc(js):
+        gc = {}
+        if "text" in (global_configs or {}):
+            gc["text"] = torch.stack([items[j][2] for j in js]).to(device)
+        if "image" in (global_configs or {}):
+            gc["image"] = torch.stack([items[j][3] for j in js]).to(device)
+        return gc
+
+    def _tctx(js):
+        if not wants_ctx:
+            return None
+        return {"tokens": torch.stack([items[j][4]["tokens"] for j in js]),
+                "mask": torch.stack([items[j][4]["mask"] for j in js])}
+
+    def _generate(lo, hi, conditioned=True, subset=None):
+        keep_1 = inpaint_keep_window(1, n_frames, lo, hi)[0]
+        gen_rng = _rng()
+        out_c, out_u = {}, {}
+        if paired and conditioned and subset is None:
+            x0_of, drawn = {}, 0
+            for s in range(0, len(own), spf):
+                grp = own[s:s + spf]
+                while drawn <= grp[-1]:
+                    x = torch.randn(n_frames, D, device=device, generator=gen_rng)
+                    if drawn % di.world == di.rank:
+                        x0_of[drawn] = x
+                    drawn += 1
+                fc, gc, tctx = _fc(grp), _gc(grp), _tctx(grp)
+                x0 = torch.stack([x0_of.pop(j) for j in grp])
+                keep = keep_1.expand(len(grp), -1)
+                lat = torch.stack([items[j][0] for j in grp])
+
+                def _part(a, b):
+                    c, u = euler_sample_cfg_paired(
+                        model, n_frames, device,
+                        steps=sampling_cfg.euler_steps,
+                        t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
+                        t_schedule=t_schedule_of(sampling_cfg),
+                        use_amp=use_amp,
+                        frame_cond={k: v[a:b] for k, v in fc.items()},
+                        global_cond={k: v[a:b] for k, v in gc.items()},
+                        guidance=guidance,
+                        frame_dims=frame_dims, global_configs=global_configs,
+                        gen_rng=gen_rng,
+                        text_ctx=(None if tctx is None
+                                  else {k: v[a:b] for k, v in tctx.items()}),
+                        x0=x0[a:b], inpaint=(keep[a:b], lat[a:b]))
+                    return list(zip(c, u))
+
+                for j, (c, u) in zip(grp, run_in_fitting_groups(
+                        "generation", len(grp), len(grp), _part)):
+                    out_c[j], out_u[j] = c, u
+            return out_c, out_u
+        for j in range(n):
+            if j not in items:
+                if gen_rng is not None:
+                    torch.randn(1, n_frames, D, device=device, generator=gen_rng)
+                continue
+            cond = conditioned and any_cond
+            out_c[j] = euler_sample_cfg(
+                model, n_frames, device,
+                steps=sampling_cfg.euler_steps,
+                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
+                t_schedule=t_schedule_of(sampling_cfg),
+                use_amp=use_amp,
+                frame_cond=_fc([j], subset) if cond else None,
+                global_cond=_gc([j]) if cond else None,
+                guidance=guidance if cond else 1.0,
+                frame_dims=frame_dims, global_configs=global_configs,
+                gen_rng=gen_rng, text_ctx=_tctx([j]) if cond else None,
+                inpaint=(keep_1, items[j][0]))
+        return out_c, None
+
+    def _measure(lat_of, lo, hi, measure, fad, desc):
+        if measure and frame_active:
+            fidelity_evaluator.reset()
+            fidelity_evaluator.keep_contours_for(())
+        gsims = {c: {} for c in gsim_names} if measure else {}
+        f_full = {"sx": None, "sxx": None, "n": 0}
+        f_seg = {"sx": None, "sxx": None, "n": 0}
+        for j in tqdm(sorted(lat_of), desc=desc, leave=False, disable=not is_main):
+            need_fad = fad and j in fad_pos
+            if not (measure or need_fad):
+                continue
+            wav = decode_frames_to_wav(lat_of[j], normalizer, dac_model)
+            seg = wav[lo * hop:hi * hop]
+            if measure:
+                if frame_active:
+                    fidelity_evaluator.add_sample(
+                        wav.numpy(), sr, n_frames,
+                        {k: v.cpu().numpy() for k, v in items[j][1].items()},
+                        sample_id=j, frames=(lo, hi))
+                for c in gsim_names:
+                    t = items[j][2] if c == "text" else items[j][3]
+                    try:
+                        emb = global_embedders[c].embed(seg.numpy(), sr)
+                        gsims[c][j] = float(np.dot(emb, np.asarray(t.cpu()).reshape(-1)))
+                    except Exception as _e:
+                        if not gsims[c]:
+                            print(f"    [inpaint] {c} similarity unavailable: "
+                                  f"{type(_e).__name__}: {_e}")
+            if need_fad:
+                _fad_add(f_full, fad_embedder.embed(wav.view(1, 1, -1), sr))
+                _fad_add(f_seg, fad_embedder.embed(seg.reshape(1, 1, -1), sr))
+        per, cov = {}, {}
+        if measure and frame_active:
+            for _r, _s in enumerate(dist_all_gather_object(
+                    fidelity_evaluator.export_state(), di)):
+                if is_main and _r != di.rank:
+                    fidelity_evaluator.merge_state(_s)
+            per = {k: v for k, v in fidelity_evaluator.per_sample().items()
+                   if not k.endswith("/<no metric>")}
+            cov = {k: v for k, v in fidelity_evaluator.coverage().items()
+                   if not k.endswith("/<no metric>")}
+        if measure:
+            for _r, _g in enumerate(dist_all_gather_object(gsims, di)):
+                if is_main and _r != di.rank:
+                    for _c, _d in _g.items():
+                        gsims.setdefault(_c, {}).update(_d)
+        return (per, cov, gsims, _fad_stats(_fad_reduce(f_full, di)),
+                _fad_stats(_fad_reduce(f_seg, di)))
+
+    def _influence(per_c, cov_c, gs_c, per_n, gs_n, have_null):
+        inf, covp = ({}, {})
+        if frame_active:
+            inf, covp = pair_influence(per_c, per_n, coverage_cond=cov_c,
+                                       have_null=have_null)
+        for c in gsim_names:
+            if not gs_c.get(c):
+                continue
+            cm, nm, dm, npair = pair_scalar(gs_c[c], (gs_n or {}).get(c, {}),
+                                            have_null=have_null)
+            k = {"text": "clap_sim", "image": "clip_sim"}.get(c, "sim")
+            inf[c] = {k: {"cond": cm, "null": nm, "delta": dm}}
+            covp[f"{c}/{k}"] = {"valid": npair, "attempted": len(gs_c[c]),
+                                "unpaired": 0}
+        named = {f"{c}_{split_name}": v for c, v in inf.items()}
+        cov_named = {}
+        for k, v in covp.items():
+            c, _, m = k.partition("/")
+            cov_named[f"{c}_{split_name}/{m}"] = v
+        return named, cov_named
+
+    blocks, report = [], {}
+    for w, (lo, hi) in enumerate(thirds):
+        name = INPAINT_WINDOWS[w]
+        lat_c, lat_u = _generate(lo, hi, conditioned=True)
+        if need_null and lat_u is None:
+            lat_u = _generate(lo, hi, conditioned=False)[0]
+        per_c, cov_c, gs_c, fad_full_c, fad_seg_c = _measure(
+            lat_c, lo, hi, scoring, fad_on, f"inpaint {name}: decode + measure")
+        per_n, gs_n, fad_full_u, fad_seg_u = {}, {}, None, None
+        if lat_u is not None:
+            per_n, _cv, gs_n, fad_full_u, fad_seg_u = _measure(
+                lat_u, lo, hi, scoring, fad_on and compute_uncond,
+                f"inpaint {name}: decode + measure (no conditions)")
+        lat_m = dist_dac_metrics([lat_c[j][lo:hi] for j in sorted(lat_c)],
+                                 ref["lat"][w], metrics_enabled, device, di) \
+            if want_lat and ref["lat"][w] is not None else {}
+        lat_mu = (dist_dac_metrics([lat_u[j][lo:hi] for j in sorted(lat_u)],
+                                   ref["lat"][w], metrics_enabled, device, di)
+                  if want_lat and compute_uncond and lat_u is not None
+                  and ref["lat"][w] is not None else {})
+
+        entries = []
+        for _lab, _names in (subset_specs or ()):
+            if tuple(_names) == tuple(frame_dims or {}):
+                entries.append((_lab, None))
+                continue
+            _ls = _generate(lo, hi, conditioned=True, subset=set(_names))[0]
+            _p, _cv, _g, _, _ = _measure(_ls, lo, hi, True, False,
+                                         f"inpaint {name}: subset {_lab}")
+            entries.append((_lab, (_p, _cv, _g)))
+            del _ls
+        have_null = lat_u is not None
+        del lat_c, lat_u
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        if not is_main:
+            continue
+
+        def _fadv(stats, refstats):
+            if stats is None or refstats is None:
+                return None
+            return compute_fad(stats["mu"], stats["sigma"], refstats,
+                               device=fad_device)
+
+        vals = {
+            "fd_cond": lat_m.get("fd_dac"), "kl_cond_rg": lat_m.get("kl_real_gen"),
+            "kl_cond_gr": lat_m.get("kl_gen_real"),
+            "fd_uncond": lat_mu.get("fd_dac"), "kl_uncond_rg": lat_mu.get("kl_real_gen"),
+            "kl_uncond_gr": lat_mu.get("kl_gen_real"),
+            "fad_full_cond": _fadv(fad_full_c, ref["full"]),
+            "fad_inpaint_cond": _fadv(fad_seg_c, ref["seg"][w]),
+            "fad_full_uncond": _fadv(fad_full_u, ref["full"]),
+            "fad_inpaint_uncond": _fadv(fad_seg_u, ref["seg"][w]),
+        }
+        sfx = f"_{name}"
+        if any_cond:
+            tags = {"fd_cond": f"Fd_{_fd}_cond{sfx}",
+                    "kl_cond_rg": f"Kl_cond/real_gen{sfx}",
+                    "kl_cond_gr": f"Kl_cond/gen_real{sfx}",
+                    "fd_uncond": f"Fd_{_fd}_uncond{sfx}",
+                    "kl_uncond_rg": f"Kl_uncond/real_gen{sfx}",
+                    "kl_uncond_gr": f"Kl_uncond/gen_real{sfx}",
+                    "fad_full_cond": f"Fad_vggish_full_cond{sfx}",
+                    "fad_inpaint_cond": f"Fad_vggish_inpaint_cond{sfx}",
+                    "fad_full_uncond": f"Fad_vggish_full_uncond{sfx}",
+                    "fad_inpaint_uncond": f"Fad_vggish_inpaint_uncond{sfx}"}
+        else:
+            tags = {"fd_cond": f"Fd_{_fd}{sfx}", "kl_cond_rg": f"Kl_real_gen{sfx}",
+                    "kl_cond_gr": f"Kl_gen_real{sfx}",
+                    "fad_full_cond": f"Fad_vggish_full{sfx}",
+                    "fad_inpaint_cond": f"Fad_vggish_inpaint{sfx}"}
+        for k, tag in tags.items():
+            if vals.get(k) is not None:
+                writer.add_scalar(f"{_mi}/{tag}", vals[k], step)
+
+        inf_named, cov_named = ({}, {})
+        if scoring:
+            inf_named, cov_named = _influence(per_c, cov_c, gs_c, per_n, gs_n,
+                                              have_null)
+        if mir_curves and frame_active:
+            for _c, _names in MIR_CURVE_METRICS.items():
+                if fidelity_evaluator.families.get(_c) != "mir_influence_metrics":
+                    continue
+                for _k in _names:
+                    _v = (inf_named.get(f"{_c}_{split_name}", {}).get(_k, {})
+                          .get("cond"))
+                    if _v is not None:
+                        writer.add_scalar(f"{_mi}/{_c.capitalize()}_{_k}_cond{sfx}",
+                                          _v, step)
+
+        head = f"**Inpainting {name} · {lo / fps:.2f}-{hi / fps:.2f} s**"
+        if inf_named and entries:
+            tables = []
+            for _lab, _res in entries:
+                if _res is None:
+                    tables.append((_lab, inf_named, cov_named))
+                else:
+                    _i, _cv2 = _influence(_res[0], _res[1], _res[2], per_n, gs_n,
+                                          have_null)
+                    tables.append((_lab, _i, _cv2))
+            body = format_influence_matrix(tables, step, prefix=prefix,
+                                           guidance=guidance, n_samples=n,
+                                           always_given=set(gsim_names))
+            blocks.append(head + "\n" + "\n".join(body.split("\n")[1:]))
+        elif inf_named:
+            body = format_influence_panel(inf_named, step, prefix=prefix,
+                                          guidance=guidance, n_samples=n,
+                                          coverage=cov_named)
+            blocks.append(head + "\n" + "\n".join(body.split("\n")[1:]))
+
+        def _f(x):
+            return f"{x:.4f}" if x is not None else "n/a"
+        print(f"  [inpaint {name}] FD-{lc.active().label}: {_f(vals['fd_cond'])} | "
+              f"KL(real||gen): {_f(vals['kl_cond_rg'])} | "
+              f"KL(gen||real): {_f(vals['kl_cond_gr'])} | "
+              f"FAD full: {_f(vals['fad_full_cond'])} | "
+              f"FAD inpaint: {_f(vals['fad_inpaint_cond'])}")
+        report[name] = dict(vals, frames=[lo, hi], influence=inf_named,
+                            influence_coverage=cov_named)
+    md = None
+    if is_main and blocks:
+        md = "\n\n---\n\n".join(blocks)
+    return md, report
+
 
 @torch.no_grad()
 def evaluate_and_log_metrics(
@@ -1905,6 +2654,7 @@ def evaluate_and_log_metrics(
     probe_sets=None, image_root=None, test_dataset=None,
     tag_prefix="Validation", split_name="validation", report=None,
     dist_info=None, mir_curves=False,
+    inpaint_only=False, fad_reference="decoded", wav_root=None,
 ):
     guidance = float(conditioning_cfg.guidance_scale)
     n_frames = val_dataset.n_frames
@@ -1929,6 +2679,44 @@ def evaluate_and_log_metrics(
     if scoring_active and frame_active:
         subset_specs = resolve_influence_subsets(
             sampling_cfg.get("influence_subsets", None), list(frame_dims or {}))
+
+    _ip_model = bool(getattr(model, "inpainting", False))
+
+    def _inpaint_eval():
+        return evaluate_inpainting(
+            model, normalizer, val_dataset, indices, step, writer, device,
+            sampling_cfg, guidance, use_amp, frame_dims, global_configs,
+            fidelity_evaluator=fidelity_evaluator,
+            global_embedders=global_embedders, compute_uncond=compute_uncond,
+            metrics_seed=metrics_seed, metrics_enabled=metrics_enabled,
+            fad_embedder=fad_embedder, n_fad=n_fad, fad_device=fad_device,
+            fad_reference=fad_reference, wav_root=wav_root,
+            text_vec_for=_text_vec_for, dist_info=dist_info,
+            subset_specs=subset_specs, mir_curves=mir_curves,
+            tag_prefix=tag_prefix, split_name=split_name, prefix=prefix)
+
+    if inpaint_only and _ip_model:
+        _ip_md, _ip_report = _inpaint_eval()
+        if _ip_md:
+            from condition_metrics import format_influence_legend
+            writer.add_text(f"{tag_prefix}/Condition_influence", _ip_md, step)
+            _legend_tag = f"{tag_prefix}/Condition_influence_legend"
+            if fixed_card_pending(writer, _legend_tag):
+                writer.add_text(_legend_tag,
+                                format_influence_legend() + INPAINT_LEGEND, 0)
+        if report is not None:
+            report.update({"n_generations": int(n_samples),
+                           "inpainting": _ip_report})
+        log_listening_panels(
+            model=model, normalizer=normalizer, step=step, writer=writer,
+            device=device, output_dir=output_dir, sampling_cfg=sampling_cfg,
+            conditioning_cfg=conditioning_cfg, use_amp=use_amp,
+            frame_dims=frame_dims, global_configs=global_configs,
+            fidelity_evaluator=fidelity_evaluator, test_dataset=test_dataset,
+            probe_sets=probe_sets, n_frames=n_frames, prefix=prefix,
+            metrics_seed=metrics_seed, image_root=image_root,
+            text_vec_for=_text_vec_for, dist_info=_di, inpaint_only=True)
+        return None, None, None
 
     ref_frames = (fd_dac_ref_stats["n_total"]
                   if fd_dac_ref_stats is not None else "n/a")
@@ -2320,6 +3108,10 @@ def evaluate_and_log_metrics(
         _c, _, _m = _k.partition("/")
         _cov_named[f"{_row_label(_c)}/{_m}"] = _v
 
+    _ip_md = _ip_report = None
+    if _ip_model:
+        _ip_md, _ip_report = _inpaint_eval()
+
     if influence:
         from condition_metrics import (format_influence_panel,
                                        format_influence_matrix,
@@ -2337,10 +3129,13 @@ def evaluate_and_log_metrics(
                 n_samples=int(n_samples),
                 coverage=_cov_named,
             )
+        if _ip_md:
+            panel_md = panel_md + "\n\n---\n\n" + _ip_md
         writer.add_text(f"{tag_prefix}/Condition_influence", panel_md, step)
         _legend_tag = f"{tag_prefix}/Condition_influence_legend"
         if fixed_card_pending(writer, _legend_tag):
-            writer.add_text(_legend_tag, format_influence_legend(), 0)
+            writer.add_text(_legend_tag, format_influence_legend()
+                            + (INPAINT_LEGEND if _ip_model else ""), 0)
 
     _m = f"{tag_prefix}/Metrics"
     _fd = "dac" if lc.active().name == "dac_44khz" else "encodec"
@@ -2420,6 +3215,8 @@ def evaluate_and_log_metrics(
             "influence": _inf_named,
             "influence_coverage": _cov_named,
         })
+        if _ip_model:
+            report["inpainting"] = _ip_report
 
     log_listening_panels(
         model=model, normalizer=normalizer, step=step, writer=writer,
@@ -2678,6 +3475,7 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
         "text_cross_every":     int(cfg.model.get("text_cross_every", 0)),
         "attention":            str(cfg.model.get("attention", "standard")),
         "qk_norm":              bool(cfg.model.get("qk_norm", False)),
+        "inpainting":           bool(cfg.training.get("inpainting", False)),
         "codec":                lc.active().name,
         "config":               OmegaConf.to_container(cfg, resolve=True),
         "label_map":            label_map,
@@ -2828,6 +3626,27 @@ def dist_dac_metrics(lat_list, ref_stats, enabled, device, di, block_size=16):
         out["kl_real_gen"] = gaussian_kl_fullcov(mu_ref, sigma_ref, mu_gen, sigma_gen)
         out["kl_gen_real"] = gaussian_kl_fullcov(mu_gen, sigma_gen, mu_ref, sigma_ref)
     return out
+
+
+@torch.no_grad()
+def dist_latent_stats(lat_list, device, di, block_size=16):
+    lats = [x for x in lat_list if x is not None]
+    dim = lc.active().latent_dim
+    sum_x = torch.zeros(dim, dtype=torch.float64, device=device)
+    sum_xx = torch.zeros(dim, dim, dtype=torch.float64, device=device)
+    count = torch.zeros((), dtype=torch.float64, device=device)
+    for start in range(0, len(lats), block_size):
+        block = torch.cat(lats[start:start + block_size]).to(device=device,
+                                                             dtype=torch.float64)
+        sum_x = sum_x + block.sum(dim=0)
+        sum_xx = sum_xx + block.T @ block
+        count = count + block.shape[0]
+        del block
+    sum_x, sum_xx, count = dist_sum_tensors([sum_x, sum_xx, count], di)
+    if float(count) < 2:
+        return None
+    mu, sigma, n = compute_mu_sigma(sum_x, sum_xx, count)
+    return {"mu": mu.cpu(), "sigma": sigma.cpu(), "n_total": int(n)}
 
 
 @torch.no_grad()
@@ -3356,11 +4175,16 @@ if __name__ == "__main__":
 
     metrics_uncond = bool(cfg.sampling.get("metrics_uncond", True))
 
-    n_uncond_cards = max(0, int(cfg.sampling.get("n_audio_samples", 4) or 0))
+    _no_scratch = (bool(cfg.training.get("inpainting", False))
+                   and inpaint_mask_probs(cfg.training)[0] == 0.0)
+    n_uncond_cards = (0 if _no_scratch else
+                      max(0, int(cfg.sampling.get("n_audio_samples", 4) or 0)))
     print(f"Uncond cards: {n_uncond_cards}"
-          + (f" (uncond_00..uncond_{n_uncond_cards - 1:02d}), refreshed every "
+          + (f" ({UNCOND_AUDIO_GROUP}/00..{n_uncond_cards - 1:02d}), refreshed every "
              f"intervals.audio and every intervals.metrics from the same noise"
              if n_uncond_cards else "")
+          + (" (inpainting only: nothing is generated from scratch)"
+             if _no_scratch else "")
           + "\n")
     print(f"Conditioning influence: frame={list(FRAME_COND_DIMS.keys()) or 'none'}"
           f"{' + text(CLAP)' if 'text' in global_embedders else ''}"
@@ -3385,11 +4209,13 @@ if __name__ == "__main__":
         )
     ATTENTION = str(cfg.model.get("attention", "standard"))
     QK_NORM = bool(cfg.model.get("qk_norm", False))
+    INPAINTING = bool(cfg.training.get("inpainting", False))
     print(f"[MODEL] Building ConditionedAudioDiT-{cfg.model.kind} "
           f"| frame={list(FRAME_COND_DIMS)} | global={list(GLOBAL_CONFIGS)} "
           f"| frame_reinject_every={FRAME_REINJECT_EVERY} "
           f"| text_cross_every={TEXT_CROSS_EVERY} "
-          f"| attention={ATTENTION} | qk_norm={QK_NORM}")
+          f"| attention={ATTENTION} | qk_norm={QK_NORM} "
+          f"| inpainting={INPAINTING}")
     model = ConditionedAudioDiT(
         kind=cfg.model.kind,
         drop=cfg.model.get("drop", 0.0),
@@ -3401,6 +4227,7 @@ if __name__ == "__main__":
         text_ctx_dim=TEXT_CTX_DIM,
         attention=ATTENTION,
         qk_norm=QK_NORM,
+        inpainting=INPAINTING,
         token_dim=lc.active().latent_dim,
     ).to(device)
     ema = EMAModel(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None
@@ -3481,17 +4308,29 @@ if __name__ == "__main__":
                 f"q/k weights compute, so it needs a run from scratch (leave "
                 f"paths.init_from empty), or set model.qk_norm={_ck_qk} to "
                 f"warm-start as before.")
+        if ckpt_inpainting(_ck) and not INPAINTING:
+            raise RuntimeError(
+                f"{init_from} was trained with training.inpainting=true, this "
+                f"run builds the model without the inpainting context layers. "
+                f"A warm start may only ADD zero-initialised weights, not drop "
+                f"trained ones: set training.inpainting=true to warm-start from "
+                f"it.")
         _sd = (_ck.get("ema_state_dict") if _ck.get("ema_ready", True)
                and "ema_state_dict" in _ck else _ck.get("model_state_dict"))
         if not isinstance(_sd, dict):
             raise RuntimeError(f"{init_from} carries no model weights")
         _res = model.load_state_dict(_sd, strict=False)
-        _new = tuple(["cross_attn.", "text_null", "norm_cross."])
-        _bad = [k for k in _res.missing_keys if not any(n in k for n in _new)]
+        _new_parts = {
+            "the new cross-attention": ("cross_attn.", "text_null", "norm_cross."),
+            "the new inpainting context layers": (".inpaint_embed.",),
+        }
+        _bad = [k for k in _res.missing_keys
+                if not any(n in k for _p in _new_parts.values() for n in _p)]
         if _bad or _res.unexpected_keys:
             raise RuntimeError(
                 f"{init_from} does not fit this model.\n"
-                f"  missing and NOT part of the new cross-attention: "
+                f"  missing and NOT part of the new cross-attention or "
+                f"inpainting context layers: "
                 f"{_bad[:8]}{' ...' if len(_bad) > 8 else ''}\n"
                 f"  present in the checkpoint but not in this model: "
                 f"{list(_res.unexpected_keys)[:8]}"
@@ -3499,9 +4338,12 @@ if __name__ == "__main__":
                 f"A warm start may only ADD zero-initialised weights. Rebuild "
                 f"this run with the same model.kind, conditions and "
                 f"frame_reinject_every as the checkpoint.")
+        _added = [_w for _w, _p in _new_parts.items()
+                  if any(n in k for k in _res.missing_keys for n in _p)]
         print(f"  {len(_sd) - len(_res.missing_keys)} tensor(s) loaded, "
-              f"{len(_res.missing_keys)} left at their zero/random init "
-              f"(the new cross-attention). Step counter starts at 0.")
+              f"{len(_res.missing_keys)} left at their zero/random init"
+              + (f" ({' and '.join(_added)})" if _added else "")
+              + ". Step counter starts at 0.")
         if ema is not None:
             ema.copy_from(model)
         del _ck, _sd
@@ -3576,6 +4418,16 @@ if __name__ == "__main__":
                 f"model.qk_norm={ckpt_qk} to resume this run (--resume reads it "
                 f"off the checkpoint weights by itself); a different qk_norm is "
                 f"a NEW run from scratch.")
+        ckpt_ip = ckpt_inpainting(ckpt)
+        if ckpt_ip != INPAINTING:
+            raise RuntimeError(
+                f"Checkpoint was trained with training.inpainting={ckpt_ip} but "
+                f"the model was built with inpainting={INPAINTING}. They must "
+                f"match to resume: the inpainting context adds its own layers "
+                f"in every block. Pass training.inpainting={ckpt_ip} to resume "
+                f"this run (--resume reads it off the checkpoint weights by "
+                f"itself); to add inpainting to a trained model, start a NEW "
+                f"run with paths.init_from -- its layers start at zero.")
 
         ckpt_frame_dims = ckpt.get("frame_cond_dims", None)
         if ckpt_frame_dims is not None and dict(ckpt_frame_dims) != dict(FRAME_COND_DIMS):
@@ -3733,6 +4585,20 @@ if __name__ == "__main__":
             f"{sum(1 for _tv, _ in _grid if _tv < 0.1)} of them at t < 0.1 "
             f"(noise end), the last at t={_grid[-1][0]:.3f}")
     del _grid
+    IP_PROBS = inpaint_mask_probs(cfg.training) if INPAINTING else None
+    INPAINT_ONLY = INPAINTING and IP_PROBS[0] == 0.0
+    IP_THIRDS = inpaint_thirds(n_frames)
+    if INPAINTING:
+        _fps = lc.active().frames_per_s
+        print(f"Inpainting training (Stable Audio 3): masks full / 1-"
+              f"{INPAINT_MAX_SPANS} spans / continuation = {IP_PROBS[0]:g} / "
+              f"{IP_PROBS[1]:g} / {IP_PROBS[2]:g} | Train/Loss = "
+              f"Loss_generated + Loss_context | validation thirds "
+              + ", ".join(f"{w} {lo / _fps:.2f}-{hi / _fps:.2f} s"
+                          for w, (lo, hi) in zip(INPAINT_WINDOWS, IP_THIRDS))
+              + (" | inpainting only: no full-mask Validation/Loss, no best "
+                 "checkpoint, no generation from scratch in the panels"
+                 if INPAINT_ONLY else ""))
     print(f"DATASET_ROOT:   {cfg.paths.dataset_root}")
     print(f"WAV_ROOT:       {cfg.paths.wav_root}")
     print(f"CONDITION_ROOT: {cfg.paths.condition_root}")
@@ -3751,6 +4617,7 @@ if __name__ == "__main__":
         global_configs=GLOBAL_CONFIGS,
         output_dir=audio_dir,
         dist_info=DIST,
+        inpainting=INPAINTING,
     )
     dist_replay(writer, DIST)
 
@@ -3769,11 +4636,13 @@ if __name__ == "__main__":
             model.train()
 
             accum_loss = 0.0
+            accum_gen = accum_ctx = 0.0
             for _micro in range(cfg.data.grad_accum):
                 batch = next(train_iter)
                 _sync = (train_model.no_sync()
                          if DIST.enabled and _micro < cfg.data.grad_accum - 1
                          else nullcontext())
+                _lp = {} if INPAINTING else None
                 with _sync:
                     loss = compute_loss(
                         train_model, batch, device,
@@ -3787,11 +4656,16 @@ if __name__ == "__main__":
                         p_drop_each_frame=P_DROP_EACH_FRAME,
                         training=True,
                         t_sampler=T_SAMPLER,
+                        inpaint_probs=IP_PROBS,
+                        parts=_lp,
                     ) / cfg.data.grad_accum
                     scaler.scale(loss).backward()
                 accum_loss += loss.item()
+                if INPAINTING:
+                    accum_gen += _lp["generated"].item() / cfg.data.grad_accum
+                    accum_ctx += _lp["context"].item() / cfg.data.grad_accum
 
-                del loss, batch
+                del loss, batch, _lp
 
             scaler.unscale_(optimizer)
             _clip = cfg.training.grad_clip
@@ -3810,9 +4684,16 @@ if __name__ == "__main__":
                 else:
                     ema.update(model)
 
-            if DIST.enabled:
+            if DIST.enabled and INPAINTING:
+                accum_loss, accum_gen, accum_ctx = [
+                    v / DIST.world
+                    for v in dist_sum([accum_loss, accum_gen, accum_ctx], DIST)]
+            elif DIST.enabled:
                 accum_loss = dist_sum([accum_loss], DIST)[0] / DIST.world
             writer.add_scalar("Train/Loss", accum_loss, step)
+            if INPAINTING:
+                writer.add_scalar("Train/Loss_generated", accum_gen, step)
+                writer.add_scalar("Train/Loss_context", accum_ctx, step)
             writer.add_scalar("Train/Learning rate",
                               scheduler.get_last_lr()[0], step)
             writer.add_scalar("Train/Grad_norm", grad_norm.item(), step)
@@ -3829,6 +4710,8 @@ if __name__ == "__main__":
                     val_loss_sum = 0.0
                     ema_val_loss_sum = 0.0
                     val_sample_count = 0
+                    ip_sum = [0.0] * len(INPAINT_WINDOWS)
+                    ip_ema_sum = [0.0] * len(INPAINT_WINDOWS)
                     ema_active = (cfg.training.use_ema
                                   and step >= cfg.training.ema_start)
                     for _vbi, (vb, (fixed_x0, fixed_t)) in enumerate(zip(
@@ -3836,6 +4719,36 @@ if __name__ == "__main__":
                         if DIST.enabled and _vbi % DIST.world != DIST.rank:
                             continue
                         batch_sample_count = int(vb[0].shape[0])
+                        if INPAINTING:
+                            for _w, (_lo, _hi) in enumerate(IP_THIRDS):
+                                _keep = inpaint_keep_window(
+                                    batch_sample_count, int(vb[0].shape[1]),
+                                    _lo, _hi)
+                                for _net, _acc in ([(model, ip_sum)]
+                                                   + ([(ema.model, ip_ema_sum)]
+                                                      if ema_active else [])):
+                                    _lp = {}
+                                    compute_loss(
+                                        _net, vb, device,
+                                        use_amp=cfg.training.use_amp,
+                                        t_min=cfg.sampling.t_min,
+                                        t_max=cfg.sampling.t_max,
+                                        global_configs=GLOBAL_CONFIGS,
+                                        p_drop_all=cfg.conditioning.p_drop_all,
+                                        p_drop_frame=cfg.conditioning.p_drop_frame,
+                                        p_drop_global=cfg.conditioning.p_drop_global,
+                                        p_drop_each_frame=P_DROP_EACH_FRAME,
+                                        training=False,
+                                        x0=fixed_x0,
+                                        t=fixed_t,
+                                        inpaint_keep=_keep,
+                                        parts=_lp,
+                                    )
+                                    _acc[_w] += (_lp["generated"].item()
+                                                 * batch_sample_count)
+                        if INPAINT_ONLY:
+                            val_sample_count += batch_sample_count
+                            continue
                         vl = compute_loss(
                             model, vb, device,
                             use_amp=cfg.training.use_amp,
@@ -3870,28 +4783,56 @@ if __name__ == "__main__":
                             ).item()
                             ema_val_loss_sum += evl * batch_sample_count
 
-                    if DIST.enabled:
+                    if DIST.enabled and INPAINTING:
+                        _n_ip = len(INPAINT_WINDOWS)
+                        _all = dist_sum([val_loss_sum, ema_val_loss_sum,
+                                         val_sample_count] + ip_sum + ip_ema_sum,
+                                        DIST)
+                        val_loss_sum, ema_val_loss_sum, val_sample_count = _all[:3]
+                        ip_sum = _all[3:3 + _n_ip]
+                        ip_ema_sum = _all[3 + _n_ip:3 + 2 * _n_ip]
+                    elif DIST.enabled:
                         val_loss_sum, ema_val_loss_sum, val_sample_count = \
                             dist_sum([val_loss_sum, ema_val_loss_sum,
                                       val_sample_count], DIST)
-                    val_loss = val_loss_sum / val_sample_count
-                    ema_val_loss = val_loss
-                    if ema_active:
-                        ema_val_loss = ema_val_loss_sum / val_sample_count
-                        writer.add_scalar("Validation/Loss_ema", ema_val_loss, step)
+                    if not INPAINT_ONLY:
+                        val_loss = val_loss_sum / val_sample_count
+                        ema_val_loss = val_loss
+                        if ema_active:
+                            ema_val_loss = ema_val_loss_sum / val_sample_count
+                            writer.add_scalar("Validation/Loss_ema", ema_val_loss, step)
+                    ip_val = [s / val_sample_count for s in ip_sum]
+                    ip_ema_val = [s / val_sample_count for s in ip_ema_sum]
+                    if INPAINTING:
+                        for _w, _name in enumerate(INPAINT_WINDOWS):
+                            writer.add_scalar(f"Validation/Loss_inpaint_{_name}",
+                                              ip_val[_w], step)
+                            if ema_active:
+                                writer.add_scalar(
+                                    f"Validation/Loss_inpaint_{_name}_ema",
+                                    ip_ema_val[_w], step)
 
-                writer.add_scalar("Validation/Loss", val_loss, step)
+                if not INPAINT_ONLY:
+                    writer.add_scalar("Validation/Loss", val_loss, step)
 
                 if device == "cuda":
                     torch.cuda.empty_cache()
 
                 ema_str = (f" | EMA Val {ema_val_loss:.6f}"
-                           if cfg.training.use_ema and step >= cfg.training.ema_start else "")
+                           if not INPAINT_ONLY and cfg.training.use_ema
+                           and step >= cfg.training.ema_start else "")
+                _val_str = "" if INPAINT_ONLY else f"Val {val_loss:.6f}{ema_str} | "
+                if INPAINTING:
+                    _val_str += ("Val inpaint " + " / ".join(f"{v:.6f}" for v in ip_val)
+                                 + (" | EMA " + " / ".join(f"{v:.6f}" for v in ip_ema_val)
+                                    if ema_active else "")
+                                 + " | ")
                 pbar.write(f"Step {step:7d} | Train {accum_loss:.6f} | "
-                           f"Val {val_loss:.6f}{ema_str} | "
-                           f"LR {scheduler.get_last_lr()[0]:.2e}")
+                           + _val_str
+                           + f"LR {scheduler.get_last_lr()[0]:.2e}")
 
-                check_loss = (ema_val_loss
+                check_loss = (float("inf") if INPAINT_ONLY
+                              else ema_val_loss
                               if cfg.training.use_ema and step >= cfg.training.ema_start
                               else val_loss)
                 if check_loss < best_val_loss and not DIST.is_main:
@@ -3991,6 +4932,9 @@ if __name__ == "__main__":
                     test_dataset=test_dataset,
                     dist_info=DIST,
                     mir_curves=True,
+                    inpaint_only=INPAINT_ONLY,
+                    fad_reference=_fad_ref_mode,
+                    wav_root=cfg.paths.wav_root,
                 )
                 _parts = []
                 if fd_dac_cond is not None:

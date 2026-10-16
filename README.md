@@ -586,7 +586,7 @@ instruments are merged and velocity is not kept.
   every metrics step transcribes 2 × `n_metrics_samples` generations (with and
   without the condition): ~20 min for 512 on that GPU. Several GPUs split it.
 - **Table rows** (see *influence_family* below): ours `cosine` (sounding keys,
-  per frame), `onset_corr`, `drum_corr`; mir_eval `note_precision`,
+  per frame), `onset Pearson corr`, `drum Pearson corr`; mir_eval `note_precision`,
   `note_recall`, `note_f1`, `drum_precision`, `drum_recall`, `drum_f1`.
 - `extract_conditions.py` refuses `midi` (it never sees the sources and their
   MIDI); `sampling_cond.py` with a reference audio gets the `midi` condition by
@@ -1068,6 +1068,69 @@ python training_cond.py ... sampling.t_schedule=logsnr_uniform sampling.euler_st
 - **`uniform` generates what it did before, bit for bit**: the same times and
   step sizes, with the same arithmetic.
 
+### Inpainting (Stable Audio 3) — `training.inpainting`, `training.inpaint_masks`
+
+The model can learn to regenerate a stretch of a clip given the rest of it, the
+way Stable Audio 3 does ([arXiv 2605.17991](https://arxiv.org/abs/2605.17991),
+§3.2): every example of the batch draws a mask, the frames the mask keeps are
+given to the model as context, and it regenerates the others.
+
+```yaml
+training:
+  inpainting: false               # true: build the context layers, train with masks
+  inpaint_masks: [0.8, 0.1, 0.1]  # probability of: full mask (generate from scratch),
+                                  # 1-10 random spans, continuation (a prefix kept)
+```
+
+- **The model.** The context is the mask plus the latent times the mask (73
+  channels with DAC, 129 with EnCodec). Every block adds it through its own
+  Linear-SiLU-Linear, the last layer zero-initialised, between the
+  cross-attention and the feed-forward: +1.8M parameters on S, +39.6M on XL. The
+  context is the same in the conditioned and the unconditioned branch of the
+  CFG: the guidance never removes it. With `inpainting: false` nothing is built
+  and the run is the one of before, bit for bit.
+- **The loss** is SA3's: the mean over the regenerated frames plus the mean over
+  the kept ones, per example, then over the batch (an example without context
+  adds 0 to the second). `Train/Loss` = `Train/Loss_generated` +
+  `Train/Loss_context`: it is not comparable with a run without inpainting.
+- **`[0, 0.5, 0.5]` = inpainting only:** the model never generates from scratch,
+  so it does not learn to. No full-mask `Validation/Loss` and no best checkpoint
+  (only the periodic and the last ones), no `Validation/Metrics/`, nothing
+  generated from scratch in the panels (no generation, subset or uncond cards,
+  no target-vs-generation images); the startup log says `Uncond cards: 0
+  (inpainting only: nothing is generated from scratch)`.
+- **Checkpoints.** The flag is read off the weights: a resume keeps it, a resume
+  with the other value stops and says why. `paths.init_from` from a model
+  without inpainting works (the new layers start at zero); the other way stops.
+- **Validation, on fixed thirds.** Besides `Validation/Loss` (full mask, as
+  before), `Validation/Loss_inpaint_1_start`, `_2_middle`, `_3_end` (+ `_ema`):
+  the same validation batches, noise and `t`, with the first, the middle or the
+  last third regenerated (0–1.67, 1.67–3.33, 3.33–5.00 s on a 5 s clip).
+- **Metrics step.** Every validation clip of the step is regenerated three
+  times, once per third, with the rest of the clip as context, put back as it
+  was before decoding (SA3 decodes the model's output instead): 3 ×
+  `n_metrics_samples` generations more, about 4 times as long.
+  `Validation/Inpainting/` has one curve per metric and third:
+  `Fd_dac_cond_<third>` (`Fd_encodec_` on EnCodec), `Kl_cond/real_gen_<third>`,
+  `Kl_cond/gen_real_<third>` — the frames of that third against the same third
+  of the real clips —, `Fad_vggish_full_cond_<third>` (the whole clip with that
+  third regenerated, against the same real clips) and
+  `Fad_vggish_inpaint_cond_<third>` (that third alone, against the same third);
+  the same with `_uncond` when `sampling.metrics_uncond` is on, and with
+  `mir_influence_metrics` the mir curves of every condition per third. A run
+  without conditions logs `Fd_dac_<third>`, `Kl_real_gen_<third>`, ... A third of
+  a 5 s clip is 1.7 s, one VGGish window: `Fad_vggish_inpaint` rests on one
+  embedding per clip.
+- **The Text table** gets one block per third — with-cond, null, Δ — measured on
+  the frames of that third; null is the same context without conditions. The
+  legend says so, and `sampling.influence_subsets` applies to the blocks too.
+- **Listening:** three cards per panel, the probes' context, a group per test
+  clip in a run without conditions — see the Audio window in *Unconditional
+  training with the same code* below.
+- `test_cond.py` does the same on the test split (`Test/Inpainting/`, the blocks
+  of `Test/Condition_influence`), and `sampling_cond.py inpaint` regenerates a
+  stretch of any audio file (§4).
+
 ### Which metrics are computed
 
 `metrics.enabled` selects the distributional metrics, mirroring the unconditional
@@ -1115,8 +1178,13 @@ standard MIR metrics, so the numbers are comparable with the literature.
 | f0 | `mir_eval.melody`: `raw_pitch_accuracy` (50 cents), `raw_chroma_accuracy`, `voicing_recall`, `voicing_false_alarm` (↓ lower is better), `overall_accuracy` |
 | chroma, chord | `mir_eval.multipitch`, on the pitch classes ON in each frame: `chroma_precision`, `chroma_recall`, `chroma_accuracy`, `chroma_miss_error` (↓), `chroma_false_alarm_error` (↓, can exceed 1) |
 | rhythm | `mir_eval.beat`, on the beat instants read off the curves with beat_this's own rule (maximum within ±60 ms, probability > 0.5): `beat_f_measure`, `beat_cemgil`, `beat_p_score`, `beat_cmlt`, `beat_amlt`, `downbeat_f_measure` |
-| midi | `mir_eval.transcription`, onsets within ±50 ms on the same key (offsets ignored): `note_precision`, `note_recall`, `note_f1`; the same for drum hits on the same class: `drum_precision`, `drum_recall`, `drum_f1`. Ours: `cosine` (sounding keys), `onset_corr`, `drum_corr` |
+| midi | `mir_eval.transcription`, onsets within ±50 ms on the same key (offsets ignored): `note_precision`, `note_recall`, `note_f1`; the same for drum hits on the same class: `drum_precision`, `drum_recall`, `drum_f1`. Ours: `cosine` (sounding keys), `onset Pearson corr`, `drum Pearson corr` |
 | energy, text, image | always ours (mir_eval has no counterpart) |
+
+Our correlations are Pearson's, and the table says so: `Pearson corr` (f0, on
+the voiced frames; energy), `beat Pearson corr` and `downbeat Pearson corr`
+(rhythm), `onset Pearson corr` and `drum Pearson corr` (midi). The JSON of
+`test_cond.py` keeps the short keys (`corr`, `beat_corr`, ...).
 
 The target is the reference and the generation the estimate, on the shared
 frame grid of the codec, DAC or EnCodec (no resampling). A sample whose target has no voiced frame has no raw
@@ -1235,6 +1303,8 @@ sample was given:
 - With `sampling.influence_subsets` on, the panel becomes the Δ matrix (one row
   per subset of conditions, one column per metric) with the detailed table of
   every subset underneath.
+- With `training.inpainting` the panel has one more block per third of the
+  clip, measured on that third (see *Inpainting* above).
 - The null generations cost no extra sampling under CFG (the unconditional
   velocity is computed anyway), but they are decoded and measured like the
   conditioned ones: the audio part of the panel takes twice as long.
@@ -1394,15 +1464,38 @@ as a grid of peers. `audio_panel_tags()` in `training_cond.py` builds the names
 and is the single source of truth.
 
 ```
-test_XX/1_real_test_XX                  the recording the conditions come from
-test_XX/2_f0_test_XX                    the sonified f0 target
-test_XX/3..N_<cond>_test_XX             energy, chroma, ...
-test_XX/N+1_generation_test_XX          the generation they produced
-probe_XX/1_f0_probe_XX , /2_chroma_probe_XX , /3_generation_probe_XX
+test_XX/1_real                  the recording the conditions come from
+test_XX/2_f0                    the sonified f0 target
+test_XX/3..N_<cond>             energy, chroma, ...
+test_XX/N+1_generation          the generation they produced
+test_XX/N+2_inpaint_<third>     (inpainting) that third regenerated, the rest the recording
+probe_XX/1_f0 , /2_chroma , /3_generation
+probe_XX/3_inpaint_context , /4_generation , /5_inpaint_<third>   (inpainting)
 
-uncond generation/uncond_NN             generations without conditions
-ground truth/real_test_XX               (unconditional run only) real TEST recordings
+uncond generation/NN            generations without conditions
+ground truth/real_test_XX       (unconditional run only) real TEST recordings
+test_XX/1_real , /2_inpaint_<third>   (unconditional run with inpainting, instead)
 ```
+
+A card name does not repeat what the text before the `/` already says: the
+dashboard writes the whole tag above every card, so `probe_00/1_f0` is the f0
+card of probe 00 even on its own. `ground truth/` keeps `real_test_XX`, since
+there the number is not before the `/`.
+
+With `training.inpainting` every test and probe panel gets three cards after
+the generation, `<n>_inpaint_1_start`, `_2_middle` and `_3_end`: the same clip
+with that third regenerated, from the noise draw of the panel's generation,
+written by the metrics step. The rest of the clip is the context. For a test
+panel it is the recording. A probe has no recording, so its context is the sum
+of its stimuli: each frame condition's sonification divided by its RMS, summed,
+then brought to peak 0.25, the level of one stimulus, and encoded once per run
+with the run's codec. It is the card `<n>_inpaint_context`, right after the
+stimuli. A probe of globals only (text, image) has no waveform to give as
+context, and no inpainting cards. In a run without conditions the inpainting has
+a group per test clip, `test_XX/1_real` and `test_XX/2_inpaint_<third>`, in
+place of `ground truth/`. With
+inpainting only (`inpaint_masks: [0, …]`) the inpainting cards take the slot of
+the generation, and nothing generated from scratch is shown.
 
 The TEST panels are `sampling.n_test_panels` samples of the **test** split,
 spread evenly over it and the same at every step (they replaced the validation
@@ -1411,12 +1504,12 @@ Both are for listening and looking: nothing measured on them is in the
 Condition_influence table, which is computed on the validation generations.
 
 The uncond cards are `sampling.n_audio_samples` generations without conditions,
-`uncond_00`, `uncond_01`, ... — just a number, since a generation with no
+`uncond generation/00`, `/01`, ... — just a number, since a generation with no
 conditions has nothing of any sample in it. Card k starts from the k-th draw of
 ONE noise stream seeded with `metrics.seed`, so they are all different. (Until
 2 Oct 2026 they were collected from the validation and the probe pass, each of
-which restarted the generator from the seed: `uncond_00` and `uncond_04` were
-the same audio.) In a PURE-UNCONDITIONAL run there are no blocks: the audio
+which restarted the generator from the seed: cards 00 and 04 were the same
+audio.) In a PURE-UNCONDITIONAL run there are no blocks: the audio
 window is the uncond cards plus `n_audio_samples` validation recordings in
 `ground truth/`.
 
@@ -1424,8 +1517,8 @@ WHO WRITES WHAT, AND WHEN. The `test_XX/` and `probe_XX/` panels are written by
 the metrics step alone, every `intervals.metrics`: their stimuli (and the
 recording) once per board, at step 0, the generation at every metrics step.
 Every `intervals.audio` steps in between, only the uncond cards are refreshed —
-by the same function, from the same noise draws, so the slider of `uncond_NN`
-walks one generation through training. Nothing conditioned is generated between
+by the same function, from the same noise draws, so the slider of
+`uncond generation/NN` walks one generation through training. Nothing conditioned is generated between
 metrics steps.
 
 ON DISK, `runs/<run>/audio/` holds what the Audio window shows, and nothing
@@ -1439,11 +1532,15 @@ audio/
 │   ├── conditions.npz           every array / vector the model received
 │   ├── text.txt                 the sentence the model received (text runs)
 │   ├── image.<ext>              the picture the model received (image runs)
-│   ├── info.json                which test sample, guidance, noise draw
-│   └── step_0050000_EMA.wav …   its generation at every metrics step
+│   ├── info.json                which test sample, guidance, noise draw (+ the thirds, with inpainting)
+│   ├── step_0050000_EMA.wav …   its generation at every metrics step
+│   └── step_0050000_EMA_inpaint_1_start.wav …   (inpainting) the three regenerated thirds
 ├── probe/probe_00/              a probe panel: the same, without real.wav
+│                                (+ inpaint_context.wav, the context, with inpainting)
 ├── uncond/uncond_00/            step_0025000_EMA.wav … only
 └── ground_truth/                real_test_XX.wav, in a run without conditions
+                                 (with inpainting: test/test_XX/ with real.wav, info.json
+                                 and the inpainting wavs instead)
 ```
 
 A panel's conditions are the same at every step: its folder holds one copy of
@@ -1463,7 +1560,7 @@ config still holding it gets one log line).
 
 A run conditioned ONLY on globals — no frame condition, so no waveform to put
 beside the recording — has blocks with just the recording and the generation:
-`test_XX/2_generation_test_XX`. When `text` is active, the block header carries
+`test_XX/2_generation`. When `text` is active, the block header carries
 the label of the sample (see the probe section), and every card of that sample —
 the conditions, the generation, the subset generations, the comparison images,
 the image card — sits under that one header.
@@ -1498,7 +1595,7 @@ generation still matches its prompt. A run with no frame condition has nothing
 to subset.
 
 Each subset also gets its own audio card inside every test block
-(`test_XX/4_gen_no_chroma_test_XX`), so the whole combination ladder of one
+(`test_XX/4_gen_no_chroma`), so the whole combination ladder of one
 test sample plays side by side.
 
 ### Probe sets — the ablation instrument
@@ -1753,10 +1850,10 @@ tests it on Stable Audio 3's grid; the JSON records `euler_steps` and
 
 | window | content |
 |---|---|
-| Time series | `Test/Metrics/*`: FD (`Fd_dac_*` or `Fd_encodec_*`, by the checkpoint's codec), KL (both directions), FAD-VGGish if in `metrics.enabled`, on `n_metrics_samples` test samples spread over the split, against the real test data |
-| Text | `Test/Condition_influence`: the training's panel on those same generations, at the checkpoint's step -- a row per metric of every condition (`<cond>_test`, text / image included), columns with-cond / null / Δ / valid/used; its legend; the config |
+| Time series | `Test/Metrics/*`: FD (`Fd_dac_*` or `Fd_encodec_*`, by the checkpoint's codec), KL (both directions), FAD-VGGish if in `metrics.enabled`, on `n_metrics_samples` test samples spread over the split, against the real test data; `Test/Inpainting/*` for a checkpoint trained with inpainting (the curves of *Inpainting* in §3, without the mir ones) |
+| Text | `Test/Condition_influence`: the training's panel on those same generations, at the checkpoint's step -- a row per metric of every condition (`<cond>_test`, text / image included), columns with-cond / null / Δ / valid/used, and with inpainting one block per third; its legend; the config |
 | Images | `test_XX/` and `probe_XX/`: target vs re-extracted condition |
-| Audio | `test_XX/` (recording, sonified conditions, generation), `probe_XX/` (stimuli, generation), `uncond generation/uncond_NN` |
+| Audio | `test_XX/` (recording, sonified conditions, generation), `probe_XX/` (stimuli, generation), `uncond generation/NN`; with inpainting, the inpainting cards and the probes' context |
 
 The panels are the training's: the same test samples (for the same
 `n_test_panels`), the same probe stimuli (for the same `n_probe_panels`), the
@@ -1766,7 +1863,10 @@ the training's too: a test sample carries the one stored by the preprocessing
 (the CLAP text vector of its caption when `sampling.validation_text_from_caption`
 is on), a probe the stimulus of `probe_conditions.py`. An unconditional
 checkpoint gets no table and no panels: the metrics on a single axis, the uncond
-cards, the real test recordings (`ground truth/real_test_XX`) and the config.
+cards, the real test recordings (`ground truth/real_test_XX`; with inpainting,
+the `test_XX/` groups instead) and the config. A checkpoint trained with
+inpainting only tests only the inpainting: nothing is generated from scratch, so
+there is no `Test/Metrics/` and no generation card.
 
 What the Audio window shows goes to `runs/<run>/test_outputs/`, laid out as the
 training's `audio/` folder (`test/`, `probe/`, `uncond/`, `ground_truth/` for an
@@ -1816,10 +1916,10 @@ process per GPU, stays alive as their parent and stops them all if one dies).
   to the GPU, not the optimizer state, and the N processes share one copy of
   the file in memory.
 
-**Generate / edit:** `sampling_cond.py` takes the checkpoint and the mode as
-**positional** arguments (`checkpoint` then `generate`|`edit`). The codec (DAC
-or EnCodec) is read from the checkpoint: an edit encodes the source with it, and
-every generation is decoded with it.
+**Generate / edit / inpaint:** `sampling_cond.py` takes the checkpoint and the
+mode as **positional** arguments (`checkpoint` then `generate`|`edit`|`inpaint`).
+The codec (DAC or EnCodec) is read from the checkpoint: an edit or an inpainting
+encodes the source with it, and every generation is decoded with it.
 
 ```bash
 # generate (length defaults to the checkpoint's n_frames; pass --duration to override)
@@ -1829,7 +1929,16 @@ python sampling_cond.py <ckpt> generate \
 # edit an existing file (conditions aligned to the SOURCE length)
 python sampling_cond.py <ckpt> edit --source in.wav \
     --condition_wav reference.wav --strength 0.4 --output out/
+
+# regenerate 1.5-3.0 s of an existing file, the rest kept as it is
+# (a checkpoint trained with training.inpainting; conditions as for edit)
+python sampling_cond.py <ckpt> inpaint --source in.wav \
+    --inpaint_start 1.5 --inpaint_end 3.0 --n_samples 4 --output out/
 ```
+
+An inpainting writes `--n_samples` versions, `inpaint_<tag>_NN.wav`; outside the
+span each one is the source through the codec. A checkpoint trained without
+`training.inpainting` refuses the mode.
 
 If a checkpoint requires conditions and you omit them, the script stops unless you
 pass `--allow_null_frame_conditions` / `--allow_null_global_conditions`.

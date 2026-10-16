@@ -27,7 +27,7 @@ from network_cond import (ConditionedAudioDiT,
                           ckpt_frame_reinject_every,
                           ckpt_text_cross_every, ckpt_text_ctx_dim,
                           check_ckpt_reinject_gate, ckpt_attention,
-                          ckpt_qk_norm)
+                          ckpt_qk_norm, ckpt_inpainting)
 import latent_codec as lc
 from conditions import (
     ConditionRegistry,
@@ -90,7 +90,7 @@ def euler_sampling_cfg(
     guidance=3.0, steps=50,
     frame_dims=None, global_configs=None,
     x_start=None, t_start=0.0,
-    use_amp=True, text_ctx=None, t_schedule="uniform",
+    use_amp=True, text_ctx=None, t_schedule="uniform", inpaint=None,
 ):
     model.eval()
     from_noise = x_start is None or t_start <= 0.0
@@ -109,6 +109,12 @@ def euler_sampling_cfg(
         ctx = text_ctx["tokens"].to(device)
         ctx_mask = text_ctx["mask"].to(device)
 
+    ip_m = ip_lat = ip_ctx = None
+    if inpaint is not None:
+        ip_m = inpaint[0].to(device=device, dtype=torch.float32).view(1, n_frames, 1)
+        ip_lat = inpaint[1].to(device=device, dtype=torch.float32).view(1, n_frames, -1)
+        ip_ctx = torch.cat([ip_m, ip_lat * ip_m], dim=-1)
+
     actual_start = min(max(t_start, T_MIN), T_MAX)
     grid = euler_grid(steps, T_MIN, T_MAX, t_schedule,
                       t_start=None if from_noise else actual_start)
@@ -123,28 +129,25 @@ def euler_sampling_cfg(
                 fc = frame_cond if frame_cond else null_fc
                 gc = global_cond if global_cond else null_gc
                 v_c = model(x, t, frame_conditions=fc, global_conditions=gc,
-                            text_context=ctx, text_context_mask=ctx_mask)
+                            text_context=ctx, text_context_mask=ctx_mask,
+                            inpaint_context=ip_ctx)
                 v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc,
-                            text_context=None)
+                            text_context=None, inpaint_context=ip_ctx)
                 v = v_u + guidance * (v_c - v_u)
             else:
                 v = model(x, t,
                           frame_conditions=frame_cond or null_fc,
                           global_conditions=global_cond or null_gc,
-                          text_context=ctx, text_context_mask=ctx_mask)
+                          text_context=ctx, text_context_mask=ctx_mask,
+                          inpaint_context=ip_ctx)
         x = x + v.float() * dt
 
+    if ip_m is not None:
+        x = ip_m * ip_lat + (1 - ip_m) * x
     return x[0].cpu()
 
 
-@torch.no_grad()
-def edit_audio(
-    model, normalizer, source_path, device,
-    frame_cond_builder=None, global_cond=None,
-    edit_strength=0.3, guidance=3.0, steps=50,
-    frame_dims=None, global_configs=None,
-    use_amp=True, text_ctx=None, t_schedule="uniform",
-):
+def encode_source(normalizer, source_path, device):
     spec = lc.active()
     dac_model = lc.load_model(spec.name, device, cache=False)
 
@@ -161,16 +164,25 @@ def edit_audio(
     del dac_model
     if device == "cuda":
         torch.cuda.empty_cache()
+    return normalizer.normalize(z).T.unsqueeze(0)
 
-    n_frames = z.shape[1]
+
+@torch.no_grad()
+def edit_audio(
+    model, normalizer, source_path, device,
+    frame_cond_builder=None, global_cond=None,
+    edit_strength=0.3, guidance=3.0, steps=50,
+    frame_dims=None, global_configs=None,
+    use_amp=True, text_ctx=None, t_schedule="uniform",
+):
+    spec = lc.active()
+    x1 = encode_source(normalizer, source_path, device)
+    n_frames = x1.shape[1]
 
     frame_cond = frame_cond_builder(n_frames) if frame_cond_builder is not None else None
     if frame_dims:
         print(f"  [edit] source n_frames={n_frames} -> "
               f"frame_cond={'ON' if frame_cond else 'NULL'}")
-
-    z_norm = normalizer.normalize(z)
-    x1 = z_norm.T.unsqueeze(0)
 
     if not (0.0 <= edit_strength <= 1.0):
         raise ValueError(f"--strength must be in [0, 1], got {edit_strength}")
@@ -199,6 +211,50 @@ def edit_audio(
     del dac_model
 
     return wav
+
+
+@torch.no_grad()
+def inpaint_audio(
+    model, normalizer, source_path, device, start_s, end_s,
+    frame_cond_builder=None, global_cond=None,
+    guidance=3.0, steps=50, n_samples=1,
+    frame_dims=None, global_configs=None,
+    use_amp=True, text_ctx=None, t_schedule="uniform",
+):
+    spec = lc.active()
+    x1 = encode_source(normalizer, source_path, device)
+    n_frames = x1.shape[1]
+    fps = spec.frames_per_s
+    lo = max(0, int(math.floor(start_s * fps)))
+    hi = min(n_frames, int(math.ceil(end_s * fps)))
+    if not 0.0 <= start_s < end_s or lo >= hi:
+        raise ValueError(
+            f"--inpaint_start {start_s} / --inpaint_end {end_s}: need "
+            f"0 <= start < end inside the {n_frames / fps:.2f} s of the source")
+    keep = torch.ones(n_frames)
+    keep[lo:hi] = 0.0
+
+    frame_cond = frame_cond_builder(n_frames) if frame_cond_builder is not None else None
+    print(f"  [inpaint] source {n_frames} frames ({n_frames / fps:.2f} s) | "
+          f"regenerating frames {lo}-{hi} ({lo / fps:.2f}-{hi / fps:.2f} s), "
+          f"the rest is kept as it is | "
+          f"frame_cond={'ON' if frame_cond else 'NULL'}")
+
+    dac_model = lc.load_model(spec.name, "cpu", cache=False)
+    wavs = []
+    for _ in range(int(n_samples)):
+        frames = euler_sampling_cfg(
+            model, n_frames, device,
+            frame_cond=frame_cond, global_cond=global_cond,
+            guidance=guidance, steps=steps,
+            frame_dims=frame_dims, global_configs=global_configs,
+            use_amp=use_amp, text_ctx=text_ctx, t_schedule=t_schedule,
+            inpaint=(keep, x1[0]),
+        )
+        z_out = normalizer.denormalize(frames.T)
+        wavs.append(lc.decode(dac_model, z_out.unsqueeze(0).float()).squeeze())
+    del dac_model
+    return wavs
 
 
 def build_global_cond(
@@ -336,9 +392,14 @@ def resolve_normalizer_path(ckpt: dict, ckpt_path: str, cli_path: str = None) ->
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint", type=str)
-    parser.add_argument("mode", choices=["generate", "edit"])
+    parser.add_argument("mode", choices=["generate", "edit", "inpaint"])
     parser.add_argument("--source", type=str, default=None,
-                        help="Source audio for edit mode")
+                        help="Source audio for edit and inpaint modes")
+    parser.add_argument("--inpaint_start", type=float, default=None,
+                        help="Inpaint mode: start, in seconds, of the span of "
+                             "--source to regenerate; the rest is kept")
+    parser.add_argument("--inpaint_end", type=float, default=None,
+                        help="Inpaint mode: end of that span, in seconds")
     parser.add_argument("--label", type=str, default=None,
                         help="Class name (will be used as the CLAP prompt "
                              "if --prompt is not passed)")
@@ -417,6 +478,7 @@ def main():
     text_ctx_dim = ckpt_text_ctx_dim(ckpt)
     attention = ckpt_attention(ckpt)
     qk_norm = ckpt_qk_norm(ckpt)
+    inpainting = ckpt_inpainting(ckpt)
 
     model = ConditionedAudioDiT(
         kind=ckpt.get("model_kind", "L"),
@@ -428,6 +490,7 @@ def main():
         text_ctx_dim=text_ctx_dim,
         attention=attention,
         qk_norm=qk_norm,
+        inpainting=inpainting,
         token_dim=CODEC.latent_dim,
     ).to(device)
 
@@ -559,6 +622,40 @@ def main():
         p = os.path.join(args.output, f"edit_{tag}.wav")
         sf.write(p, wav.numpy(), CODEC.sample_rate)
         print(f"  {p}")
+
+    elif args.mode == "inpaint":
+        if not inpainting:
+            print("[ERROR] this checkpoint was trained without "
+                  "training.inpainting: it has no layers to read a context. "
+                  "Use a checkpoint trained with training.inpainting: true.")
+            sys.exit(1)
+        if not args.source or args.inpaint_start is None or args.inpaint_end is None:
+            print("[ERROR] mode=inpaint needs --source, --inpaint_start and "
+                  "--inpaint_end")
+            sys.exit(1)
+
+        def _frame_cond_builder(nf):
+            return build_frame_cond(args, ckpt, nf, device)
+
+        print(f"Inpainting {args.source} | {args.inpaint_start}-"
+              f"{args.inpaint_end} s | {args.n_samples} version(s) | "
+              f"guidance={args.guidance} | "
+              f"frame_source={'ON' if has_frame_source else 'NULL'}")
+        wavs = inpaint_audio(
+            model, normalizer, args.source, device,
+            args.inpaint_start, args.inpaint_end,
+            frame_cond_builder=_frame_cond_builder,
+            global_cond=gc if gc else None,
+            guidance=args.guidance, steps=args.steps,
+            n_samples=args.n_samples,
+            frame_dims=frame_dims, global_configs=global_configs,
+            text_ctx=prompt_ctx, t_schedule=t_schedule,
+        )
+        tag = _out_tag("inpainted")
+        for i, wav in enumerate(wavs):
+            p = os.path.join(args.output, f"inpaint_{tag}_{i:02d}.wav")
+            sf.write(p, wav.numpy(), CODEC.sample_rate)
+            print(f"  {p}")
 
 
 if __name__ == "__main__":

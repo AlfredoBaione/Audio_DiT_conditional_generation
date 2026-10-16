@@ -236,7 +236,8 @@ class CrossAttention(nn.Module):
 class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, max_seq_len=4096,
                  mlp_ratio=4.0, drop=0.0, cross_attn_ctx_dim=0,
-                 attention="standard", layer_idx=0, qk_norm=False):
+                 attention="standard", layer_idx=0, qk_norm=False,
+                 inpaint_ctx_dim=0):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         if attention == "standard":
@@ -264,8 +265,15 @@ class DiTBlock(nn.Module):
             self.cross_attn = CrossAttention(hidden_size, num_heads,
                                              int(cross_attn_ctx_dim),
                                              qk_norm=qk_norm)
+        self.inpaint_embed = None
+        if int(inpaint_ctx_dim or 0) > 0:
+            self.inpaint_embed = nn.Sequential(
+                nn.Linear(int(inpaint_ctx_dim), hidden_size, bias=True),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size, bias=True),
+            )
 
-    def forward(self, x, c, ctx=None, ctx_mask=None):
+    def forward(self, x, c, ctx=None, ctx_mask=None, inpaint=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         if self.cross_attn is not None:
@@ -275,6 +283,13 @@ class DiTBlock(nn.Module):
                     "reached it; ConditionedAudioDiT.forward must pass one "
                     "(its learned null token when there is no text)")
             x = x + self.cross_attn(self.norm_cross(x), ctx, ctx_mask)
+        if self.inpaint_embed is not None:
+            if inpaint is None:
+                raise ValueError(
+                    "this DiTBlock has an inpainting context layer but no "
+                    "context reached it; ConditionedAudioDiT.forward must pass "
+                    "one (all zeros when nothing is kept)")
+            x = x + self.inpaint_embed(inpaint)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -320,6 +335,7 @@ class ConditionedAudioDiT(nn.Module):
         text_ctx_dim:         int = 0,
         attention:            str = "standard",
         qk_norm:              bool = False,
+        inpainting:           bool = False,
     ):
         super().__init__()
         cfg = self.CONFIGS[kind]
@@ -334,6 +350,8 @@ class ConditionedAudioDiT(nn.Module):
                 f"attention must be one of {ATTENTION_KINDS}, got {attention!r}")
         self.attention   = attention
         self.qk_norm     = bool(qk_norm)
+        self.inpainting  = bool(inpainting)
+        self.inpaint_ctx_dim = token_dim + 1 if self.inpainting else 0
 
         self.frame_cond_dims     = dict(frame_cond_dims)     if frame_cond_dims     else {}
         self.frame_cond_out_dims = dict(frame_cond_out_dims) if frame_cond_out_dims else {}
@@ -387,7 +405,8 @@ class ConditionedAudioDiT(nn.Module):
                      mlp_ratio=mlp_ratio, drop=drop,
                      cross_attn_ctx_dim=(self.text_ctx_dim
                                          if i in self.text_cross_layers else 0),
-                     attention=attention, layer_idx=i, qk_norm=self.qk_norm)
+                     attention=attention, layer_idx=i, qk_norm=self.qk_norm,
+                     inpaint_ctx_dim=self.inpaint_ctx_dim)
             for i in range(n_layers)
         ])
 
@@ -501,6 +520,16 @@ class ConditionedAudioDiT(nn.Module):
         else:
             print("  QK-norm: OFF")
 
+        if self.inpainting:
+            ip_params = n_layers * ((self.inpaint_ctx_dim + 1) * hidden_size
+                                    + (hidden_size + 1) * hidden_size)
+            print(f"  Inpainting context: mask + masked latent "
+                  f"({self.inpaint_ctx_dim} values per frame) -> Linear-SiLU-"
+                  f"Linear added before the FFN of every block (Stable Audio "
+                  f"3) | last layer zero-init | +{ip_params/1e6:.2f}M params")
+        else:
+            print("  Inpainting context: OFF")
+
     def initialize_weights(self):
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -533,6 +562,9 @@ class ConditionedAudioDiT(nn.Module):
             if block.cross_attn is not None:
                 nn.init.constant_(block.cross_attn.proj.weight, 0)
                 nn.init.constant_(block.cross_attn.proj.bias, 0)
+            if block.inpaint_embed is not None:
+                nn.init.constant_(block.inpaint_embed[-1].weight, 0)
+                nn.init.constant_(block.inpaint_embed[-1].bias, 0)
 
     def _gather_frame_conditions(
         self,
@@ -599,6 +631,17 @@ class ConditionedAudioDiT(nn.Module):
             mask[empty, 0] = True
         return ctx, mask
 
+    def _gather_inpaint_context(self, inpaint_context, B, T, device):
+        if inpaint_context is None:
+            return torch.zeros(B, T, self.inpaint_ctx_dim, device=device,
+                               dtype=torch.float32)
+        if tuple(inpaint_context.shape) != (B, T, self.inpaint_ctx_dim):
+            raise ValueError(
+                f"inpaint_context must be (B, T, {self.inpaint_ctx_dim}) = "
+                f"({B}, {T}, mask + {self.token_dim} masked latent values), "
+                f"got {tuple(inpaint_context.shape)}")
+        return inpaint_context.to(device=device, dtype=torch.float32)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -607,10 +650,19 @@ class ConditionedAudioDiT(nn.Module):
         global_conditions: Optional[Dict[str, torch.Tensor]] = None,
         text_context:      Optional[torch.Tensor] = None,
         text_context_mask: Optional[torch.Tensor] = None,
+        inpaint_context:   Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x.to(torch.float32)
         t = t.to(torch.float32).flatten()
         B, T, _ = x.shape
+
+        inpaint = None
+        if self.inpainting:
+            inpaint = self._gather_inpaint_context(inpaint_context, B, T, x.device)
+        elif inpaint_context is not None:
+            raise ValueError(
+                "an inpainting context was passed to a model built without "
+                "inpainting (training.inpainting: false); it would be ignored")
 
         frame_proj = None
         if self.has_frame:
@@ -641,7 +693,7 @@ class ConditionedAudioDiT(nn.Module):
                 gate = torch.repeat_interleave(
                     gate, self.frame_slot_repeats, dim=-1).unsqueeze(1)
                 x = x + reinject[str(i)](frame_proj * gate)
-            x = block(x, c, ctx, ctx_mask)
+            x = block(x, c, ctx, ctx_mask, inpaint)
 
         x = self.final_layer(x, c)
         return x
@@ -722,6 +774,29 @@ def ckpt_qk_norm(ckpt: dict) -> bool:
             f"this checkpoint says qk_norm={field!r} but its weights are "
             f"{'with' if from_weights else 'without'} the q_norm/k_norm "
             f"gains. The weights are what gets loaded; the field is wrong -- "
+            f"the checkpoint was edited or assembled by hand.")
+    return from_weights
+
+
+def ckpt_inpainting(ckpt: dict) -> bool:
+    sd = ckpt.get("model_state_dict", None)
+    if not isinstance(sd, dict) or not sd:
+        sd = ckpt.get("ema_state_dict", None)
+    from_weights = None
+    if isinstance(sd, dict) and sd:
+        from_weights = any(".inpaint_embed." in k for k in sd)
+    field = ckpt.get("inpainting", None)
+    if field is None:
+        cfg = ckpt.get("config", None)
+        if isinstance(cfg, dict):
+            field = (cfg.get("training", None) or {}).get("inpainting", None)
+    if from_weights is None:
+        return bool(field or False)
+    if field is not None and bool(field) != from_weights:
+        raise RuntimeError(
+            f"this checkpoint says inpainting={field!r} but its weights are "
+            f"{'with' if from_weights else 'without'} the inpainting context "
+            f"layers. The weights are what gets loaded; the field is wrong -- "
             f"the checkpoint was edited or assembled by hand.")
     return from_weights
 

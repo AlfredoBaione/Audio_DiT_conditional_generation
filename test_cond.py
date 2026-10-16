@@ -22,7 +22,7 @@ from network_cond import (ConditionedAudioDiT,
                           ckpt_frame_reinject_every,
                           ckpt_text_cross_every, ckpt_text_ctx_dim,
                           check_ckpt_reinject_gate, ckpt_attention,
-                          ckpt_qk_norm)
+                          ckpt_qk_norm, ckpt_inpainting)
 from conditions import ConditionRegistry
 import latent_codec as lc
 from metrics import (precompute_latent_reference, precompute_audio_reference,
@@ -283,8 +283,13 @@ def main():
     text_ctx_dim = ckpt_text_ctx_dim(ckpt)
     attention = ckpt_attention(ckpt)
     qk_norm = ckpt_qk_norm(ckpt)
+    inpainting = ckpt_inpainting(ckpt)
+    inpaint_only = inpainting and tc.inpaint_mask_probs(cfg.training)[0] == 0.0
     print(f"[test_cond] Self-attention:        {attention}")
     print(f"[test_cond] QK-norm:               {'on' if qk_norm else 'off'}")
+    print(f"[test_cond] Inpainting:            {'on' if inpainting else 'off'}"
+          + (" (inpainting only: nothing is generated from scratch)"
+             if inpaint_only else ""))
     print(f"[test_cond] Euler steps:           {cfg.sampling.euler_steps} | "
           f"t schedule: {tc.t_schedule_of(cfg.sampling)}")
 
@@ -298,6 +303,7 @@ def main():
         text_ctx_dim=text_ctx_dim,
         attention=attention,
         qk_norm=qk_norm,
+        inpainting=inpainting,
         token_dim=CODEC.latent_dim,
     ).to(device)
 
@@ -422,7 +428,8 @@ def main():
             normalizer=normalizer, writer=writer,
             n_samples=cfg.sampling.get("n_audio_samples", 4),
             sampling_cfg=cfg.sampling, frame_dims=frame_cond_dims,
-            global_configs=global_configs, output_dir=str(output_dir))
+            global_configs=global_configs, output_dir=str(output_dir),
+            inpainting=inpainting)
 
     if n_scored == 0:
         print(f"\n[test_cond] --- panels only (sampling.n_metrics_samples = 0), "
@@ -434,7 +441,8 @@ def main():
             frame_dims=frame_cond_dims, global_configs=global_configs,
             fidelity_evaluator=fidelity_evaluator, test_dataset=test_dataset,
             probe_sets=probe_sets, n_frames=n_frames, prefix=weights,
-            metrics_seed=metrics_seed, image_root=image_root)
+            metrics_seed=metrics_seed, image_root=image_root,
+            inpaint_only=inpaint_only)
         writer.close()
         if DIST.enabled:
             dist.destroy_process_group()
@@ -541,7 +549,8 @@ def main():
         fad_ref_stats=fad_ref_stats, n_fad=n_scored, fad_device=fad_device,
         probe_sets=probe_sets, image_root=image_root,
         test_dataset=test_dataset, tag_prefix="Test", split_name="test",
-        report=report, dist_info=DIST)
+        report=report, dist_info=DIST, inpaint_only=inpaint_only,
+        fad_reference=fad_mode, wav_root=cfg.paths.wav_root)
     elapsed = time.time() - t0
     writer.close()
     if DIST.enabled:

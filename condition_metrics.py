@@ -319,9 +319,15 @@ def fidelity_fn(name: str, family: str = "influence_metrics",
 LOWER_IS_BETTER = {"voicing_false_alarm", "chroma_miss_error",
                    "chroma_false_alarm_error"}
 
+METRIC_LABELS = {"corr": "Pearson corr", "beat_corr": "beat Pearson corr",
+                 "downbeat_corr": "downbeat Pearson corr",
+                 "onset_corr": "onset Pearson corr",
+                 "drum_corr": "drum Pearson corr"}
+
 
 def _metric_label(metric: str) -> str:
-    return f"{metric} ↓" if metric in LOWER_IS_BETTER else metric
+    label = METRIC_LABELS.get(metric, metric)
+    return f"{label} ↓" if metric in LOWER_IS_BETTER else label
 
 
 def pair_influence(per_sample_cond: dict, per_sample_null: dict,
@@ -821,7 +827,7 @@ class ConditionFidelityEvaluator:
         return {k: dict(v) for k, v in self._contours.items()}
 
     def add_sample(self, gen_wav_np: np.ndarray, sr: int, n_frames: int,
-                   target_cond: dict, sample_id=None):
+                   target_cond: dict, sample_id=None, frames=None):
         if gen_wav_np.ndim > 1:
             gen_wav_np = gen_wav_np.squeeze()
         gen_wav_np = np.ascontiguousarray(gen_wav_np, dtype=np.float32)
@@ -839,6 +845,9 @@ class ConditionFidelityEvaluator:
                 self._extract_errors[name] += 1
                 print(f"  [fidelity] re-extraction failed for '{name}': {e}")
                 continue
+            if frames is not None:
+                target = target[frames[0]:frames[1]]
+                generated = np.asarray(generated)[frames[0]:frames[1]]
             if sid in self._keep_ids:
                 self._contours[name][sid] = (target.copy(),
                                              np.asarray(generated).copy())
