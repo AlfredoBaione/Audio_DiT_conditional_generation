@@ -5,7 +5,7 @@ source_dir: "./Entire_music_reduced"
 output_dir: "./dataset_ready_cond"
 
 # chunking (part of the dataset identity)
-codec:           "dac"         # dac (72-d, 86.13 frames/s) | encodec (128-d, 50 frames/s)
+codec:           "dac"         # dac | encodec
 sr:              null          # null = the codec's own rate
 chunk_duration:  5.0
 chunk_overlap:   0.0

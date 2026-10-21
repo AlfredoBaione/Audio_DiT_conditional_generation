@@ -5,8 +5,7 @@ launch_training_cond.py
 GPU-lock wrapper for IRCAM servers, dedicated to the CONDITIONED training.
 
 Locks GPU(s) BEFORE importing torch, then runs training_cond.py forwarding
-all the remaining CLI arguments to it. Mirrors the unconditional launcher
-in the sister repository.
+all the remaining CLI arguments to it.
 
 Use:
     # All defaults (1 GPU, configs/training_cond_default.yaml)

@@ -320,10 +320,7 @@ def _midi_to_hz(midi) -> float:
 
 
 def _harmonic_tone(freq, n, sr, n_harmonics: int = 6) -> np.ndarray:
-    """Additive tone: fundamental + partials at 1/k. Not a bare sine -- every
-    pitch-aware extractor (chromagram included) keys off the harmonic series,
-    and a pure sine is the degenerate case that would put the extractor's
-    weakness into the target instead of the model's."""
+    """Additive tone: fundamental + partials at 1/k."""
     t = np.arange(n, dtype=np.float64) / float(sr)
     seg = np.zeros(n, dtype=np.float64)
     for h in range(1, n_harmonics + 1):
@@ -335,8 +332,7 @@ def _harmonic_tone(freq, n, sr, n_harmonics: int = 6) -> np.ndarray:
 
 
 def _fade(seg, sr, atk_s=0.015, rel_s=0.040):
-    """Short attack/release so segment boundaries do not click. A click is
-    broadband and reads as a transient, which perturbs the frames around it."""
+    """Short attack/release so segment boundaries do not click."""
     n = len(seg)
     a = min(max(1, int(atk_s * sr)), n)
     r = min(max(1, int(rel_s * sr)), n)
@@ -356,25 +352,13 @@ def _normalize(out, amp=0.25):
 def synthesize_energy(breakpoints, sr: Optional[int] = None,
                       duration_s: float = 5.0, amp: float = 0.25,
                       seed: int = 12345) -> np.ndarray:
-    """
-    Render an (level, beats) breakpoint list as an amplitude envelope applied to
-    broadband noise, exactly duration_s long.
-
-    Noise, not a tone, is the carrier on purpose: the energy condition is a
-    frequency-weighted loudness curve, so the probe should vary loudness and
-    NOTHING else. A pitched carrier would let the model reproduce the envelope
-    by tracking pitch instead, and the row would not be measuring what it says.
-
-    The noise is drawn from a FIXED seed so the stimulus is identical on every
-    machine and the cached target stays valid.
-    """
+    """(level, beats) breakpoints -> envelope on fixed-seed noise, duration_s long."""
     sr = _lc.active_sr(sr)
     n_total = int(round(duration_s * sr))
     rng = np.random.default_rng(seed)
     carrier = rng.standard_normal(n_total)
 
     total_beats = sum(float(b) for _, b in breakpoints) or 1.0
-    # Envelope by linear interpolation between breakpoints, in SAMPLES.
     xs, ys, pos = [], [], 0.0
     for level, beats in breakpoints:
         xs.append(pos / total_beats * n_total)
@@ -415,25 +399,14 @@ def synthesize_chroma(segments, sr: Optional[int] = None,
 
 def synthesize_rhythm(grid, sr: Optional[int] = None, duration_s: float = 5.0,
                       amp: float = 0.25, seed: int = 54321) -> np.ndarray:
-    """
-    Render a (bpm, beats_per_bar) grid as a click track over a quiet bed.
-
-    `bpm` may be a (start, end) pair for a linear tempo ramp; the beat times are
-    then integrated from the instantaneous tempo rather than spaced evenly, so
-    an accelerando really accelerates.
-
-    The bed matters: beat trackers are trained on music, and a signal that is
-    pure silence between impulses is out of their distribution. A quiet
-    sustained tone keeps the stimulus musical enough to be tracked while leaving
-    the clicks as the only rhythmic information.
-    """
+    """(bpm, beats_per_bar) grid -> click track over a quiet bed; bpm may be a
+    (start, end) pair for a linear tempo ramp."""
     sr = _lc.active_sr(sr)
     n_total = int(round(duration_s * sr))
     rng = np.random.default_rng(seed)
     bpm, per_bar = grid
     per_bar = int(per_bar)
 
-    # ---- beat times ----
     times = []
     if isinstance(bpm, (tuple, list)):
         b0, b1 = float(bpm[0]), float(bpm[1])
@@ -451,12 +424,10 @@ def synthesize_rhythm(grid, sr: Optional[int] = None, duration_s: float = 5.0,
 
     out = np.zeros(n_total, dtype=np.float64)
 
-    # ---- quiet sustained bed (a low fifth), well under the clicks ----
-    bed = (_harmonic_tone(_midi_to_hz(48), n_total, sr, n_harmonics=4)
+    bed =(_harmonic_tone(_midi_to_hz(48), n_total, sr, n_harmonics=4)
            + _harmonic_tone(_midi_to_hz(55), n_total, sr, n_harmonics=4))
     out += _fade(bed, sr, atk_s=0.05, rel_s=0.05) * 0.08
 
-    # ---- the clicks: filtered noise burst, brighter/louder on the downbeat ----
     for i, tsec in enumerate(times):
         start = int(round(tsec * sr))
         down = (i % per_bar) == 0
@@ -465,7 +436,7 @@ def synthesize_rhythm(grid, sr: Optional[int] = None, duration_s: float = 5.0,
         if n_click <= 0:
             continue
         burst = rng.standard_normal(n_click)
-        # one-pole high-pass -> a bright tick; the downbeat gets a stronger one
+        # one-pole high-pass
         alpha = 0.55 if down else 0.75
         for j in range(1, n_click):
             burst[j] = burst[j] - alpha * burst[j - 1]
@@ -477,34 +448,19 @@ def synthesize_rhythm(grid, sr: Optional[int] = None, duration_s: float = 5.0,
 
 def synthesize_melody(notes, sr: Optional[int] = None, duration_s: float = 5.0,
                       n_harmonics: int = 6, amp: float = 0.25) -> np.ndarray:
-    """
-    Render a (midi, beats) note list to a float32 waveform of EXACTLY
-    duration_s seconds.
-
-    The tone is additive -- fundamental plus `n_harmonics` partials at 1/k
-    amplitude -- rather than a bare sine, because a pitch tracker keys off the
-    harmonic series: a pure sine is the degenerate case where octave errors are
-    most likely, which would put CREPE's weakness, not the model's, into the
-    target. Each note gets a short attack and release so the boundaries do not
-    click (a click is broadband and reads as a transient, which can perturb the
-    frame around it).
-
-    Beat durations are relative: the whole list is scaled to fill duration_s, so
-    a melody's note count sets its tempo and every probe is the same length as
-    a training chunk.
-    """
+    """(midi, beats) notes -> additive tones with attack/release, exactly
+    duration_s long; the beats are scaled to fill it."""
     sr = _lc.active_sr(sr)
     total_beats = sum(float(d) for _, d in notes) or 1.0
     n_total = int(round(duration_s * sr))
     out = np.zeros(n_total, dtype=np.float64)
 
-    atk = max(1, int(0.015 * sr))     # 15 ms
-    rel = max(1, int(0.040 * sr))     # 40 ms
+    atk = max(1, int(0.015 * sr))
+    rel = max(1, int(0.040 * sr))
 
     pos = 0
     for k, (midi, beats) in enumerate(notes):
-        # Distribute rounding over the whole melody rather than per note, so the
-        # last note ends exactly at n_total instead of accumulating drift.
+        # cumulative rounding: the last note ends exactly at n_total
         end = int(round((sum(float(d) for _, d in notes[:k + 1]) / total_beats)
                         * n_total))
         end = min(end, n_total)
@@ -518,7 +474,7 @@ def synthesize_melody(notes, sr: Optional[int] = None, duration_s: float = 5.0,
             seg = np.zeros(n, dtype=np.float64)
             for h in range(1, n_harmonics + 1):
                 fh = f * h
-                if fh >= 0.45 * sr:          # never synthesize above Nyquist
+                if fh >= 0.45 * sr:
                     break
                 seg += np.sin(2.0 * np.pi * fh * t) / float(h)
             env = np.ones(n, dtype=np.float64)
@@ -547,10 +503,8 @@ def midi_probe_events(spec, duration_s: float = 5.0):
 
 
 def midi_probe_notes(spec, duration_s: float = 5.0):
-    """The same events as (onset, offset, pitch, is_drum) notes -- the form
-    MidiExtractor.from_notes rolls, as it rolls a MIDI file. A drum hit
-    becomes its class's first General MIDI note (36 kick, 38 snare, ...),
-    which the roll folds back into the same class."""
+    """The same events as (onset, offset, pitch, is_drum) notes; a drum hit
+    becomes its class's first General MIDI note."""
     from conditions import MIDI_DRUM_CLASSES
     pitched, drums = midi_probe_events(spec, duration_s)
     return ([(on, off, p, False) for on, off, p in pitched]
@@ -560,11 +514,8 @@ def midi_probe_notes(spec, duration_s: float = 5.0):
 
 def synthesize_midi(spec, sr: Optional[int] = None, duration_s: float = 5.0,
                     amp: float = 0.25) -> np.ndarray:
-    """A MIDI_PATTERNS entry rendered to listen to: notes as decaying harmonic
-    tones, drum hits as class-coloured bursts (condition_metrics.
-    render_midi_events, the renderer that sonifies a midi condition). Only the
-    ear uses it: the probe's TARGET is the roll of the notes themselves
-    (SYMBOLIC_TARGETS), and the generation is transcribed, not this waveform."""
+    """A MIDI_PATTERNS entry rendered to listen to; the probe's target is the
+    note roll (SYMBOLIC_TARGETS)."""
     sr = _lc.active_sr(sr)
     pitched, drums = midi_probe_events(spec, duration_s)
     return render_midi_events(pitched, drums, sr,
@@ -575,26 +526,12 @@ SYMBOLIC_TARGETS = {"midi": midi_probe_notes}
 
 
 def synthesize_text(spec, **_ignored) -> str:
-    """The stimulus IS the prompt. This exists so the banks stay uniform (every
-    condition has an entry in SYNTHESIZERS and the builder needs no special
-    case); the `**_ignored` swallows the sr / duration_s the audio synthesizers
-    take, which mean nothing to a string."""
+    """The stimulus is the prompt itself."""
     return str(spec)
 
 
 def synthesize_image(spec, size: int = 512, **_ignored) -> np.ndarray:
-    """
-    Draw one abstract stimulus -> (size, size, 3) uint8 RGB.
-
-    Purely deterministic: same spec, same pixels, on any machine and any run.
-    That is what lets the cache fingerprint below stand for the image itself,
-    and what makes panel 03 the same stimulus at every checkpoint. The one
-    stochastic kind ("noise") carries its own seed in the spec for the same
-    reason.
-
-    Rendered at 512 and left there: CLIP resizes to its own 224 internally, and
-    downscaling twice would only soften the edges that make these forms legible.
-    """
+    """One deterministic abstract stimulus -> (size, size, 3) uint8 RGB."""
     from PIL import Image, ImageDraw
 
     kind = spec.get("kind", "solid")
@@ -612,10 +549,7 @@ def synthesize_image(spec, size: int = 512, **_ignored) -> np.ndarray:
 
     if kind == "noise":
         rng = np.random.default_rng(int(spec.get("seed", 0)))
-        # Coarse blocks, not per-pixel snow: a 512x512 white-noise image is
-        # nearly uniform grey once CLIP downsamples it to 224, which would make
-        # this stimulus indistinguishable from a flat field.
-        blocks = rng.integers(0, 2, size=(16, 16), dtype=np.int8)
+        blocks =rng.integers(0, 2, size=(16, 16), dtype=np.int8)
         arr = np.where(blocks[..., None] > 0,
                        np.asarray(fg, np.uint8), np.asarray(bg, np.uint8))
         return np.asarray(Image.fromarray(arr.astype(np.uint8))

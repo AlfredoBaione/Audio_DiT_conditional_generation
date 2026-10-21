@@ -5,10 +5,10 @@ model:
   kind: 'S'                  # S | B | G | L | XL
   duration_s: 5.0
   drop: 0.0                  # FFN dropout, 0 = off
-  frame_reinject_every: 1    # 0 = frame conditions at the input only; N = re-injected every N blocks
-  text_cross_every: 0        # 0 = off; N = text cross-attention every N blocks
-  attention: standard        # standard | differential (DIFF Transformer)
-  qk_norm: true              # per-head RMSNorm on q and k before RoPE (Stable Audio 3); false = runs before it
+  frame_reinject_every: 1    # 0 = off; N = every N blocks
+  text_cross_every: 0        # 0 = off; N = every N blocks
+  attention: standard        # standard | differential
+  qk_norm: true
 
 data:
   train_batch_size: 8
@@ -22,25 +22,25 @@ data:
 training:
   num_steps: 1000001
   lr: 1.0e-4
-  lr_schedule: inverse_power # inverse_power: lr * (1 + step / lr_inv_gamma)^-lr_power (Stable Audio 3) | cosine: constant, cosine decay from decay_start_frac
+  lr_schedule: inverse_power # inverse_power | cosine
   lr_inv_gamma: 1.0e6
   lr_power: 0.5
   seed: 42
   strict_conditions: true    # false = missing conditions zero-filled (debug only)
-  weight_decay: 0.0          # Stable Audio 3: 0.01
-  weight_decay_matrices_only: true   # decay only weight matrices, not biases, norm gains, lambda vectors, null token
-  adam_betas: [0.9, 0.999]   # Stable Audio 3: [0.9, 0.95]
+  weight_decay: 0.0
+  weight_decay_matrices_only: true
+  adam_betas: [0.9, 0.999]
   adam_eps: 1.0e-8
-  grad_clip:    0.0          # 0 = off; 1.0 cuts only spikes (normal grad norm 0.1-0.3)
+  grad_clip:    0.0          # 0 = off
   use_amp:      false
-  t_sampler: logit_normal    # logit_normal | truncated_logit (truncated logit-normal shifted towards the noise, as Stable Audio 3)
-  warmup_steps: 5000         # linear, both schedules
+  t_sampler: logit_normal    # logit_normal | truncated_logit | uniform
+  warmup_steps: 5000
   decay_start_frac: 0.8      # cosine only
   use_ema:    true
   ema_decay:  0.9999
   ema_start:  5000
-  inpainting: false          # true = also learns to regenerate masked spans from the rest of the clip (Stable Audio 3)
-  inpaint_masks: [0.8, 0.1, 0.1]   # probabilities of: full mask (normal generation), 1-10 random spans, continuation
+  inpainting: false
+  inpaint_masks: [0.8, 0.1, 0.1]   # full mask, random spans, continuation
 
 intervals:
   val:     1000
@@ -53,14 +53,14 @@ sampling:
   euler_steps: 100
   t_min: 0.001
   t_max: 0.999
-  t_schedule: uniform        # uniform | logsnr_uniform (steps equally spaced in log-SNR, crowded at the noise, as Stable Audio 3 with euler_steps: 50)
+  t_schedule: uniform        # uniform | logsnr_uniform
   n_audio_samples: 4
   n_test_panels: 8
   n_probe_panels: 8
   n_metrics_samples: 512
   validation_text_from_caption: true
-  influence_subsets: []      # [] = off | ["all", "loo"] | ["all", "loo", "singletons"] | [["f0"], ["f0", "energy"]]
-  metrics_uncond: false      # true = also FD / KL / FAD of the generations without conditions
+  influence_subsets: []      # [] = off | ["all", "loo", "singletons"] | [["f0"], ["f0", "energy"]]
+  metrics_uncond: false
   metrics_samples_per_forward: 1   # 0 = serial sampler; N = N samples per forward
   n_fad_samples: 512
 
@@ -68,19 +68,19 @@ metrics:
   enabled: ["fd_dac", "kl_dac", "fad_vggish"]
   seed: 0
   fidelity_device: "cuda"    # cuda | cpu
-  influence_family: "influence_metrics"   # influence_metrics (ours) | mir_influence_metrics (mir_eval)
+  influence_family: "influence_metrics"   # influence_metrics | mir_influence_metrics
   mir_threshold: 0.5
   dac_device: "cpu"          # cpu | cuda
   fad_device: "cuda"
-  fad_reference: "wav"       # wav (real test/val audio) | decoded (real latents through the codec)
+  fad_reference: "wav"       # wav | decoded
 
 conditioning:
   p_drop_all:    0.10
   p_drop_frame:  0.05
   p_drop_global: 0.05
-  p_drop_each_frame: 0.0     # > 0 = each frame condition also dropped on its own (partial subsets)
+  p_drop_each_frame: 0.0     # > 0 = each frame condition also dropped alone
   guidance_scale: 3.0
-  text_source: caption       # audio (chunk's CLAP audio vector) | caption (CLAP text of its caption) | mix
+  text_source: caption       # audio | caption | mix
   text_mix_p: 0.5            # mix only: probability of the caption
   enabled_frame:  ["f0"]     # f0, chroma, rhythm, energy, chord, midi
   enabled_global: []         # text, image
@@ -96,4 +96,4 @@ paths:
   f0_probe_dir:   null
   run_name:       null
   resume_from:    null
-  init_from:      null       # warm start from these weights (new layers only); not with resume_from
+  init_from:      null       # warm start; not with resume_from

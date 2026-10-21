@@ -662,20 +662,8 @@ def sonify_rhythm(arr: np.ndarray, sr: int,
 
 def render_midi_events(pitched, drums, sr: int, n_samples: int,
                        amp: float = 0.3, seed: int = 4321) -> np.ndarray:
-    """Notes and drum hits -> a waveform of exactly n_samples, to LISTEN to a
-    midi condition (sonify_midi) and to a midi probe stimulus
-    (probe_conditions.synthesize_midi).
-
-    pitched: [(onset s, offset s, MIDI pitch)]; drums: [(onset s, class)] with
-    the classes of conditions.MIDI_DRUM_CLASSES. A note is four harmonics at
-    1/k with a 5 ms attack and an exponential decay, cut with a 20 ms release
-    at its offset; a drum hit is a short burst coloured by its class -- a
-    falling sine for kick and toms, noise for snare and cymbals, short for a
-    closed hi-hat, long for crash and ride. Fixed-seed noise, so the same
-    events always sound the same.
-
-    No timbre is implied: the roll does not say which instrument plays, and
-    nobody should hear a piano in it."""
+    """pitched [(onset s, offset s, MIDI pitch)] and drums [(onset s, class)]
+    -> a waveform of exactly n_samples, to listen to."""
     rng = np.random.default_rng(seed)
     out = np.zeros(int(n_samples), dtype=np.float64)
     atk, rel = max(1, int(0.005 * sr)), max(1, int(0.02 * sr))
@@ -709,8 +697,7 @@ def render_midi_events(pitched, drums, sr: int, n_samples: int,
         t = np.arange(n) / float(sr)
         env = np.exp(-t / dec)
         if hz is not None:
-            # pitch falls by half over the hit (f = hz * (1 - t / 2T)): the
-            # thump of a membrane
+            # pitch falls by half over the hit
             T = n / float(sr)
             burst = np.sin(2.0 * np.pi * hz * (t - t * t / (4.0 * T)))
         else:

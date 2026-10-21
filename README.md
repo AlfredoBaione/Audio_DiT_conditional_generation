@@ -991,6 +991,7 @@ does not say they hold for pre-training, so `training.lr` keeps its value.
 |---|---|---|---|---|
 | `logit_normal` (default) | logit-normal (0, 1), SD3's `lognorm(0.00, 1.00)`; every run before 6 Oct 2026 | 1.4% | 8.3% | 0.50 |
 | `truncated_logit` | Stable Audio 3's pre-training recipe ([arXiv 2605.17991](https://arxiv.org/abs/2605.17991)), for 431 frames | 9.9% | 2.3% | 0.34 |
+| `uniform` | uniform on [0, 1]: every `t` equally likely | 10.0% | 20.0% | 0.50 |
 
 `truncated_logit` is the two steps of their code, mirrored into this repo's convention (SA3
 has `t = 1` = noise): the logit-normal (0, 1) **truncated at 0.075 and rescaled**
@@ -1005,8 +1006,8 @@ against their code run as is: 4M draws each, largest gap between the two CDFs
 model's own estimate of the final latent along the Euler trajectory,
 `x̂₁ = x_t + (1 − t)·v`: the content of the whole clip — each channel's mean over
 the 431 frames — is 90% fixed by `t = 0.12`, where `logit_normal` puts 2.4% of
-the examples and `truncated_logit` 13%; above `t = 0.7` every time scale is already ≥ 99%
-fixed, and `logit_normal` puts 20% of the examples there, `truncated_logit` 7%. Below
+the examples, `truncated_logit` 13% and `uniform` 12%; above `t = 0.7` every time scale is already ≥ 99%
+fixed, and `logit_normal` puts 20% of the examples there, `truncated_logit` 7%, `uniform` 30%. Below
 `t = 0.01` a 200k-step run with batch 16 has seen about 7 examples in all, and
 there the model treats the noise as if it were already content.
 

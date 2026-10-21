@@ -3,7 +3,7 @@
 launch_test_cond.py
 
 GPU-lock wrapper for IRCAM servers, dedicated to the TEST of a conditioned
-checkpoint. The twin of launch_training_cond.py.
+checkpoint.
 
 Locks GPU(s) BEFORE importing torch, then runs test_cond.py forwarding
 all the remaining CLI arguments to it.

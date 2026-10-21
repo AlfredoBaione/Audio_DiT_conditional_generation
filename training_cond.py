@@ -597,7 +597,11 @@ def sample_logit_normal(batch_size, device, t_min, t_max, mean=0.0, std=1.0):
     return torch.sigmoid(u).clamp(t_min, t_max)
 
 
-T_SAMPLERS = ("logit_normal", "truncated_logit")
+def sample_t_uniform(batch_size, device, t_min, t_max):
+    return torch.rand(batch_size, device=device).clamp(t_min, t_max)
+
+
+T_SAMPLERS = ("logit_normal", "truncated_logit", "uniform")
 T_SAMPLER_RENAMED = {"sa3": "truncated_logit"}
 
 INPAINT_MASKS_DEFAULT = (0.8, 0.1, 0.1)
@@ -647,6 +651,8 @@ def t_sampler_cdf(t_sampler, x, seq_len):
         u_x = torch.sigmoid(torch.logit(x) + length_shift_mu(seq_len))
         s_x = T_TRUNC + (1.0 - T_TRUNC) * u_x
         return float((torch.special.ndtr(torch.logit(s_x)) - lo) / (1.0 - lo))
+    if t_sampler == "uniform":
+        return float(x)
     return float(torch.special.ndtr(torch.logit(x)))
 
 
@@ -771,6 +777,8 @@ def compute_loss(model, batch, device, use_amp, t_min, t_max,
     if t is None:
         if t_sampler == "truncated_logit":
             t = sample_t_truncated_logit(B, device, t_min, t_max, seq_len=x1.shape[1])
+        elif t_sampler == "uniform":
+            t = sample_t_uniform(B, device, t_min, t_max)
         else:
             t = sample_logit_normal(B, device, t_min, t_max)
     else:
@@ -4569,7 +4577,8 @@ if __name__ == "__main__":
           + (f"(Stable Audio 3: logit-normal truncated at {T_TRUNC} and "
              f"rescaled, shift mu={length_shift_mu(n_frames):.4f} for {n_frames} "
              f"frames, alpha={math.exp(length_shift_mu(n_frames)):.2f})"
-             if T_SAMPLER == "truncated_logit" else "(logit-normal (0, 1))")
+             if T_SAMPLER == "truncated_logit" else "(uniform (0, 1))"
+             if T_SAMPLER == "uniform" else "(logit-normal (0, 1))")
           + f" | draws with t < 0.1 (noise end): {100 * _t_lo:.1f}%, "
             f"t > 0.8 (data end): {100 * _t_hi:.1f}% | the val loss keeps its "
             f"fixed logit-normal t, comparable across samplers")
