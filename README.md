@@ -1078,11 +1078,17 @@ given to the model as context, and it regenerates the others.
 
 ```yaml
 training:
-  inpainting: false               # true: build the context layers, train with masks
-  inpaint_masks: [0.8, 0.1, 0.1]  # probability of: full mask (generate from scratch),
-                                  # 1-10 random spans, continuation (a prefix kept)
+  inpainting: false                      # true: build the context layers, train with masks
+  inpaint_masks: [0.8, 0.1, 0.05, 0.05]  # probability of: full mask (generate from scratch),
+                                         # 1-5 random spans, continuation (a prefix kept),
+                                         # backward continuation (a suffix kept)
 ```
 
+- **The masks.** The continuation keeps a prefix of random length and
+  regenerates the rest; the backward continuation keeps a suffix of random
+  length and regenerates everything before it. SA3 draws 1-10 spans and has no
+  backward continuation. Three numbers, as in the configs of before, mean a
+  fourth at 0: the same masks as before, with the same random draws.
 - **The model.** The context is the mask plus the latent times the mask (73
   channels with DAC, 129 with EnCodec). Every block adds it through its own
   Linear-SiLU-Linear, the last layer zero-initialised, between the

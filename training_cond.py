@@ -604,7 +604,7 @@ def sample_t_uniform(batch_size, device, t_min, t_max):
 T_SAMPLERS = ("logit_normal", "truncated_logit", "uniform")
 T_SAMPLER_RENAMED = {"sa3": "truncated_logit"}
 
-INPAINT_MASKS_DEFAULT = (0.8, 0.1, 0.1)
+INPAINT_MASKS_DEFAULT = (0.8, 0.1, 0.05, 0.05)
 
 
 def inpaint_mask_probs(train_cfg):
@@ -615,12 +615,13 @@ def inpaint_mask_probs(train_cfg):
         p = tuple(float(x) for x in v)
     except (TypeError, ValueError):
         p = ()
-    if len(p) != 3 or min(p) < 0.0 or not math.isclose(sum(p), 1.0, abs_tol=1e-6):
+    if len(p) not in (3, 4) or min(p) < 0.0 or not math.isclose(sum(p), 1.0, abs_tol=1e-6):
         raise SystemExit(
-            f"[config] training.inpaint_masks = {v!r}, must be three "
-            f"probabilities [full mask, random spans, continuation] that sum "
-            f"to 1, e.g. [0.8, 0.1, 0.1]. Nothing was run.")
-    return p
+            f"[config] training.inpaint_masks = {v!r}, must be three or four "
+            f"probabilities [full mask, random spans, continuation, backward "
+            f"continuation] that sum to 1, e.g. [0.8, 0.1, 0.05, 0.05]. "
+            f"Nothing was run.")
+    return p + (0.0,) * (4 - len(p))
 
 
 T_TRUNC = 0.075
@@ -724,7 +725,7 @@ def apply_cfg_dropout(frame_cond, global_cond, device, global_configs, B,
 VALIDATION_PROTOCOL = "fixed_subset_common_noise_sample_weighted_v2"
 
 INPAINT_WINDOWS = ("1_start", "2_middle", "3_end")
-INPAINT_MAX_SPANS = 10
+INPAINT_MAX_SPANS = 5
 
 
 def inpaint_thirds(n_frames):
@@ -740,7 +741,7 @@ def inpaint_keep_window(B, n_frames, lo, hi):
 
 def random_inpaint_keep(B, n_frames, probs):
     keep = torch.ones(B, n_frames)
-    p_full, p_spans, _ = probs
+    p_full, p_spans, _, p_back = probs
     for i in range(B):
         u = float(torch.rand(()))
         if u < p_full:
@@ -752,6 +753,8 @@ def random_inpaint_keep(B, n_frames, probs):
                 ln = int(torch.randint(1, max_len + 1, ()))
                 s = int(torch.randint(0, n_frames - ln + 1, ()))
                 keep[i, s:s + ln] = 0.0
+        elif u >= 1.0 - p_back:
+            keep[i, :int(torch.randint(0, n_frames + 1, ()))] = 0.0
         else:
             keep[i, int(torch.randint(0, n_frames + 1, ())):] = 0.0
     return keep
@@ -4600,8 +4603,9 @@ if __name__ == "__main__":
     if INPAINTING:
         _fps = lc.active().frames_per_s
         print(f"Inpainting training (Stable Audio 3): masks full / 1-"
-              f"{INPAINT_MAX_SPANS} spans / continuation = {IP_PROBS[0]:g} / "
-              f"{IP_PROBS[1]:g} / {IP_PROBS[2]:g} | Train/Loss = "
+              f"{INPAINT_MAX_SPANS} spans / continuation / backward continuation "
+              f"= {IP_PROBS[0]:g} / {IP_PROBS[1]:g} / {IP_PROBS[2]:g} / "
+              f"{IP_PROBS[3]:g} | Train/Loss = "
               f"Loss_generated + Loss_context | validation thirds "
               + ", ".join(f"{w} {lo / _fps:.2f}-{hi / _fps:.2f} s"
                           for w, (lo, hi) in zip(INPAINT_WINDOWS, IP_THIRDS))
