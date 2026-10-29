@@ -81,12 +81,12 @@ def set_dac_device(device: str):
     dev = str(device).strip().lower()
     if dev not in ("cpu", "cuda") and not dev.startswith("cuda:"):
         raise ValueError(
-            f"metrics.dac_device must be 'cpu', 'cuda' or 'cuda:<n>', got "
+            f"metrics.codec_device must be 'cpu', 'cuda' or 'cuda:<n>', got "
             f"{device!r}."
         )
     if dev.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(
-            f"metrics.dac_device={device!r} but CUDA is not available. Set it to "
+            f"metrics.codec_device={device!r} but CUDA is not available. Set it to "
             f"'cpu' (the default) to decode on the CPU."
         )
     if _DAC_MODEL is not None and dev != _DAC_DEVICE:
@@ -323,6 +323,9 @@ def merge_cli_overrides(cfg, dotlist, where):
             OBSOLETE_SAMPLING_KEYS[k.partition(".")[2]] for k in bad
             if k.startswith("sampling.")
             and k.partition(".")[2] in OBSOLETE_SAMPLING_KEYS)
+        notes.update(dict.fromkeys(
+            f"{k} is now called {RENAMED_KEYS[k]}." for k in bad
+            if k in RENAMED_KEYS))
         _hint = "".join(f"\n          {n}" for n in notes)
         raise SystemExit(
             f"[config] unknown CLI override key(s): {bad or [str(e)]}\n"
@@ -1155,9 +1158,16 @@ OBSOLETE_SAMPLING_KEYS = {
         "probe/ (each panel with everything it was conditioned on) and "
         "uncond/."),
 }
+RENAMED_KEYS = {"metrics.dac_device": "metrics.codec_device"}
 
 
 def drop_obsolete_sampling_keys(cfg):
+    for _from, _to in RENAMED_KEYS.items():
+        _sec, _, _key = _from.partition(".")
+        _node = cfg.get(_sec, None)
+        if _node is not None and _key in _node:
+            _node[_to.partition(".")[2]] = _node.pop(_key)
+            print(f"[config] {_from} is now called {_to}.")
     smp = cfg.get("sampling", None)
     if smp is None:
         return
@@ -3774,7 +3784,7 @@ if __name__ == "__main__":
             sys.stdout = open(os.devnull, "w")
     print(f"[RUN NAME] {run_name}")
 
-    set_dac_device(cfg.metrics.get("dac_device", "cpu"))
+    set_dac_device(cfg.metrics.get("codec_device", "cpu"))
 
     CODEC = lc.activate(lc.dataset_codec(cfg.paths.dataset_root))
     print(f"[codec] {CODEC.name} (from the dataset): {CODEC.sample_rate} Hz, "

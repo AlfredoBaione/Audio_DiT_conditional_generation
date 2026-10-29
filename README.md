@@ -1157,14 +1157,14 @@ metrics:
                                   # escape hatch if the metrics step runs out of
                                   # VRAM (there the model and the generations are
                                   # resident, plus the codec decoder itself when
-                                  # dac_device is "cuda").
+                                  # codec_device is "cuda").
   influence_family: "influence_metrics"   # | "mir_influence_metrics" — which
                                   # metrics are the columns of the
                                   # Condition_influence table: ours, or
                                   # mir_eval's. See below.
   mir_threshold: 0.5              # when a chroma / chord pitch class counts as
                                   # ON for the mir metrics. Fixed once.
-  dac_device: "cpu"               # "cpu" (default) | "cuda" — where the shared
+  codec_device: "cpu"             # "cpu" (default) | "cuda" — where the shared
                                   # codec decoder (DAC or EnCodec) lives. See
                                   # below: this is the one device knob that is
                                   # not free.
@@ -1220,9 +1220,9 @@ has them scores 0. The startup line
 each condition got. The training is untouched; switching the family changes the
 columns, so compare runs within one family.
 
-#### `dac_device` — the one device knob that is not free
+#### `codec_device` — the one device knob that is not free
 
-The key keeps its name, but it places the decoder of the dataset's codec, DAC or
+It places the decoder of the dataset's codec, DAC or
 EnCodec. The other two change speed only. This one trades **wall clock against
 VRAM**, and slightly changes the values, so it has its own section.
 
@@ -1845,7 +1845,7 @@ sampling:
 ```
 
 The command line wins over both: dotlist overrides as for the training (e.g.
-`sampling.n_metrics_samples=all metrics.dac_device=cuda`), plus the shortcuts
+`sampling.n_metrics_samples=all metrics.codec_device=cuda`), plus the shortcuts
 `--metrics_samples N|all`, `--n_samples` (= `n_test_panels`), `--steps`,
 `--guidance`, `--seed`, `--duration_s`. A key that does not exist stops the test.
 The Euler grid is the checkpoint's `sampling.t_schedule` (`uniform` for a
@@ -1882,7 +1882,7 @@ unconditional checkpoint; one generation per tested checkpoint), the numbers to
 of every checkpoint tested on the slider: `tensorboard --logdir runs/<run>/test_logs --samples_per_plugin text=0`.
 The cost is the generation: hours for a full test split with 100 Euler steps;
 `n_metrics_samples: 0` writes only the panels and the uncond cards. The codec
-decoder (DAC or EnCodec) runs on `metrics.dac_device` from the checkpoint's config unless
+decoder (DAC or EnCodec) runs on `metrics.codec_device` from the checkpoint's config unless
 overridden on the command line.
 
 FAD needs the real TEST audio. With `metrics.fad_reference: wav` the test wavs

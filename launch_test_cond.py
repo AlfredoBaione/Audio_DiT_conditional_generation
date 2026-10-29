@@ -22,7 +22,7 @@ Use:
 
     # CLI overrides (passed straight to test_cond.py)
     python launch_test_cond.py --ckpt <ckpt> \\
-        sampling.n_test_panels=4 metrics.dac_device=cuda
+        sampling.n_test_panels=4 metrics.codec_device=cuda
 
     # Multi-GPU (only --num-gpus is interpreted by the launcher;
     #  everything else goes to test_cond.py)

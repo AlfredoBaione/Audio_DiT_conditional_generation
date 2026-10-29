@@ -123,6 +123,7 @@ def load_config():
         raise FileNotFoundError(f"Test config not found: {args.config}")
     cfg = OmegaConf.merge(cfg, OmegaConf.load(args.config))
     print(f"[test_cond] Test config: {args.config}")
+    tc.drop_obsolete_sampling_keys(cfg)
 
     cfg = tc.merge_cli_overrides(
         cfg, unknown, f"the checkpoint's config + {args.config}")
@@ -243,7 +244,7 @@ def main():
     writer = (SummaryWriter(str(log_dir)) if DIST.is_main
               else tc.NullWriter(fixed_dir=str(log_dir)))
 
-    tc.set_dac_device(cfg.metrics.get("dac_device", "cpu"))
+    tc.set_dac_device(cfg.metrics.get("codec_device", "cpu"))
 
     print("\n[test_cond] Loading checkpoint...")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False,
@@ -575,7 +576,7 @@ def main():
         "mir_threshold": mir_threshold,
         "text_from_caption": bool(cfg.sampling.get(
             "validation_text_from_caption", False)),
-        "dac_device": str(cfg.metrics.get("dac_device", "cpu")),
+        "codec_device": str(cfg.metrics.get("codec_device", "cpu")),
         "gpus": DIST.world,
         "minutes": round(elapsed / 60, 2),
         **report,

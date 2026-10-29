@@ -70,7 +70,7 @@ metrics:
   fidelity_device: "cuda"    # cuda | cpu
   influence_family: "influence_metrics"   # influence_metrics | mir_influence_metrics
   mir_threshold: 0.5
-  dac_device: "cpu"          # cpu | cuda
+  codec_device: "cpu"        # cpu | cuda
   fad_device: "cuda"
   fad_reference: "wav"       # wav | decoded
 
