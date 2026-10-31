@@ -65,7 +65,7 @@ sampling:
   n_fad_samples: 512
 
 metrics:
-  enabled: ["fd_dac", "kl_dac", "fad_vggish"]
+  enabled: ["fd_codec", "kl_codec", "fad_vggish"]
   seed: 0
   fidelity_device: "cuda"    # cuda | cpu
   influence_family: "influence_metrics"   # influence_metrics | mir_influence_metrics

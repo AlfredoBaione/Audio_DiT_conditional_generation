@@ -61,7 +61,7 @@ from conditions import (
 from sampling_cond import T_SCHEDULES, T_SCHEDULE_RENAMED, euler_grid
 from metrics import (
     precompute_latent_reference,
-    compute_dac_metrics,
+    compute_codec_metrics,
     precompute_audio_reference,
     compute_audio_mu_sigma,
     compute_mu_sigma,
@@ -72,12 +72,12 @@ from metrics import (
 )
 
 
-_DAC_MODEL  = None
-_DAC_DEVICE = "cpu"
+_CODEC_MODEL  = None
+_CODEC_DEVICE = "cpu"
 
 
-def set_dac_device(device: str):
-    global _DAC_DEVICE
+def set_codec_device(device: str):
+    global _CODEC_DEVICE
     dev = str(device).strip().lower()
     if dev not in ("cpu", "cuda") and not dev.startswith("cuda:"):
         raise ValueError(
@@ -89,38 +89,38 @@ def set_dac_device(device: str):
             f"metrics.codec_device={device!r} but CUDA is not available. Set it to "
             f"'cpu' (the default) to decode on the CPU."
         )
-    if _DAC_MODEL is not None and dev != _DAC_DEVICE:
+    if _CODEC_MODEL is not None and dev != _CODEC_DEVICE:
         raise RuntimeError(
-            f"set_dac_device({device!r}) called after the DAC was already loaded "
-            f"on {_DAC_DEVICE!r}. The device must be chosen before the first "
-            f"get_dac()."
+            f"set_codec_device({device!r}) called after the codec was already loaded "
+            f"on {_CODEC_DEVICE!r}. The device must be chosen before the first "
+            f"get_codec()."
         )
-    _DAC_DEVICE = dev
+    _CODEC_DEVICE = dev
 
 
-def get_dac():
-    global _DAC_MODEL
-    if _DAC_MODEL is None:
+def get_codec():
+    global _CODEC_MODEL
+    if _CODEC_MODEL is None:
         if lc.active().name == "dac_44khz":
             import dac
-            _DAC_MODEL = dac.DAC.load(dac.utils.download(model_type="44khz"))
-            _DAC_MODEL.to(_DAC_DEVICE)
-            _DAC_MODEL.eval()
+            _CODEC_MODEL = dac.DAC.load(dac.utils.download(model_type="44khz"))
+            _CODEC_MODEL.to(_CODEC_DEVICE)
+            _CODEC_MODEL.eval()
         else:
-            _DAC_MODEL = lc.load_model(lc.active().name, _DAC_DEVICE)
-        dev = next(_DAC_MODEL.parameters()).device
+            _CODEC_MODEL = lc.load_model(lc.active().name, _CODEC_DEVICE)
+        dev = next(_CODEC_MODEL.parameters()).device
         print(f"[{lc.active().label}] Model loaded once ({str(dev).upper()}) "
               f"and cached for the whole run.")
-    return _DAC_MODEL
+    return _CODEC_MODEL
 
 
-def decode_frames_to_wav(frames, normalizer, dac_model):
+def decode_frames_to_wav(frames, normalizer, codec_model):
     z = normalizer.denormalize(frames.T)
-    z = z.unsqueeze(0).float().to(next(dac_model.parameters()).device)
-    if not lc.is_dac(dac_model):
-        return lc.decode(dac_model, z).squeeze().detach().cpu()
-    z_q, _, _ = dac_model.quantizer.from_latents(z)
-    return dac_model.decode(z_q).squeeze().detach().cpu()
+    z = z.unsqueeze(0).float().to(next(codec_model.parameters()).device)
+    if not lc.is_dac(codec_model):
+        return lc.decode(codec_model, z).squeeze().detach().cpu()
+    z_q, _, _ = codec_model.quantizer.from_latents(z)
+    return codec_model.decode(z_q).squeeze().detach().cpu()
 
 
 _FITTING_GROUP = {}
@@ -241,14 +241,14 @@ def _validate_cache(cache_dir, fingerprint, guarded_files):
             print(f"[cache] verified against {meta_path} -> reusing cache.")
             return
         raise SystemExit(
-            "[cache] STALE CACHE: the cached normalizer / FD-DAC reference in\n"
+            "[cache] STALE CACHE: the cached normalizer / FD-codec reference in\n"
             f"  {cache_dir}\n"
             "were computed on a DIFFERENT dataset/duration/split than the current "
             "run, so reusing them would silently corrupt normalization and FD/KL.\n"
             f"  cached : {json.dumps(old,  sort_keys=True)}\n"
             f"  current: {json.dumps(fingerprint, sort_keys=True)}\n"
             "Point paths.cache_dir to a fresh directory, or delete "
-            "normalizer.pt / fd_dac_ref_stats.pt / cache_meta.json there.")
+            "normalizer.pt / fd_codec_ref_stats.pt / cache_meta.json there.")
 
     if present:
         raise SystemExit(
@@ -1150,7 +1150,7 @@ OBSOLETE_SAMPLING_KEYS = {
     "n_influence_samples_probe": _PANELS_NOTE,
     "n_similarity_samples": (
         "The text / image similarity is a column of the Condition_influence "
-        "table, on the same generations as FD-DAC / KL / FAD; it has no "
+        "table, on the same generations as FD-codec / KL / FAD; it has no "
         "curve of its own any more."),
     "n_val_save": (
         "The validation generations are no longer written to disk: "
@@ -1159,6 +1159,7 @@ OBSOLETE_SAMPLING_KEYS = {
         "uncond/."),
 }
 RENAMED_KEYS = {"metrics.dac_device": "metrics.codec_device"}
+RENAMED_METRICS = {"fd_dac": "fd_codec", "kl_dac": "kl_codec"}
 
 
 def drop_obsolete_sampling_keys(cfg):
@@ -1168,6 +1169,13 @@ def drop_obsolete_sampling_keys(cfg):
         if _node is not None and _key in _node:
             _node[_to.partition(".")[2]] = _node.pop(_key)
             print(f"[config] {_from} is now called {_to}.")
+    _met = cfg.get("metrics", None)
+    _enabled = _met.get("enabled", None) if _met is not None else None
+    if _enabled is not None:
+        _new = [RENAMED_METRICS.get(m, m) for m in _enabled]
+        if _new != list(_enabled):
+            print(f"[config] metrics.enabled: {list(_enabled)} is now called {_new}.")
+            _met["enabled"] = _new
     smp = cfg.get("sampling", None)
     if smp is None:
         return
@@ -1233,7 +1241,7 @@ def generate_and_log_uncond_cards(
     n_cards = max(0, int(n_cards or 0))
     if n_cards <= 0:
         return
-    dac_model = get_dac()
+    codec_model = get_codec()
     gen_rng = None
     if metrics_seed is not None:
         gen_rng = torch.Generator(device=device)
@@ -1258,7 +1266,7 @@ def generate_and_log_uncond_cards(
             print(f"    [uncond] {uncond_card_tag(k)}: non-finite generation, "
                   f"not logged")
             continue
-        wav = decode_frames_to_wav(gen, normalizer, dac_model)
+        wav = decode_frames_to_wav(gen, normalizer, codec_model)
         writer.add_audio(uncond_card_tag(k), norm_wav(wav), global_step=step,
                          sample_rate=lc.active().sample_rate)
         sf.write(os.path.join(_panel_dir(output_dir, "uncond", k),
@@ -1272,7 +1280,7 @@ def log_real_audio_samples(test_dataset, normalizer, writer,
                            global_configs=None, output_dir=None, dist_info=None,
                            inpainting=False):
     mine = dist_mine(dist_info)
-    dac_model = get_dac()
+    codec_model = get_codec()
     conditioned = bool(frame_dims or global_configs)
     panel = conditioned or bool(inpainting)
     if conditioned:
@@ -1299,7 +1307,7 @@ def log_real_audio_samples(test_dataset, normalizer, writer,
         if not pending and disk is None:
             continue
         frames = ds[idx][0]
-        waveform = decode_frames_to_wav(frames, normalizer, dac_model).unsqueeze(0)
+        waveform = decode_frames_to_wav(frames, normalizer, codec_model).unsqueeze(0)
         if disk is not None:
             os.makedirs(os.path.dirname(disk), exist_ok=True)
             sf.write(disk, waveform[0].numpy(), lc.active().sample_rate)
@@ -1322,7 +1330,7 @@ _PROBE_CONTEXT_CACHE = {}
 
 
 @torch.no_grad()
-def probe_inpaint_context(probe_sets, names, i, n_frames, normalizer, dac_model):
+def probe_inpaint_context(probe_sets, names, i, n_frames, normalizer, codec_model):
     from probe_conditions import _normalize
     spec = lc.active()
     key = (tuple((c, probe_sets[c].dir, probe_sets[c].names[i]) for c in names),
@@ -1342,8 +1350,8 @@ def probe_inpaint_context(probe_sets, names, i, n_frames, normalizer, dac_model)
         if rms > 0:
             mix += y / rms
     wav = _normalize(mix, PROBE_CONTEXT_PEAK)
-    dev = next(dac_model.parameters()).device
-    z = lc.encode(dac_model, torch.from_numpy(wav).view(1, 1, -1).to(dev),
+    dev = next(codec_model.parameters()).device
+    z = lc.encode(codec_model, torch.from_numpy(wav).view(1, 1, -1).to(dev),
                   spec.sample_rate)
     frames = normalizer.normalize(z[0].float().cpu()).T.contiguous()
     if frames.shape[0] != int(n_frames):
@@ -1359,7 +1367,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                     step, writer, device,
                     output_dir, use_amp, sampling_cfg, guidance,
                     frame_dims, global_configs, fidelity_evaluator,
-                    dac_model, prefix, n_plot,
+                    codec_model, prefix, n_plot,
                     metrics_seed=None, mine=None, inpainting=False,
                     inpaint_only=False):
     from probe_conditions import plot_condition_comparison
@@ -1488,7 +1496,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
     fidelity_evaluator.keep_contours_for(own)
     wavs = {}
     for i, lat in cond_lat.items():
-        wav = decode_frames_to_wav(lat, normalizer, dac_model)
+        wav = decode_frames_to_wav(lat, normalizer, codec_model)
         if names:
             fidelity_evaluator.add_sample(
                 wav.numpy(), lc.active().sample_rate, n_frames,
@@ -1504,9 +1512,9 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         contexts = {}
         for i in own:
             contexts[i], ctx_wavs[i] = probe_inpaint_context(
-                probe_sets, names, i, n_frames, normalizer, dac_model)
+                probe_sets, names, i, n_frames, normalizer, codec_model)
         for w, window in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
-            ip_wavs[w] = {i: decode_frames_to_wav(z, normalizer, dac_model)
+            ip_wavs[w] = {i: decode_frames_to_wav(z, normalizer, codec_model)
                           for i, z in _generate(contexts, window).items()}
 
     for i in own:
@@ -1782,7 +1790,7 @@ def test_text_given(dataset, idx, vec, wants_ctx):
 def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     step, writer, device, output_dir, use_amp, sampling_cfg,
                     guidance, frame_dims, global_configs, fidelity_evaluator,
-                    dac_model, prefix, metrics_seed=None, text_vec_for=None,
+                    codec_model, prefix, metrics_seed=None, text_vec_for=None,
                     subset_specs=(), image_root=None, mine=None,
                     inpainting=False, inpaint_only=False):
     from probe_conditions import plot_condition_comparison
@@ -1894,7 +1902,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
         fidelity_evaluator.keep_contours_for(own)
     wavs = {}
     for j, z in lat.items():
-        wav = decode_frames_to_wav(z, normalizer, dac_model)
+        wav = decode_frames_to_wav(z, normalizer, codec_model)
         if use_ev:
             fidelity_evaluator.add_sample(
                 wav.numpy(), lc.active().sample_rate, n_frames,
@@ -1909,13 +1917,13 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
     for _lab, _names in (subset_specs or ()):
         if tuple(_names) == _full:
             continue
-        ladder[_lab] = {j: decode_frames_to_wav(z, normalizer, dac_model)
+        ladder[_lab] = {j: decode_frames_to_wav(z, normalizer, codec_model)
                         for j, z in _generate(subset=set(_names)).items()}
 
     ip_wavs = {}
     if inpainting:
         for w, window in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
-            ip_wavs[w] = {j: decode_frames_to_wav(z, normalizer, dac_model)
+            ip_wavs[w] = {j: decode_frames_to_wav(z, normalizer, codec_model)
                           for j, z in _generate(window=window).items()}
 
     img_failed, img_shown = None, 0
@@ -1968,7 +1976,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
             if fixed_card_pending(writer, tags["conditions"][cname]):
                 writer.add_audio(tags["conditions"][cname], norm_wav(son),
                                  global_step=0, sample_rate=lc.active().sample_rate)
-        real = decode_frames_to_wav(items[k][0], normalizer, dac_model)
+        real = decode_frames_to_wav(items[k][0], normalizer, codec_model)
         if fixed_card_pending(writer, tags["real"]):
             writer.add_audio(tags["real"], norm_wav(real),
                              global_step=0, sample_rate=lc.active().sample_rate)
@@ -2038,7 +2046,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
 def run_uncond_inpaint_panels(test_dataset, ds_indices, model, normalizer,
                               n_frames, step, writer, device, output_dir,
                               use_amp, sampling_cfg, frame_dims, global_configs,
-                              dac_model, prefix, metrics_seed=None, mine=None):
+                              codec_model, prefix, metrics_seed=None, mine=None):
     n = len(ds_indices)
     if n == 0:
         return
@@ -2070,11 +2078,11 @@ def run_uncond_inpaint_panels(test_dataset, ds_indices, model, normalizer,
                 frame_cond=None, global_cond=None, guidance=1.0,
                 frame_dims=frame_dims, global_configs=global_configs,
                 gen_rng=gen_rng, inpaint=(keep, frames[j]))
-            ip_wavs[w][j] = decode_frames_to_wav(z, normalizer, dac_model)
+            ip_wavs[w][j] = decode_frames_to_wav(z, normalizer, codec_model)
 
     for k in own:
         tags = audio_panel_tags("test", k, conditioned=True, generation=False)
-        real = decode_frames_to_wav(frames[k], normalizer, dac_model)
+        real = decode_frames_to_wav(frames[k], normalizer, codec_model)
         if fixed_card_pending(writer, tags["real"]):
             writer.add_audio(tags["real"], norm_wav(real), global_step=0,
                              sample_rate=sr)
@@ -2147,7 +2155,7 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
     if di is not None and not all(dist_all_gather_object(bool(probe_sets), di)):
         mine_probe = None
     dist_record(writer, di)
-    dac_model = get_dac()
+    codec_model = get_codec()
     subset_specs = []
     if fidelity_evaluator is not None and fidelity_evaluator.active:
         subset_specs = resolve_influence_subsets(
@@ -2168,7 +2176,7 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                     output_dir=output_dir, use_amp=use_amp,
                     sampling_cfg=sampling_cfg, guidance=guidance,
                     frame_dims=frame_dims, global_configs=global_configs,
-                    fidelity_evaluator=fidelity_evaluator, dac_model=dac_model,
+                    fidelity_evaluator=fidelity_evaluator, codec_model=codec_model,
                     prefix=prefix, metrics_seed=metrics_seed,
                     text_vec_for=text_vec_for, subset_specs=subset_specs,
                     image_root=image_root, mine=mine, inpainting=inpainting,
@@ -2190,7 +2198,7 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                     n_frames=n_frames, step=step, writer=writer, device=device,
                     output_dir=output_dir, use_amp=use_amp,
                     sampling_cfg=sampling_cfg, frame_dims=frame_dims,
-                    global_configs=global_configs, dac_model=dac_model,
+                    global_configs=global_configs, codec_model=codec_model,
                     prefix=prefix, metrics_seed=metrics_seed, mine=mine)
             except Exception as _e:
                 print(f"    [inpainting panels] SKIPPED at step {step}: "
@@ -2219,7 +2227,7 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                     sampling_cfg=sampling_cfg,
                     guidance=guidance, frame_dims=frame_dims,
                     global_configs=global_configs,
-                    fidelity_evaluator=fidelity_evaluator, dac_model=dac_model,
+                    fidelity_evaluator=fidelity_evaluator, codec_model=codec_model,
                     prefix=prefix, n_plot=_npanel,
                     metrics_seed=metrics_seed, mine=mine_probe,
                     inpainting=inpainting, inpaint_only=inpaint_only,
@@ -2261,7 +2269,7 @@ INPAINT_LEGEND = (
 _INPAINT_REF_CACHE = {}
 
 
-def _inpaint_real_wav(val_dataset, idx, normalizer, dac_model, fad_reference,
+def _inpaint_real_wav(val_dataset, idx, normalizer, codec_model, fad_reference,
                       wav_root, n_frames):
     if fad_reference == "wav" and wav_root:
         npy_path, _cp, start, _lab, _cls = val_dataset.samples[idx]
@@ -2272,7 +2280,7 @@ def _inpaint_real_wav(val_dataset, idx, normalizer, dac_model, fad_reference,
         a = int(round(int(start) * per_frame))
         b = int(round((int(start) + n_frames) * per_frame))
         return torch.from_numpy(data[a:b].mean(axis=1).copy()), sr, per_frame
-    return (decode_frames_to_wav(val_dataset[idx][0], normalizer, dac_model),
+    return (decode_frames_to_wav(val_dataset[idx][0], normalizer, codec_model),
             lc.active().sample_rate, float(lc.active().hop_length))
 
 
@@ -2331,7 +2339,7 @@ def evaluate_inpainting(
                         if (global_embedders or {}).get(c) is not None)
     scoring = any_cond and (frame_active or bool(gsim_names))
     need_null = any_cond and (scoring or compute_uncond)
-    want_lat = "fd_dac" in metrics_enabled or "kl_dac" in metrics_enabled
+    want_lat = "fd_codec" in metrics_enabled or "kl_codec" in metrics_enabled
     fad_on = fad_embedder is not None and "fad_vggish" in metrics_enabled
     own = [j for j in range(n) if j % di.world == di.rank]
     n_fad_use = min(int(n_fad or 0), n) if fad_on else 0
@@ -2343,7 +2351,7 @@ def evaluate_inpainting(
     if text_vec_for is None:
         text_vec_for = caption_text_vec_fn(val_dataset.latent_root, sampling_cfg,
                                            global_configs)
-    dac_model = get_dac()
+    codec_model = get_codec()
     _mi = f"{tag_prefix}/Inpainting"
     _fd = "dac" if lc.active().name == "dac_44khz" else "encodec"
 
@@ -2374,7 +2382,7 @@ def evaluate_inpainting(
             acc_seg = [{"sx": None, "sxx": None, "n": 0} for _ in thirds]
             for j in sorted(p for p in fad_pos if p in items):
                 wav, wsr, per_frame = _inpaint_real_wav(
-                    val_dataset, indices[j], normalizer, dac_model,
+                    val_dataset, indices[j], normalizer, codec_model,
                     fad_reference, wav_root, n_frames)
                 _fad_add(acc_full, fad_embedder.embed(wav.view(1, 1, -1), wsr))
                 for w, (lo, hi) in enumerate(thirds):
@@ -2479,7 +2487,7 @@ def evaluate_inpainting(
             need_fad = fad and j in fad_pos
             if not (measure or need_fad):
                 continue
-            wav = decode_frames_to_wav(lat_of[j], normalizer, dac_model)
+            wav = decode_frames_to_wav(lat_of[j], normalizer, codec_model)
             seg = wav[lo * hop:hi * hop]
             if measure:
                 if frame_active:
@@ -2551,11 +2559,11 @@ def evaluate_inpainting(
             per_n, _cv, gs_n, fad_full_u, fad_seg_u = _measure(
                 lat_u, lo, hi, scoring, fad_on and compute_uncond,
                 f"inpaint {name}: decode + measure (no conditions)")
-        lat_m = dist_dac_metrics([lat_c[j][lo:hi] for j in sorted(lat_c)],
-                                 ref["lat"][w], metrics_enabled, device, di) \
+        lat_m = dist_codec_metrics([lat_c[j][lo:hi] for j in sorted(lat_c)],
+                                   ref["lat"][w], metrics_enabled, device, di) \
             if want_lat and ref["lat"][w] is not None else {}
-        lat_mu = (dist_dac_metrics([lat_u[j][lo:hi] for j in sorted(lat_u)],
-                                   ref["lat"][w], metrics_enabled, device, di)
+        lat_mu = (dist_codec_metrics([lat_u[j][lo:hi] for j in sorted(lat_u)],
+                                     ref["lat"][w], metrics_enabled, device, di)
                   if want_lat and compute_uncond and lat_u is not None
                   and ref["lat"][w] is not None else {})
 
@@ -2583,9 +2591,9 @@ def evaluate_inpainting(
                                device=fad_device)
 
         vals = {
-            "fd_cond": lat_m.get("fd_dac"), "kl_cond_rg": lat_m.get("kl_real_gen"),
+            "fd_cond": lat_m.get("fd_codec"), "kl_cond_rg": lat_m.get("kl_real_gen"),
             "kl_cond_gr": lat_m.get("kl_gen_real"),
-            "fd_uncond": lat_mu.get("fd_dac"), "kl_uncond_rg": lat_mu.get("kl_real_gen"),
+            "fd_uncond": lat_mu.get("fd_codec"), "kl_uncond_rg": lat_mu.get("kl_real_gen"),
             "kl_uncond_gr": lat_mu.get("kl_gen_real"),
             "fad_full_cond": _fadv(fad_full_c, ref["full"]),
             "fad_inpaint_cond": _fadv(fad_seg_c, ref["seg"][w]),
@@ -2666,7 +2674,7 @@ def evaluate_inpainting(
 @torch.no_grad()
 def evaluate_and_log_metrics(
     model, normalizer, val_dataset, step, writer, device, output_dir,
-    fd_dac_ref_stats, n_samples,
+    fd_codec_ref_stats, n_samples,
     sampling_cfg, conditioning_cfg, use_amp,
     frame_dims, global_configs,
     fidelity_evaluator=None, global_embedders=None, compute_uncond=True,
@@ -2739,8 +2747,8 @@ def evaluate_and_log_metrics(
             text_vec_for=_text_vec_for, dist_info=_di, inpaint_only=True)
         return None, None, None
 
-    ref_frames = (fd_dac_ref_stats["n_total"]
-                  if fd_dac_ref_stats is not None else "n/a")
+    ref_frames = (fd_codec_ref_stats["n_total"]
+                  if fd_codec_ref_stats is not None else "n/a")
     print(f"\n  Compute metrics @ step {step}: {n_samples} generations "
           f"(cond guidance={guidance}"
           f"{', + uncond' if compute_uncond else ''}) "
@@ -2873,7 +2881,7 @@ def evaluate_and_log_metrics(
                 cond_list[j], unc_list[j] = c, u
         return cond_list, targets, global_targets, unc_list
 
-    has_ref = fd_dac_ref_stats is not None
+    has_ref = fd_codec_ref_stats is not None
 
     spf = int(sampling_cfg.get("metrics_samples_per_forward", 1))
     paired = (spf >= 1 and (guidance > 1.0) and any_cond_active)
@@ -2885,26 +2893,26 @@ def evaluate_and_log_metrics(
         if compute_uncond and not any_cond_active:
             _unc_pre = cond_lat
     if _di is not None:
-        _m = (dist_dac_metrics(cond_lat, fd_dac_ref_stats, metrics_enabled,
-                               device, _di) if has_ref else {})
-        fd_dac_cond = _m.get("fd_dac")
+        _m = (dist_codec_metrics(cond_lat, fd_codec_ref_stats, metrics_enabled,
+                                 device, _di) if has_ref else {})
+        fd_codec_cond = _m.get("fd_codec")
         kl_cond = {"kl_real_gen": _m.get("kl_real_gen"),
                    "kl_gen_real": _m.get("kl_gen_real")}
     else:
         cond_stack = torch.stack(cond_lat)
         if has_ref:
-            _m = compute_dac_metrics(cond_stack, fd_dac_ref_stats,
-                                     enabled=metrics_enabled, device=device)
-            fd_dac_cond = _m["fd_dac"]
+            _m = compute_codec_metrics(cond_stack, fd_codec_ref_stats,
+                                       enabled=metrics_enabled, device=device)
+            fd_codec_cond = _m["fd_codec"]
             kl_cond = {"kl_real_gen": _m["kl_real_gen"], "kl_gen_real": _m["kl_gen_real"]}
         else:
-            fd_dac_cond = None
+            fd_codec_cond = None
             kl_cond = {"kl_real_gen": None, "kl_gen_real": None}
         del cond_stack
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    fd_dac_uncond = None
+    fd_codec_uncond = None
     kl_uncond = {"kl_real_gen": None, "kl_gen_real": None}
     unc_lat = _unc_pre if _unc_pre is not None else []
     need_null = scoring_active and any_cond_active
@@ -2912,9 +2920,9 @@ def evaluate_and_log_metrics(
         unc_lat = _generate(conditioned=False)[0]
     if compute_uncond and unc_lat and _di is not None:
         if has_ref:
-            _mu = dist_dac_metrics(unc_lat, fd_dac_ref_stats, metrics_enabled,
-                                   device, _di)
-            fd_dac_uncond = _mu.get("fd_dac")
+            _mu = dist_codec_metrics(unc_lat, fd_codec_ref_stats, metrics_enabled,
+                                     device, _di)
+            fd_codec_uncond = _mu.get("fd_codec")
             kl_uncond = {"kl_real_gen": _mu.get("kl_real_gen"),
                          "kl_gen_real": _mu.get("kl_gen_real")}
         if device == "cuda":
@@ -2922,16 +2930,16 @@ def evaluate_and_log_metrics(
     elif compute_uncond and unc_lat:
         unc_stack = torch.stack(unc_lat)
         if has_ref:
-            _mu = compute_dac_metrics(unc_stack, fd_dac_ref_stats,
-                                      enabled=metrics_enabled, device=device)
-            fd_dac_uncond = _mu["fd_dac"]
+            _mu = compute_codec_metrics(unc_stack, fd_codec_ref_stats,
+                                        enabled=metrics_enabled, device=device)
+            fd_codec_uncond = _mu["fd_codec"]
             kl_uncond = {"kl_real_gen": _mu["kl_real_gen"],
                          "kl_gen_real": _mu["kl_gen_real"]}
         del unc_stack
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    dac_model = get_dac()
+    codec_model = get_codec()
 
     fad_on = fad_embedder is not None and fad_ref_stats is not None
     n_fad_use = min(int(n_fad or 0), len(cond_lat)) if fad_on else 0
@@ -2951,7 +2959,7 @@ def evaluate_and_log_metrics(
         fst = {"sx": None, "sxx": None, "n": 0}
         for i in tqdm(sorted(need), desc=desc, leave=False,
                       disable=not is_main):
-            wav = decode_frames_to_wav(lat_list[i], normalizer, dac_model)
+            wav = decode_frames_to_wav(lat_list[i], normalizer, codec_model)
             if measure:
                 wn = wav.numpy()
                 if frame_active:
@@ -3161,15 +3169,15 @@ def evaluate_and_log_metrics(
     _m = f"{tag_prefix}/Metrics"
     _fd = "dac" if lc.active().name == "dac_44khz" else "encodec"
     if any_cond_active:
-        if fd_dac_cond is not None:
-            writer.add_scalar(f"{_m}/Fd_{_fd}_cond", fd_dac_cond, step)
+        if fd_codec_cond is not None:
+            writer.add_scalar(f"{_m}/Fd_{_fd}_cond", fd_codec_cond, step)
         if kl_cond["kl_real_gen"] is not None:
             writer.add_scalar(f"{_m}/Kl_cond/real_gen",
                               kl_cond["kl_real_gen"], step)
             writer.add_scalar(f"{_m}/Kl_cond/gen_real",
                               kl_cond["kl_gen_real"], step)
-        if fd_dac_uncond is not None:
-            writer.add_scalar(f"{_m}/Fd_{_fd}_uncond", fd_dac_uncond, step)
+        if fd_codec_uncond is not None:
+            writer.add_scalar(f"{_m}/Fd_{_fd}_uncond", fd_codec_uncond, step)
         if kl_uncond["kl_real_gen"] is not None:
             writer.add_scalar(f"{_m}/Kl_uncond/real_gen",
                               kl_uncond["kl_real_gen"], step)
@@ -3180,8 +3188,8 @@ def evaluate_and_log_metrics(
         if fad_uncond is not None:
             writer.add_scalar(f"{_m}/Fad_vggish_uncond", fad_uncond, step)
     else:
-        if fd_dac_cond is not None:
-            writer.add_scalar(f"{_m}/Fd_{_fd}", fd_dac_cond, step)
+        if fd_codec_cond is not None:
+            writer.add_scalar(f"{_m}/Fd_{_fd}", fd_codec_cond, step)
         if kl_cond["kl_real_gen"] is not None:
             writer.add_scalar(f"{_m}/Kl_real_gen",
                               kl_cond["kl_real_gen"], step)
@@ -3202,12 +3210,12 @@ def evaluate_and_log_metrics(
 
     def _f(x):
         return f"{x:.4f}" if x is not None else "n/a"
-    print(f"  [cond]   FD-{lc.active().label}: {_f(fd_dac_cond)} | "
+    print(f"  [cond]   FD-{lc.active().label}: {_f(fd_codec_cond)} | "
           f"KL(real||gen): {_f(kl_cond['kl_real_gen'])} | "
           f"KL(gen||real): {_f(kl_cond['kl_gen_real'])}"
           + (f" | FAD-VGGish: {_f(fad_cond)}" if fad_cond is not None else ""))
     if compute_uncond:
-        print(f"  [uncond] FD-{lc.active().label}: {_f(fd_dac_uncond)} | "
+        print(f"  [uncond] FD-{lc.active().label}: {_f(fd_codec_uncond)} | "
               f"KL(real||gen): {_f(kl_uncond['kl_real_gen'])} | "
               f"KL(gen||real): {_f(kl_uncond['kl_gen_real'])}"
               + (f" | FAD-VGGish: {_f(fad_uncond)}" if fad_uncond is not None else ""))
@@ -3225,10 +3233,10 @@ def evaluate_and_log_metrics(
     if report is not None:
         report.update({
             "n_generations": int(n_samples),
-            "fd_dac_cond": fd_dac_cond,
+            "fd_codec_cond": fd_codec_cond,
             "kl_cond_real_gen": kl_cond["kl_real_gen"],
             "kl_cond_gen_real": kl_cond["kl_gen_real"],
-            "fd_dac_uncond": fd_dac_uncond,
+            "fd_codec_uncond": fd_codec_uncond,
             "kl_uncond_real_gen": kl_uncond["kl_real_gen"],
             "kl_uncond_gen_real": kl_uncond["kl_gen_real"],
             "fad_vggish_cond": fad_cond,
@@ -3249,7 +3257,7 @@ def evaluate_and_log_metrics(
         metrics_seed=metrics_seed, image_root=image_root,
         text_vec_for=_text_vec_for, dist_info=_di)
 
-    return fd_dac_cond, kl_cond["kl_real_gen"], kl_cond["kl_gen_real"]
+    return fd_codec_cond, kl_cond["kl_real_gen"], kl_cond["kl_gen_real"]
 
 
 def read_influence_settings(metrics_cfg):
@@ -3617,10 +3625,10 @@ def dist_broadcast_tensor_(t, di, src=0):
         t.copy_(x.to(t.device))
 
 
-def dist_dac_metrics(lat_list, ref_stats, enabled, device, di, block_size=16):
-    out = {"fd_dac": None, "kl_real_gen": None, "kl_gen_real": None}
-    want_fd = "fd_dac" in enabled
-    want_kl = "kl_dac" in enabled
+def dist_codec_metrics(lat_list, ref_stats, enabled, device, di, block_size=16):
+    out = {"fd_codec": None, "kl_real_gen": None, "kl_gen_real": None}
+    want_fd = "fd_codec" in enabled
+    want_kl = "kl_codec" in enabled
     if not (want_fd or want_kl):
         return out
     lats = [x for x in lat_list if x is not None]
@@ -3641,7 +3649,7 @@ def dist_dac_metrics(lat_list, ref_stats, enabled, device, di, block_size=16):
     mu_ref = ref_stats["mu"].to(device)
     sigma_ref = ref_stats["sigma"].to(device)
     if want_fd:
-        out["fd_dac"] = float(
+        out["fd_codec"] = float(
             compute_frechet_distance(mu_ref, sigma_ref, mu_gen, sigma_gen).item())
     if want_kl:
         out["kl_real_gen"] = gaussian_kl_fullcov(mu_ref, sigma_ref, mu_gen, sigma_gen)
@@ -3784,7 +3792,7 @@ if __name__ == "__main__":
             sys.stdout = open(os.devnull, "w")
     print(f"[RUN NAME] {run_name}")
 
-    set_dac_device(cfg.metrics.get("codec_device", "cpu"))
+    set_codec_device(cfg.metrics.get("codec_device", "cpu"))
 
     CODEC = lc.activate(lc.dataset_codec(cfg.paths.dataset_root))
     print(f"[codec] {CODEC.name} (from the dataset): {CODEC.sample_rate} Hz, "
@@ -3803,8 +3811,8 @@ if __name__ == "__main__":
                           buffering=1, encoding="utf-8",
                           errors="backslashreplace")
 
-    normalizer_path   = os.path.join(cache_dir, "normalizer.pt")
-    fd_dac_cache_path = os.path.join(cache_dir, "fd_dac_ref_stats.pt")
+    normalizer_path     = os.path.join(cache_dir, "normalizer.pt")
+    fd_codec_cache_path = os.path.join(cache_dir, "fd_codec_ref_stats.pt")
     _fad_ref_mode = str((cfg.get("metrics", None) or {}).get("fad_reference", "wav"))
     fad_cache_path = os.path.join(cache_dir, f"fad_vggish_ref_{_fad_ref_mode}.pt")
 
@@ -3812,8 +3820,12 @@ if __name__ == "__main__":
     _fingerprint = _cache_fingerprint(cfg, _n_frames_fp, DIST)
     if DIST.enabled and not DIST.is_main:
         dist_barrier(DIST)
+    _old_fd_cache = os.path.join(cache_dir, "fd_dac_ref_stats.pt")
+    if os.path.exists(_old_fd_cache) and not os.path.exists(fd_codec_cache_path):
+        os.replace(_old_fd_cache, fd_codec_cache_path)
+        print("[cache] fd_dac_ref_stats.pt is now called fd_codec_ref_stats.pt.")
     _validate_cache(cache_dir, _fingerprint,
-                    guarded_files=[normalizer_path, fd_dac_cache_path,
+                    guarded_files=[normalizer_path, fd_codec_cache_path,
                                    fad_cache_path])
     if DIST.enabled and DIST.is_main:
         dist_barrier(DIST)
@@ -4044,31 +4056,31 @@ if __name__ == "__main__":
     metrics_val_ds = MetricsAdapter(val_dataset)
 
     if (metrics_enabled and DIST.enabled and dist_broadcast_object(
-            not os.path.exists(fd_dac_cache_path), DIST)):
+            not os.path.exists(fd_codec_cache_path), DIST)):
         _own = range(DIST.rank, len(metrics_val_ds), DIST.world)
         if DIST.is_main:
             print(f"[Latent Reference] Accumulation on {len(metrics_val_ds)} "
                   f"samples, over {DIST.world} GPUs...")
-        fd_dac_ref_stats = dist_reference_stats(
+        fd_codec_ref_stats = dist_reference_stats(
             (metrics_val_ds[i][0] for i in _own), len(_own),
             lc.active().latent_dim, device, DIST, "Latent reference")
         if DIST.is_main:
-            save_reference(fd_dac_ref_stats, fd_dac_cache_path)
-            print(f"[Latent Reference] Cache saved in: {fd_dac_cache_path}")
+            save_reference(fd_codec_ref_stats, fd_codec_cache_path)
+            print(f"[Latent Reference] Cache saved in: {fd_codec_cache_path}")
     elif metrics_enabled and not DIST.is_main:
-        fd_dac_ref_stats = None
+        fd_codec_ref_stats = None
     elif metrics_enabled:
-        fd_dac_ref_stats = precompute_latent_reference(
+        fd_codec_ref_stats = precompute_latent_reference(
             metrics_val_ds,
-            cache_path=fd_dac_cache_path,
+            cache_path=fd_codec_cache_path,
         )
     else:
-        fd_dac_ref_stats = None
+        fd_codec_ref_stats = None
         print("Reference stats SKIPPED: no distributional metric enabled "
               "(metrics.enabled is empty).\n")
     if metrics_enabled and DIST.is_main:
         print(f"Reference stats ready: FD-{lc.active().label} + KL on "
-              f"{fd_dac_ref_stats['n_total']} latent frames "
+              f"{fd_codec_ref_stats['n_total']} latent frames "
               f"({len(val_dataset)} val samples)\n")
 
     fad_embedder = None
@@ -4106,14 +4118,14 @@ if __name__ == "__main__":
                     f"  Either re-run preprocess_stream.py with --save_wav (it does "
                     f"NOT re-encode the latents), or set metrics.fad_reference="
                     f"'decoded' to build the reference by decoding the validation "
-                    f"latents through DAC instead. NB: 'decoded' compares two "
-                    f"DAC-decoded distributions, which isolates the model from the "
+                    f"latents through the codec instead. NB: 'decoded' compares two "
+                    f"codec-decoded distributions, which isolates the model from the "
                     f"codec but is NOT comparable with published FAD values.")
             if _split:
                 _own = _val_wavs[DIST.rank::DIST.world]
                 if DIST.is_main:
                     print(f"[Audio ref] embedding {len(_val_wavs)} real val wavs "
-                          f"(NO DAC), over {DIST.world} GPUs...")
+                          f"(NO codec), over {DIST.world} GPUs...")
                 fad_ref_stats = dist_reference_stats(
                     (fad_embedder.embed(w, audio_sr=sr) for w, sr in wav_clips(_own)),
                     len(_own), fad_embedder.embedding_dim, fad_device, DIST,
@@ -4126,18 +4138,18 @@ if __name__ == "__main__":
                     _val_wavs, fad_embedder, cache_path=fad_cache_path,
                     device=fad_device)
         elif _fad_ref_mode == "decoded":
-            _dac = get_dac()
+            _codec = get_codec()
 
             def _real_clips(idxs):
                 for i in idxs:
                     frames = val_dataset[i][0]
-                    yield (decode_frames_to_wav(frames, normalizer, _dac)
+                    yield (decode_frames_to_wav(frames, normalizer, _codec)
                            .view(1, 1, -1), lc.active().sample_rate)
 
             if _split:
                 _own = range(DIST.rank, len(val_dataset), DIST.world)
                 if DIST.is_main:
-                    print(f"[Audio ref] embedding {len(val_dataset)} DAC-decoded val "
+                    print(f"[Audio ref] embedding {len(val_dataset)} codec-decoded val "
                           f"latents (metrics.fad_reference='decoded'), over "
                           f"{DIST.world} GPUs...")
                 fad_ref_stats = dist_reference_stats(
@@ -4152,7 +4164,7 @@ if __name__ == "__main__":
                 fad_ref_stats = torch.load(fad_cache_path, map_location="cpu",
                                            weights_only=False)
             else:
-                print(f"[Audio ref] embedding {len(val_dataset)} DAC-decoded val "
+                print(f"[Audio ref] embedding {len(val_dataset)} codec-decoded val "
                       f"latents (metrics.fad_reference='decoded')...")
                 _mu, _sig, _n = compute_audio_mu_sigma(
                     _real_clips(range(len(val_dataset))), len(val_dataset),
@@ -4165,13 +4177,13 @@ if __name__ == "__main__":
                 f"[metrics] metrics.fad_reference='{_fad_ref_mode}' is not a valid "
                 f"choice. Use 'wav' (real validation wavs, comparable with the "
                 f"literature) or 'decoded' (validation latents decoded through "
-                f"DAC, no wavs needed).")
+                f"the codec, no wavs needed).")
         if DIST.is_main:
             print(f"FAD reference ready: {fad_ref_stats['n_total']} embedding "
                   f"vectors (128-D)\n")
     if DIST.enabled:
-        fd_dac_ref_stats, fad_ref_stats = dist_broadcast_object(
-            (fd_dac_ref_stats, fad_ref_stats), DIST)
+        fd_codec_ref_stats, fad_ref_stats = dist_broadcast_object(
+            (fd_codec_ref_stats, fad_ref_stats), DIST)
 
     fidelity_evaluator, global_embedders = build_condition_scorers(
         cfg, FRAME_COND_DIMS, GLOBAL_CONFIGS, registry,
@@ -4558,17 +4570,17 @@ if __name__ == "__main__":
     print(f"Train: {len(train_dataset)} chunk | Val: {len(val_dataset)} chunk")
     print(f"Audio every {cfg.intervals.audio} step | "
           f"Metrics every {cfg.intervals.metrics} step")
-    if fd_dac_ref_stats is not None:
+    if fd_codec_ref_stats is not None:
         print(f"Metrics: {cfg.sampling.n_metrics_samples} generated vs "
-              f"{fd_dac_ref_stats['n_total']} reference frames")
+              f"{fd_codec_ref_stats['n_total']} reference frames")
     else:
         print("Metrics: distributional metrics DISABLED (metrics.enabled: [])")
     print(f"Codec: {lc.active().name} ({lc.active().sample_rate} Hz, "
           f"{lc.active().frames_per_s:.2f} frames/s, "
           f"{lc.active().latent_dim}-d latents)")
-    print(f"{lc.active().label} decoder device: {_DAC_DEVICE}"
+    print(f"{lc.active().label} decoder device: {_CODEC_DEVICE}"
           + ("  (~2.5 s per 5 s clip; 'cuda' is ~13x faster but adds a ~1 GB "
-             "peak at the metrics step)" if _DAC_DEVICE == "cpu" else
+             "peak at the metrics step)" if _CODEC_DEVICE == "cpu" else
              "  (~0.2 s per 5 s clip; ~1 GB peak at the metrics step)"))
     P_DROP_EACH_FRAME = float(cfg.conditioning.get("p_drop_each_frame", 0.0))
     print(f"CFG dropout: all={cfg.conditioning.p_drop_all} "
@@ -4923,7 +4935,7 @@ if __name__ == "__main__":
                 gen_model = (ema.model
                               if cfg.training.use_ema and step >= cfg.training.ema_start
                               else model)
-                fd_dac_cond, kl_cond_rg, kl_cond_gr = evaluate_and_log_metrics(
+                fd_codec_cond, kl_cond_rg, kl_cond_gr = evaluate_and_log_metrics(
                     model=gen_model,
                     normalizer=normalizer,
                     val_dataset=val_dataset,
@@ -4931,7 +4943,7 @@ if __name__ == "__main__":
                     writer=writer,
                     device=device,
                     output_dir=audio_dir,
-                    fd_dac_ref_stats=fd_dac_ref_stats,
+                    fd_codec_ref_stats=fd_codec_ref_stats,
                     n_samples=cfg.sampling.n_metrics_samples,
                     sampling_cfg=cfg.sampling,
                     conditioning_cfg=cfg.conditioning,
@@ -4960,8 +4972,8 @@ if __name__ == "__main__":
                     wav_root=cfg.paths.wav_root,
                 )
                 _parts = []
-                if fd_dac_cond is not None:
-                    _parts.append(f"FD-{lc.active().label}={fd_dac_cond:.4f}")
+                if fd_codec_cond is not None:
+                    _parts.append(f"FD-{lc.active().label}={fd_codec_cond:.4f}")
                 if kl_cond_rg is not None:
                     _parts.append(f"KL(real||gen)={kl_cond_rg:.4f}")
                 if kl_cond_gr is not None:

@@ -60,7 +60,7 @@ def process_file(
     cond_path: Path,
     registry: ConditionRegistry,
     force: bool = False,
-    dac_device: str = "cpu",
+    codec_device: str = "cpu",
 ) -> bool:
     required_conds = set(registry.frame_names)
 
@@ -96,10 +96,10 @@ def process_file(
             return False
     else:
         try:
-            audio = decode_latent_to_wav(latent_path, device=dac_device)
+            audio = decode_latent_to_wav(latent_path, device=codec_device)
             sr = lc.active().sample_rate
         except Exception as e:
-            tqdm.write(f"  [ERR] Decode DAC {latent_path.name}: {e}")
+            tqdm.write(f"  [ERR] Decode {latent_path.name}: {e}")
             return False
 
     new_conds = {}
@@ -144,7 +144,7 @@ Examples:
                              "later without recomputing the others.")
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="Device for the DAC decoder (only used as a "
+                        help="Device for the codec decoder (only used as a "
                              "fallback when a WAV is missing on disk)")
     parser.add_argument("--force", action="store_true",
                         help="Recompute everything even if it already exists")
@@ -177,7 +177,7 @@ Examples:
                   f"name next to each SOURCE audio file, which this tool never "
                   f"sees. Use: python preprocess_stream.py SRC "
                   f"{dataset_root} --conditions {','.join(companion)} "
-                  f"(same SRC and parameters as the dataset; --skip_dac).")
+                  f"(same SRC and parameters as the dataset; --skip_encoder).")
             return
         print(f"  [note] {companion} left out: read from the source's MIDI, "
               f"only preprocess_stream.py can add it.")
@@ -195,7 +195,7 @@ Examples:
     print(f"  Dataset:         {dataset_root}")
     print(f"  Conditions:      {registry.frame_names}")
     print(f"  Dims:            {registry.frame_cond_dims}")
-    print(f"  DAC device:      {args.device}")
+    print(f"  Codec device:    {args.device}")
     print(f"  Force rebuild:   {args.force}")
     print(f"{'='*60}\n")
 
@@ -222,7 +222,7 @@ Examples:
                 cond_path=cond_path,
                 registry=registry,
                 force=args.force,
-                dac_device=args.device,
+                codec_device=args.device,
             )
             if processed:
                 total_processed += 1

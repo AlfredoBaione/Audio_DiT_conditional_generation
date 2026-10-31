@@ -1141,13 +1141,13 @@ training:
 ### Which metrics are computed
 
 `metrics.enabled` selects the distributional metrics, mirroring the unconditional
-project's registry. `fd_dac` and `kl_dac` keep their names on both codecs: they
+project's registry. `fd_codec` and `kl_codec`
 are measured in the latent space of the dataset's codec, DAC or EnCodec.
 
 ```yaml
 metrics:
-  enabled: ["fd_dac", "kl_dac"]   # [] turns them off (and skips their reference)
-                                  # add "fad_vggish" for the audio-domain FAD
+  enabled: ["fd_codec", "kl_codec"]  # [] turns them off (and skips their reference)
+                                     # add "fad_vggish" for the audio-domain FAD
   seed: 0
   fidelity_device: "cuda"         # "cuda" | "cpu" — device for the re-extraction
                                   # (CREPE / beat_this / CLAP-audio) that feeds the
@@ -1273,7 +1273,7 @@ DAC decoder device: cuda  (~0.2 s per 5 s clip; ~1 GB peak at the metrics step)
 ```
 
 Listing a metric is an explicit request: an unsupported name is a **hard error at
-startup**, not a silent skip. `fd_dac` and `kl_dac` share the generated
+startup**, not a silent skip. `fd_codec` and `kl_codec` share the generated
 mean/covariance, so asking for both costs essentially the same as asking for one.
 
 ### The Condition_influence table (TensorBoard, Text window)
@@ -1379,7 +1379,7 @@ Needs `global_conditions/text_labels_emb.npy` in the dataset (written by
 
 ### FAD-VGGish (optional, off by default)
 
-`fd_dac` and `kl_dac` score the **latent space of the codec** (DAC or EnCodec).
+`fd_codec` and `kl_codec` score the **latent space of the codec** (DAC or EnCodec).
 `fad_vggish` scores the
 **audio**, through embeddings of a model trained on real recordings — it is the
 number the controllable-music literature reports, so it is what makes your
@@ -1388,7 +1388,7 @@ its use is the final, offline evaluation of a checkpoint.
 
 ```yaml
 metrics:
-  enabled: ["fd_dac", "kl_dac", "fad_vggish"]
+  enabled: ["fd_codec", "kl_codec", "fad_vggish"]
   fad_device: "cuda"       # VGGish embedder device (speed only)
   fad_reference: "wav"     # "wav" | "decoded" — see below
 sampling:

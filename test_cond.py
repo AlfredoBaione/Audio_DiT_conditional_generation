@@ -66,7 +66,7 @@ def load_config():
     parser.add_argument("--metrics_samples", type=str, default=None,
                         metavar="N|all",
                         help="Shortcut for sampling.n_metrics_samples: how "
-                             "many test samples FD-DAC, KL, FAD and the table "
+                             "many test samples FD-codec, KL, FAD and the table "
                              "are computed on; 'all' = the whole test split, "
                              "0 = no metrics (panels only).")
     parser.add_argument("--n_samples", type=int, default=None,
@@ -244,7 +244,7 @@ def main():
     writer = (SummaryWriter(str(log_dir)) if DIST.is_main
               else tc.NullWriter(fixed_dir=str(log_dir)))
 
-    tc.set_dac_device(cfg.metrics.get("codec_device", "cpu"))
+    tc.set_codec_device(cfg.metrics.get("codec_device", "cpu"))
 
     print("\n[test_cond] Loading checkpoint...")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False,
@@ -460,12 +460,12 @@ def main():
                          f"available here: {list(COND_METRICS)}.")
     compute_uncond = bool(cfg.sampling.get("metrics_uncond", False))
 
-    fd_dac_ref_stats = None
-    if "fd_dac" in metrics_enabled or "kl_dac" in metrics_enabled:
+    fd_codec_ref_stats = None
+    if "fd_codec" in metrics_enabled or "kl_codec" in metrics_enabled:
         if DIST.enabled:
-            fd_dac_ref_stats = split_latent_reference(test_dataset, DIST, device)
+            fd_codec_ref_stats = split_latent_reference(test_dataset, DIST, device)
         else:
-            fd_dac_ref_stats = precompute_latent_reference(
+            fd_codec_ref_stats = precompute_latent_reference(
                 tc.MetricsAdapter(test_dataset), cache_path=None, device=device)
 
     fad_embedder = fad_ref_stats = None
@@ -496,12 +496,12 @@ def main():
                     f"same output dir with --save_wav test (it does NOT "
                     f"re-encode the latents) -- or run this test with "
                     f"metrics.fad_reference=decoded, which decodes the real test "
-                    f"latents through DAC instead (not comparable with published "
+                    f"latents through the codec instead (not comparable with published "
                     f"FAD values).")
             if DIST.enabled:
                 _own = _wavs[DIST.rank::DIST.world]
                 print(f"[Audio ref] embedding {len(_wavs)} real test wavs "
-                      f"(NO DAC), over {DIST.world} GPUs...")
+                      f"(NO codec), over {DIST.world} GPUs...")
                 fad_ref_stats = split_audio_reference(
                     wav_clips(_own), len(_own), fad_embedder, fad_device, DIST,
                     "Audio ref")
@@ -509,12 +509,12 @@ def main():
                 fad_ref_stats = precompute_audio_reference(
                     _wavs, fad_embedder, cache_path=None, device=fad_device)
         elif fad_mode == "decoded":
-            _dac = tc.get_dac()
+            _codec = tc.get_codec()
 
             def _real_clips(idxs):
                 for i in idxs:
                     yield (tc.decode_frames_to_wav(test_dataset[i][0], normalizer,
-                                                   _dac).view(1, 1, -1),
+                                                   _codec).view(1, 1, -1),
                            lc.active().sample_rate)
             if DIST.enabled:
                 _own = range(DIST.rank, total, DIST.world)
@@ -530,7 +530,7 @@ def main():
         else:
             raise SystemExit(
                 f"[test_cond] metrics.fad_reference='{fad_mode}' is not valid: "
-                f"'wav' (real test wavs) or 'decoded' (test latents via DAC).")
+                f"'wav' (real test wavs) or 'decoded' (test latents via the codec).")
 
     print(f"\n[test_cond] === METRICS on {n_scored}/{total} test samples "
           f"({weights} weights, step {ckpt_step}) ===")
@@ -539,7 +539,7 @@ def main():
     tc.evaluate_and_log_metrics(
         model=model, normalizer=normalizer, val_dataset=test_dataset,
         step=ckpt_step, writer=writer, device=device,
-        output_dir=str(output_dir), fd_dac_ref_stats=fd_dac_ref_stats,
+        output_dir=str(output_dir), fd_codec_ref_stats=fd_codec_ref_stats,
         n_samples=n_scored, sampling_cfg=cfg.sampling,
         conditioning_cfg=cfg.conditioning, use_amp=use_amp,
         frame_dims=frame_cond_dims, global_configs=global_configs,

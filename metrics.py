@@ -163,8 +163,8 @@ def precompute_latent_reference(
     return stats
 
 
-def precompute_fd_dac_reference(val_dataset, cache_path=None, device=None,
-                                batch_accum: int = 50) -> dict:
+def precompute_fd_codec_reference(val_dataset, cache_path=None, device=None,
+                                  batch_accum: int = 50) -> dict:
     return precompute_latent_reference(
         val_dataset, cache_path=cache_path, device=device, batch_accum=batch_accum)
 
@@ -189,7 +189,7 @@ def _generated_mu_sigma(generated_latents: torch.Tensor, device: str,
     return mu_gen, sigma_gen
 
 
-def compute_fd_dac(
+def compute_fd_codec(
     generated_latents: torch.Tensor,
     ref_stats: dict,
     device: str = "cuda",
@@ -230,19 +230,19 @@ def compute_kl_both(
     return {"kl_real_gen": kl_real_gen, "kl_gen_real": kl_gen_real}
 
 
-DAC_METRICS = ("fd_dac", "kl_dac")
+CODEC_METRICS = ("fd_codec", "kl_codec")
 
 
-def compute_dac_metrics(
+def compute_codec_metrics(
     generated_latents: torch.Tensor,
     ref_stats: dict,
-    enabled=DAC_METRICS,
+    enabled=CODEC_METRICS,
     device: str = "cuda",
     block_size: int = 16,
 ) -> dict:
-    out = {"fd_dac": None, "kl_real_gen": None, "kl_gen_real": None}
-    want_fd = "fd_dac" in enabled
-    want_kl = "kl_dac" in enabled
+    out = {"fd_codec": None, "kl_real_gen": None, "kl_gen_real": None}
+    want_fd = "fd_codec" in enabled
+    want_kl = "kl_codec" in enabled
     if not (want_fd or want_kl):
         return out
 
@@ -251,7 +251,7 @@ def compute_dac_metrics(
     sigma_ref = ref_stats["sigma"].to(device)
 
     if want_fd:
-        out["fd_dac"] = float(
+        out["fd_codec"] = float(
             compute_frechet_distance(mu_ref, sigma_ref, mu_gen, sigma_gen).item())
     if want_kl:
         out["kl_real_gen"] = gaussian_kl_fullcov(mu_ref, sigma_ref, mu_gen, sigma_gen)
@@ -375,7 +375,7 @@ def precompute_audio_reference(val_wav_source, embedder, cache_path=None,
                 f"{len(missing)}/{len(wavs)} reference wavs do not exist "
                 f"(first: {missing[0]}). Re-run preprocess_stream.py with "
                 f"--save_wav, or switch metrics.fad_reference to 'decoded'.")
-    print(f"[Audio ref] embedding {len(wavs)} real val wavs (NO DAC)...")
+    print(f"[Audio ref] embedding {len(wavs)} real val wavs (NO codec)...")
 
     def _iter():
         for p in wavs:
@@ -410,9 +410,9 @@ def _decode_embed_mu_sigma(generated_latents, normalizer, embedder, device, desc
     return _audio_clips_to_mu_sigma(_iter(), generated_latents.shape[0], embedder, device, desc)
 
 
-ALL_METRICS = ("fd_dac", "kl_dac", "fad_encodec", "fad_vggish")
+ALL_METRICS = ("fd_codec", "kl_codec", "fad_encodec", "fad_vggish")
 
-COND_METRICS = ("fd_dac", "kl_dac", "fad_vggish")
+COND_METRICS = ("fd_codec", "kl_codec", "fad_vggish")
 
 
 @torch.no_grad()
@@ -445,8 +445,8 @@ def build_references(enabled, val_dataset, val_wav_root, embedders, cache_dir,
                      device: str = "cuda", strict: bool = True) -> dict:
     cache_dir = Path(cache_dir)
     refs = {}
-    if "fd_dac" in enabled or "kl_dac" in enabled:
-        refs["dac"] = precompute_latent_reference(
+    if "fd_codec" in enabled or "kl_codec" in enabled:
+        refs["codec"] = precompute_latent_reference(
             val_dataset, cache_path=str(cache_dir / "latent_ref_stats.pt"), device=device)
     for name, key, fname in (("fad_encodec", "encodec", "fad_encodec_ref_stats.pt"),
                              ("fad_vggish",  "vggish",  "fad_vggish_ref_stats.pt")):
@@ -522,10 +522,10 @@ def evaluate_generation(model, normalizer, val_dataset, *, enabled, references,
     generated_latents = torch.stack(gen_list)
 
     out = {}
-    if "fd_dac" in enabled:
-        out["fd_dac"] = compute_fd_dac(generated_latents, references["dac"], device=device)
-    if "kl_dac" in enabled:
-        kl = compute_kl_both(generated_latents, references["dac"], device=device)
+    if "fd_codec" in enabled:
+        out["fd_codec"] = compute_fd_codec(generated_latents, references["codec"], device=device)
+    if "kl_codec" in enabled:
+        kl = compute_kl_both(generated_latents, references["codec"], device=device)
         out["kl_real_gen"] = kl["kl_real_gen"]
         out["kl_gen_real"] = kl["kl_gen_real"]
     for name, key in (("fad_encodec", "encodec"), ("fad_vggish", "vggish")):

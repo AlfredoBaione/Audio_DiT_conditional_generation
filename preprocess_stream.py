@@ -2325,7 +2325,7 @@ def build_parser():
                              "table, so another N can be re-derived later "
                              "without re-reading a single .npz.")
 
-    parser.add_argument("--skip_encoder", "--skip_dac", dest="skip_encoder",
+    parser.add_argument("--skip_encoder", dest="skip_encoder",
                         action="store_true",
                         help="Do everything except the codec encoding (debug).")
     parser.add_argument("--force", action="store_true",

@@ -149,7 +149,7 @@ def euler_sampling_cfg(
 
 def encode_source(normalizer, source_path, device):
     spec = lc.active()
-    dac_model = lc.load_model(spec.name, device, cache=False)
+    codec_model = lc.load_model(spec.name, device, cache=False)
 
     audio, sr = sf.read(source_path, dtype='float32')
     if audio.ndim == 2:
@@ -159,9 +159,9 @@ def encode_source(normalizer, source_path, device):
         audio = librosa.resample(audio, orig_sr=sr, target_sr=spec.sample_rate)
 
     audio_t = torch.from_numpy(audio).float().unsqueeze(0).unsqueeze(0).to(device)
-    latents = lc.encode(dac_model, audio_t, spec.sample_rate)
+    latents = lc.encode(codec_model, audio_t, spec.sample_rate)
     z = latents.squeeze(0).cpu()
-    del dac_model
+    del codec_model
     if device == "cuda":
         torch.cuda.empty_cache()
     return normalizer.normalize(z).T.unsqueeze(0)
@@ -189,7 +189,7 @@ def edit_audio(
 
     if edit_strength == 0.0:
         print("  [edit] strength=0 -> identity: returning the source through the "
-              "DAC round-trip, no integration.")
+              "codec round-trip, no integration.")
         frames = x1.squeeze(0)
     else:
         t_start = 1.0 - edit_strength
@@ -206,9 +206,9 @@ def edit_audio(
         )
 
     z_out = normalizer.denormalize(frames.T)
-    dac_model = lc.load_model(spec.name, "cpu", cache=False)
-    wav = lc.decode(dac_model, z_out.unsqueeze(0).float()).squeeze()
-    del dac_model
+    codec_model = lc.load_model(spec.name, "cpu", cache=False)
+    wav = lc.decode(codec_model, z_out.unsqueeze(0).float()).squeeze()
+    del codec_model
 
     return wav
 
@@ -240,7 +240,7 @@ def inpaint_audio(
           f"the rest is kept as it is | "
           f"frame_cond={'ON' if frame_cond else 'NULL'}")
 
-    dac_model = lc.load_model(spec.name, "cpu", cache=False)
+    codec_model = lc.load_model(spec.name, "cpu", cache=False)
     wavs = []
     for _ in range(int(n_samples)):
         frames = euler_sampling_cfg(
@@ -252,8 +252,8 @@ def inpaint_audio(
             inpaint=(keep, x1[0]),
         )
         z_out = normalizer.denormalize(frames.T)
-        wavs.append(lc.decode(dac_model, z_out.unsqueeze(0).float()).squeeze())
-    del dac_model
+        wavs.append(lc.decode(codec_model, z_out.unsqueeze(0).float()).squeeze())
+    del codec_model
     return wavs
 
 
@@ -425,7 +425,7 @@ def main():
                         help="Generation length in seconds (generate mode). If "
                              "omitted, uses the exact n_frames the checkpoint was "
                              "trained with (recommended). A value here is converted "
-                             "to DAC frames via round(), matching preprocessing.")
+                             "to codec frames via round(), matching preprocessing.")
     parser.add_argument("--output", type=str, default="./generated_cond")
     parser.add_argument("--normalizer", type=str, default=None,
                         help="Explicit path to normalizer.pt (otherwise resolved "
@@ -579,7 +579,7 @@ def main():
               f"{n_frames} frame | guidance={args.guidance} | "
               f"frame_cond={'ON' if frame_cond else 'NULL'}")
 
-        dac_m = lc.load_model(CODEC.name, "cpu", cache=False)
+        codec_m = lc.load_model(CODEC.name, "cpu", cache=False)
 
         for i in range(args.n_samples):
             gen = euler_sampling_cfg(
@@ -592,7 +592,7 @@ def main():
             )
             with torch.no_grad():
                 z = normalizer.denormalize(gen.T)
-                wav = lc.decode(dac_m, z.unsqueeze(0).float()).squeeze()
+                wav = lc.decode(codec_m, z.unsqueeze(0).float()).squeeze()
             tag = _out_tag(_active_cond_tag(frame_cond, gc))
             p = os.path.join(args.output, f"gen_{tag}_{i:02d}.wav")
             sf.write(p, wav.numpy(), CODEC.sample_rate)
