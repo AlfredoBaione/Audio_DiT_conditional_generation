@@ -288,31 +288,17 @@ def is_global_probe(condition: str) -> bool:
 
 def _slug(text) -> str:
     s = "".join(ch if ch.isalnum() else "_" for ch in str(text).lower())
-    return "_".join(p for p in s.split("_") if p)[:40] or "caption"
+    return "_".join(p for p in s.split("_") if p)[:40] or "text"
 
 
-def text_probe_bank(caption_table=None, n_panels=None):
-    table = caption_table or {}
-    labels = [str(c) for c in (table.get("captions_text")
-                               or table.get("captions") or [])]
-    n_terms = table.get("n_terms")
+def text_probe_bank(labels, text_source, n_panels=None):
+    if not labels or text_source == "text":
+        return TEXT_PROMPTS
     n = len(TEXT_PROMPTS)
-    if not labels:
-        return TEXT_PROMPTS, (f"the dataset has no caption file -> the {n} "
-                              f"descriptions")
-    if n_terms is None:
-        return TEXT_PROMPTS, (f"the caption file does not say how many terms "
-                              f"its captions have -> the {n} descriptions")
-    if int(n_terms) > 1:
-        return TEXT_PROMPTS, (f"the dataset's captions have {int(n_terms)} "
-                              f"terms -> the {n} descriptions")
     if n_panels is not None:
         n = max(1, min(int(n_panels), n))
     words = [labels[i % len(labels)] for i in range(n)]
-    more = f" (the first {n} of {len(labels)})" if len(labels) > n else ""
-    return ([(_slug(w), w) for w in words],
-            f"the dataset's captions are single labels -> those labels, in "
-            f"turn: {', '.join(labels[:n])}{more}")
+    return [(_slug(w), w) for w in words]
 
 
 def _midi_to_hz(midi) -> float:
@@ -854,13 +840,9 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
                 targets = [data[f"probe_{i:02d}"] for i in range(n_probes)]
                 tok = data["tok"] if "tok" in data.files else None
                 tlen = data["tok_len"] if "tok_len" in data.files else None
-                stale_text = (condition == "text" and tok is None)
-                if stale_text and verbose:
-                    print(f"{tag} cache predates the token sequences "
-                          f"-> rebuilding")
-                if not stale_text and (ext is None
-                                       or all(os.path.exists(_stim_path(i))
-                                              for i in range(n_probes))):
+                if (ext is None
+                        or all(os.path.exists(_stim_path(i))
+                               for i in range(n_probes))):
                     if verbose:
                         print(f"{tag} cache hit: {n_probes} stimuli "
                               f"from {probe_dir}")

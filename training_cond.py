@@ -44,21 +44,19 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from audio_dataset_npy import frames_per_chunk
+from dataset_utils import frames_per_chunk
 
 import latent_codec as lc
-from network_cond import (ConditionedAudioDiT, check_ckpt_reinject_gate,
-                          ckpt_attention, ckpt_qk_norm, ckpt_inpainting,
-                          ATTENTION_KINDS)
+from network_cond import ConditionedAudioDiT, ATTENTION_KINDS
 from audio_dataset_cond import (
-    build_conditioned_datasets, collate_conditioned, load_caption_table,
+    build_conditioned_datasets, collate_conditioned,
 )
 from conditions import (
     ConditionRegistry,
     CONDITION_CONFIG,
     make_null_frame_conditions, make_null_global_conditions,
 )
-from sampling_cond import T_SCHEDULES, T_SCHEDULE_RENAMED, euler_grid
+from sampling_cond import T_SCHEDULES, euler_grid
 from metrics import (
     precompute_latent_reference,
     compute_codec_metrics,
@@ -228,9 +226,8 @@ def _cache_fingerprint(cfg, n_frames, di=None):
     }
 
 
-def _validate_cache(cache_dir, fingerprint, guarded_files):
+def _validate_cache(cache_dir, fingerprint):
     meta_path = os.path.join(cache_dir, "cache_meta.json")
-    present = [f for f in guarded_files if os.path.exists(f)]
 
     if os.path.exists(meta_path):
         try:
@@ -249,15 +246,6 @@ def _validate_cache(cache_dir, fingerprint, guarded_files):
             f"  current: {json.dumps(fingerprint, sort_keys=True)}\n"
             "Point paths.cache_dir to a fresh directory, or delete "
             "normalizer.pt / fd_codec_ref_stats.pt / cache_meta.json there.")
-
-    if present:
-        raise SystemExit(
-            "[cache] UNVERIFIABLE CACHE: found "
-            f"{[os.path.basename(f) for f in present]} in\n  {cache_dir}\n"
-            "but no cache_meta.json to tie them to a dataset. After the "
-            "preprocessing refactor the latent statistics changed, so an old "
-            "cache is almost certainly stale. Delete those files (and any "
-            "cache_meta.json) or use a fresh paths.cache_dir.")
 
     os.makedirs(cache_dir, exist_ok=True)
     Path(meta_path).write_text(json.dumps(fingerprint, indent=2))
@@ -319,19 +307,11 @@ def merge_cli_overrides(cfg, dotlist, where):
         base_keys = set(_flatten_keys(OmegaConf.to_container(cfg, resolve=False)))
         bad = [k for k in _flatten_keys(OmegaConf.to_container(cli_cfg))
                if k not in base_keys]
-        notes = dict.fromkeys(
-            OBSOLETE_SAMPLING_KEYS[k.partition(".")[2]] for k in bad
-            if k.startswith("sampling.")
-            and k.partition(".")[2] in OBSOLETE_SAMPLING_KEYS)
-        notes.update(dict.fromkeys(
-            f"{k} is now called {RENAMED_KEYS[k]}." for k in bad
-            if k in RENAMED_KEYS))
-        _hint = "".join(f"\n          {n}" for n in notes)
         raise SystemExit(
             f"[config] unknown CLI override key(s): {bad or [str(e)]}\n"
             f"          These do not exist in {where}. Check the "
             f"spelling and the dotted path (e.g. 'data.num_val_batches', not "
-            f"'data_num_val_batches'). Nothing was run.{_hint}")
+            f"'data_num_val_batches'). Nothing was run.")
     OmegaConf.set_struct(cfg, False)
     return cfg
 
@@ -359,37 +339,13 @@ def load_config():
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
         _meta = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if "config" in _meta and _meta["config"] is not None:
-            ckpt_cfg = OmegaConf.create(_meta["config"])
-            cfg = OmegaConf.merge(cfg, ckpt_cfg)
-            print("[RESUME] Config restored from checkpoint "
-                  f"(model.kind={cfg.model.kind}, "
-                  f"frame_reinject_every={cfg.model.get('frame_reinject_every', 0)}, "
-                  f"attention={cfg.model.get('attention', 'standard')}, "
-                  f"t_sampler={cfg.training.get('t_sampler', 'logit_normal')}, "
-                  f"t_schedule={cfg.sampling.get('t_schedule', None) or 'uniform'}, "
-                  f"enabled_frame={cfg.conditioning.enabled_frame}, "
-                  f"enabled_global={cfg.conditioning.enabled_global}, "
-                  f"train_batch_size={cfg.data.train_batch_size}).")
-        elif "model_kind" in _meta:
-            cfg.model.kind = _meta["model_kind"]
-            print(f"[RESUME] model.kind restored from checkpoint: {cfg.model.kind} "
-                  "(older checkpoint without full config; other params come "
-                  "from the YAML/CLI).")
-        cfg.model.qk_norm = ckpt_qk_norm(_meta)
-        cfg.training.inpainting = ckpt_inpainting(_meta)
-        _ck_trn = (_meta.get("config") or {}).get("training") or {}
-        _legacy = {k: v for k, v in LEGACY_TRAINING_KEYS.items()
-                   if k not in _ck_trn}
-        for _k, _v in _legacy.items():
-            cfg.training[_k] = _v
-        print(f"[RESUME] model.qk_norm={cfg.model.qk_norm}, "
-              f"training.inpainting={cfg.training.inpainting} (read off the weights)"
-              + (f" | absent from this checkpoint, set to what it was trained "
-                 f"with: {_legacy}" if _legacy else ""))
+        cfg = OmegaConf.merge(cfg, OmegaConf.create(_meta["config"]))
+        print("[RESUME] Config restored from checkpoint "
+              f"(model.kind={cfg.model.kind}, "
+              f"enabled_frame={cfg.conditioning.enabled_frame}, "
+              f"enabled_global={cfg.conditioning.enabled_global}, "
+              f"train_batch_size={cfg.data.train_batch_size}).")
         del _meta
-
-    drop_obsolete_sampling_keys(cfg)
 
     cfg = merge_cli_overrides(cfg, unknown, args.config)
 
@@ -456,7 +412,7 @@ def load_config():
             f"[config] training.lr_inv_gamma = {_trn.get('lr_inv_gamma')} must be "
             f"> 0 and training.lr_power = {_trn.get('lr_power')} must be >= 0. "
             f"Nothing was run.")
-    _betas = list(_trn.get("adam_betas", LEGACY_TRAINING_KEYS["adam_betas"]))
+    _betas = list(_trn.adam_betas)
     if len(_betas) != 2 or not all(0.0 <= float(b) < 1.0 for b in _betas):
         raise SystemExit(
             f"[config] training.adam_betas = {_betas}, must be two values in "
@@ -489,12 +445,6 @@ def load_config():
 
 
 LR_SCHEDULES = ("inverse_power", "cosine")
-LEGACY_TRAINING_KEYS = {
-    "lr_schedule": "cosine",
-    "adam_betas": [0.9, 0.999],
-    "adam_eps": 1e-8,
-    "weight_decay_matrices_only": False,
-}
 
 
 def make_lr_lambda(num_steps: int, warmup_steps: int, decay_start_frac: float,
@@ -553,20 +503,19 @@ def build_optimizer(model, train_cfg, layout: str):
         groups = [{"params": [p for _, p in named], "weight_decay": wd}]
     else:
         raise ValueError(f"optimizer layout must be 'single' or 'matrices', got {layout!r}")
-    betas = train_cfg.get("adam_betas", LEGACY_TRAINING_KEYS["adam_betas"])
+    betas = train_cfg.adam_betas
     return torch.optim.AdamW(
         groups,
         lr=float(train_cfg.lr),
         betas=(float(betas[0]), float(betas[1])),
-        eps=float(train_cfg.get("adam_eps", LEGACY_TRAINING_KEYS["adam_eps"])),
+        eps=float(train_cfg.adam_eps),
     )
 
 
 def optimizer_overrides_ignored(optimizer, scheduler, train_cfg) -> list:
     g = optimizer.param_groups[0]
-    betas = tuple(float(b) for b in
-                  train_cfg.get("adam_betas", LEGACY_TRAINING_KEYS["adam_betas"]))
-    eps = float(train_cfg.get("adam_eps", LEGACY_TRAINING_KEYS["adam_eps"]))
+    betas = tuple(float(b) for b in train_cfg.adam_betas)
+    eps = float(train_cfg.adam_eps)
     out = []
     if not math.isclose(scheduler.base_lrs[0], float(train_cfg.lr), rel_tol=1e-9):
         out.append(f"lr={scheduler.base_lrs[0]:g} (training.lr={float(train_cfg.lr):g})")
@@ -605,7 +554,6 @@ def sample_t_uniform(batch_size, device, t_min, t_max):
 
 
 T_SAMPLERS = ("logit_normal", "truncated_logit", "uniform")
-T_SAMPLER_RENAMED = {"sa3": "truncated_logit"}
 
 INPAINT_MASKS_DEFAULT = (0.8, 0.1, 0.05, 0.05)
 
@@ -725,7 +673,6 @@ def apply_cfg_dropout(frame_cond, global_cond, device, global_configs, B,
     return frame_cond, global_cond, text_ctx_mask
 
 
-VALIDATION_PROTOCOL = "fixed_subset_common_noise_sample_weighted_v2"
 
 INPAINT_WINDOWS = ("1_start", "2_middle", "3_end")
 INPAINT_MAX_SPANS = 5
@@ -1139,71 +1086,6 @@ def resolve_influence_subsets(spec, active_names):
 PANEL_KEYS = {"test": "n_test_panels", "probe": "n_probe_panels"}
 PANEL_DEFAULT = 8
 
-_PANELS_NOTE = (
-    "The Condition_influence table is computed on all the "
-    "sampling.n_metrics_samples generations; the listening panels are "
-    "sampling.n_test_panels (test samples) and sampling.n_probe_panels "
-    "(probe stimuli).")
-OBSOLETE_SAMPLING_KEYS = {
-    "n_influence_samples": _PANELS_NOTE,
-    "n_influence_samples_valid": _PANELS_NOTE,
-    "n_influence_samples_probe": _PANELS_NOTE,
-    "n_similarity_samples": (
-        "The text / image similarity is a column of the Condition_influence "
-        "table, on the same generations as FD-codec / KL / FAD; it has no "
-        "curve of its own any more."),
-    "n_val_save": (
-        "The validation generations are no longer written to disk: "
-        "runs/<run>/audio/ holds what the Audio window shows -- test/, "
-        "probe/ (each panel with everything it was conditioned on) and "
-        "uncond/."),
-}
-RENAMED_KEYS = {"metrics.dac_device": "metrics.codec_device"}
-RENAMED_METRICS = {"fd_dac": "fd_codec", "kl_dac": "kl_codec"}
-
-
-def drop_obsolete_sampling_keys(cfg):
-    for _from, _to in RENAMED_KEYS.items():
-        _sec, _, _key = _from.partition(".")
-        _node = cfg.get(_sec, None)
-        if _node is not None and _key in _node:
-            _node[_to.partition(".")[2]] = _node.pop(_key)
-            print(f"[config] {_from} is now called {_to}.")
-    _met = cfg.get("metrics", None)
-    _enabled = _met.get("enabled", None) if _met is not None else None
-    if _enabled is not None:
-        _new = [RENAMED_METRICS.get(m, m) for m in _enabled]
-        if _new != list(_enabled):
-            print(f"[config] metrics.enabled: {list(_enabled)} is now called {_new}.")
-            _met["enabled"] = _new
-    smp = cfg.get("sampling", None)
-    if smp is None:
-        return
-    gone = [k for k in OBSOLETE_SAMPLING_KEYS if k in smp]
-    for k in gone:
-        del smp[k]
-    for note in dict.fromkeys(OBSOLETE_SAMPLING_KEYS[k] for k in gone):
-        keys = [k for k in gone if OBSOLETE_SAMPLING_KEYS[k] == note]
-        print(f"[config] sampling.{', sampling.'.join(keys)}: no longer read. "
-              f"{note}")
-    for k in PANEL_KEYS.values():
-        if smp.get(k, None) is None:
-            smp[k] = PANEL_DEFAULT
-    if smp.get("t_schedule", None) is None:
-        smp["t_schedule"] = "uniform"
-    _old = smp.get("t_schedule")
-    if _old in T_SCHEDULE_RENAMED:
-        smp["t_schedule"] = T_SCHEDULE_RENAMED[_old]
-        print(f"[config] sampling.t_schedule: {_old!r} is now called "
-              f"{smp['t_schedule']!r}.")
-    trn = cfg.get("training", None)
-    if trn is not None and trn.get("t_sampler", None) in T_SAMPLER_RENAMED:
-        _old = trn.get("t_sampler")
-        trn["t_sampler"] = T_SAMPLER_RENAMED[_old]
-        print(f"[config] training.t_sampler: {_old!r} is now called "
-              f"{trn['t_sampler']!r}.")
-
-
 def panel_count(sampling_cfg, which) -> int:
     if sampling_cfg is None:
         return PANEL_DEFAULT
@@ -1610,103 +1492,13 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                      _w[i].numpy(), lc.active().sample_rate)
 
 
-def load_text_label_vocab(latent_root):
-    try:
-        d = Path(latent_root).parent / "global_conditions"
-        js, npy = d / "text_vocab.json", d / "text_vocab.npy"
-        if not (js.exists() and npy.exists()):
-            return None, None
-        phrases = json.loads(js.read_text(encoding="utf-8"))["phrases"]
-        return list(phrases), np.load(str(npy)).astype(np.float32)
-    except Exception as e:
-        print(f"[metrics] label vocabulary unreadable ({type(e).__name__}: {e})")
-        return None, None
-
-
-def load_text_captions(latent_root):
-    try:
-        p = Path(latent_root).parent / "global_conditions" / "text_labels.jsonl"
-        if not p.exists():
-            return {}
-        out = {}
-        with open(p, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                r = json.loads(line)
-                if r.get("chunk"):
-                    out[r["chunk"]] = r.get("caption") or r.get("class") or ""
-        return out
-    except Exception as e:
-        print(f"[metrics] text_labels.jsonl unreadable "
-              f"({type(e).__name__}: {e})")
-        return {}
-
-
-def load_caption_conditions(latent_root):
-    t = load_caption_table(latent_root)
-    if not t or "emb" not in t:
-        return {}, None
-    return t.get("ids", {}), t["emb"]
-
-
-def _chunk_key_of(val_dataset, cond_path):
-    try:
-        if cond_path is None:
-            return None
-        root = Path(val_dataset.latent_root).parent / "conditions"
-        return Path(cond_path).relative_to(root).with_suffix("").as_posix()
-    except Exception:
-        return None
-
-
-def describe_validation_sample(val_dataset, ds_idx, captions=None,
-                               phrases=None, vocab_emb=None, k=1):
-    try:
-        if not (0 <= ds_idx < len(val_dataset.samples)):
-            return ""
-        npy_path, cond_path, _start, _lab, class_name = \
-            val_dataset.samples[ds_idx]
-        if captions:
-            key = _chunk_key_of(val_dataset, cond_path)
-            if key is not None and key in captions:
-                return captions[key]
-        if not phrases or vocab_emb is None or cond_path is None:
-            return str(class_name)
-        with np.load(str(cond_path)) as z:
-            if "text" not in z:
-                return str(class_name)
-            vec = z["text"]
-        from conditions import nearest_phrases
-        near = nearest_phrases(vec, vocab_emb, phrases, k=k)
-        if not near:
-            return str(class_name)
-        return (f"{class_name} · "
-                + ", ".join(f"\"{p}\" ({c:+.2f})" for p, c in near))
-    except Exception:
-        return ""
-
-
 def panel_suffixes(dataset, ds_indices, global_configs):
     if "text" not in (global_configs or {}) or dataset is None:
         return {}
-    key = (id(dataset), tuple(int(i) for i in ds_indices))
-    cache = getattr(panel_suffixes, "_cache", None)
-    if cache is None:
-        cache = panel_suffixes._cache = {}
-    if key in cache:
-        return cache[key]
-
-    captions = load_text_captions(dataset.latent_root)
-    phrases, vocab = ((None, None) if captions
-                      else load_text_label_vocab(dataset.latent_root))
     out = {}
     for k, idx in enumerate(ds_indices):
-        desc = describe_validation_sample(dataset, int(idx), captions,
-                                          phrases, vocab)
-        out[k] = f" [{desc}]" if desc else ""
-    cache[key] = out
+        desc = dataset.generation_string(int(idx)) or dataset.samples[int(idx)][4]
+        out[k] = f" [{desc.replace('/', '-')[:60]}]"
     return out
 
 
@@ -1748,41 +1540,21 @@ def write_panel_conditions(pdir, info, arrays, sonified, real_wav=None,
         fh.write("\n")
 
 
-def test_text_given(dataset, idx, vec, wants_ctx):
-    table = (getattr(dataset, "_captions", None)
-             or load_caption_table(dataset.latent_root) or {})
-    key = _chunk_key_of(dataset, dataset.samples[idx][1])
-    cid = (table.get("ids") or {}).get(key) if key is not None else None
-    strings = table.get("captions_text") or table.get("captions") or []
-    sentence = (strings[cid] if cid is not None and cid < len(strings)
-                else None)
-    emb = table.get("emb")
-    v = np.asarray(vec, dtype=np.float32).reshape(-1)
-    if (cid is not None and emb is not None and cid < len(emb)
-            and np.array_equal(v, np.asarray(emb[cid]).reshape(-1))):
-        slot = "caption"
-        lines = [sentence if sentence is not None
-                 else "[caption embedding, its sentence is not stored in "
-                      "the dataset]"]
-    elif not v.any():
-        slot = "null"
-        lines = ["[no sentence] The text slot received the null vector "
-                 "(zeros): this chunk has no text vector."]
+def test_text_given(dataset, idx, wants_ctx):
+    kind = dataset.generation_text_source
+    sentence = dataset.generation_string(idx)
+    if sentence is not None:
+        lines = [sentence]
+    elif kind == "audio":
+        lines = ["[no sentence] The text slot received the CLAP audio embedding "
+                 "of this chunk: the vector is 'text' in conditions.npz."]
     else:
-        slot = "audio_embedding"
-        lines = ["[no sentence] The text slot received the CLAP audio "
-                 "embedding of this chunk, not a text: the vector is 'text' "
-                 "in conditions.npz."]
-    info = {"slot": slot, "sentence": sentence if slot == "caption" else None}
-    if wants_ctx:
-        ctx = (sentence if table.get("tok") is not None and cid is not None
-               else None)
-        info["cross_attention_tokens"] = ctx
-        if ctx is None:
-            lines.append("Cross-attention: the learned null token (no caption "
-                         "tokens for this chunk).")
-        elif slot != "caption":
-            lines.append(f"Cross-attention tokens: {ctx}")
+        lines = [f"[no sentence] The text slot received the null vector (zeros): "
+                 f"this source has no {kind}."]
+    info = {"slot": kind if sentence is not None or kind == "audio" else "null",
+            "sentence": sentence}
+    if wants_ctx and sentence is None:
+        lines.append("Cross-attention: the learned null token.")
     return lines, info
 
 
@@ -1790,7 +1562,7 @@ def test_text_given(dataset, idx, vec, wants_ctx):
 def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     step, writer, device, output_dir, use_amp, sampling_cfg,
                     guidance, frame_dims, global_configs, fidelity_evaluator,
-                    codec_model, prefix, metrics_seed=None, text_vec_for=None,
+                    codec_model, prefix, metrics_seed=None,
                     subset_specs=(), image_root=None, mine=None,
                     inpainting=False, inpaint_only=False):
     from probe_conditions import plot_condition_comparison
@@ -1810,8 +1582,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
     for idx in ds_indices:
         frames_real, fcond, _lab, text_emb, image_emb, text_ctx = \
             test_dataset[idx]
-        if text_vec_for is not None:
-            text_emb = text_vec_for(test_dataset, idx, text_emb)
+        text_emb = test_dataset.generation_text(idx, text_emb)
         items.append((frames_real, fcond, text_emb, image_emb, text_ctx))
 
     def _fc(grp, subset=None):
@@ -2007,8 +1778,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                 "frame_conditions": names, "global_conditions": gnames}
         if "text" in gnames:
             arrays["text"] = items[k][2].cpu().numpy()
-            text_lines, info["text"] = test_text_given(
-                test_dataset, idx, items[k][2], wants_ctx)
+            text_lines, info["text"] = test_text_given(test_dataset, idx, wants_ctx)
         if "image" in gnames:
             arrays["image"] = items[k][3].cpu().numpy()
             _iref = test_dataset.image_file_for(idx)
@@ -2110,41 +1880,12 @@ def run_uncond_inpaint_panels(test_dataset, ds_indices, model, normalizer,
                      _w[k].numpy(), sr)
 
 
-def caption_text_vec_fn(latent_root, sampling_cfg, global_configs):
-    cap_ids, cap_emb = ({}, None)
-    if (sampling_cfg is not None
-            and bool(sampling_cfg.get("validation_text_from_caption", False))
-            and "text" in (global_configs or {})):
-        cap_ids, cap_emb = load_caption_conditions(latent_root)
-        if cap_emb is None:
-            print("    [metrics] validation_text_from_caption is on but this "
-                  "dataset carries no caption embeddings -- re-run the "
-                  "preprocessing with --global text. Falling back to the "
-                  "chunk's own CLAP vector.")
-        else:
-            print(f"    [metrics] text conditioned on the DESCRIPTION "
-                  f"({cap_emb.shape[0]} distinct caption(s))")
-
-    def text_vec_for(dataset, idx, text_emb):
-        if cap_emb is None:
-            return text_emb
-        try:
-            key = _chunk_key_of(dataset, dataset.samples[idx][1])
-            cid = cap_ids.get(key)
-            if cid is None:
-                return text_emb
-            return torch.from_numpy(cap_emb[cid].copy())
-        except Exception:
-            return text_emb
-    return text_vec_for
-
-
 @torch.no_grad()
 def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                          sampling_cfg, conditioning_cfg, use_amp, frame_dims,
                          global_configs, fidelity_evaluator, test_dataset,
                          probe_sets, n_frames, prefix="EMA", metrics_seed=None,
-                         image_root=None, text_vec_for=None, dist_info=None,
+                         image_root=None, dist_info=None,
                          inpaint_only=False):
     guidance = float(conditioning_cfg.guidance_scale)
     any_cond_active = bool(frame_dims) or bool(global_configs)
@@ -2165,9 +1906,6 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
         _t_idx = test_panel_indices(len(test_dataset),
                                     panel_count(sampling_cfg, "test"))
         if _t_idx:
-            if text_vec_for is None:
-                text_vec_for = caption_text_vec_fn(
-                    test_dataset.latent_root, sampling_cfg, global_configs)
             print(f"    test panels: {len(_t_idx)} samples of the test split...")
             try:
                 run_test_panels(
@@ -2178,7 +1916,7 @@ def log_listening_panels(model, normalizer, step, writer, device, output_dir,
                     frame_dims=frame_dims, global_configs=global_configs,
                     fidelity_evaluator=fidelity_evaluator, codec_model=codec_model,
                     prefix=prefix, metrics_seed=metrics_seed,
-                    text_vec_for=text_vec_for, subset_specs=subset_specs,
+                    subset_specs=subset_specs,
                     image_root=image_root, mine=mine, inpainting=inpainting,
                     inpaint_only=inpaint_only)
             except Exception as _e:
@@ -2318,7 +2056,7 @@ def evaluate_inpainting(
     fidelity_evaluator=None, global_embedders=None, compute_uncond=True,
     metrics_seed=None, metrics_enabled=COND_METRICS, fad_embedder=None,
     n_fad=0, fad_device="cuda", fad_reference="decoded", wav_root=None,
-    text_vec_for=None, dist_info=None, subset_specs=(), mir_curves=False,
+    dist_info=None, subset_specs=(), mir_curves=False,
     tag_prefix="Validation", split_name="validation", prefix="EMA",
 ):
     from condition_metrics import (pair_influence, pair_scalar,
@@ -2348,9 +2086,6 @@ def evaluate_inpainting(
     spf = int(sampling_cfg.get("metrics_samples_per_forward", 1))
     paired = spf >= 1 and guidance > 1.0 and any_cond
     wants_ctx = bool(getattr(model, "text_cross_layers", None))
-    if text_vec_for is None:
-        text_vec_for = caption_text_vec_fn(val_dataset.latent_root, sampling_cfg,
-                                           global_configs)
     codec_model = get_codec()
     _mi = f"{tag_prefix}/Inpainting"
     _fd = "dac" if lc.active().name == "dac_44khz" else "encodec"
@@ -2364,7 +2099,7 @@ def evaluate_inpainting(
     for j in own:
         idx = indices[j]
         frames_real, fcond, _lab, text_emb, image_emb, text_ctx = val_dataset[idx]
-        items[j] = (frames_real, fcond, text_vec_for(val_dataset, idx, text_emb),
+        items[j] = (frames_real, fcond, val_dataset.generation_text(idx, text_emb),
                     image_emb, text_ctx)
 
     key = (str(val_dataset.latent_root), tuple(int(i) for i in indices), n_frames,
@@ -2497,6 +2232,8 @@ def evaluate_inpainting(
                         sample_id=j, frames=(lo, hi))
                 for c in gsim_names:
                     t = items[j][2] if c == "text" else items[j][3]
+                    if not t.any():
+                        continue
                     try:
                         emb = global_embedders[c].embed(seg.numpy(), sr)
                         gsims[c][j] = float(np.dot(emb, np.asarray(t.cpu()).reshape(-1)))
@@ -2696,8 +2433,6 @@ def evaluate_and_log_metrics(
         return _di is None or (j % _di.world) == _di.rank
 
     frame_active = (fidelity_evaluator is not None and fidelity_evaluator.active)
-    _text_vec_for = caption_text_vec_fn(val_dataset.latent_root, sampling_cfg,
-                                        global_configs)
 
     gsim_names = sorted(c for c in (global_configs or {})
                         if (global_embedders or {}).get(c) is not None)
@@ -2720,7 +2455,7 @@ def evaluate_and_log_metrics(
             metrics_seed=metrics_seed, metrics_enabled=metrics_enabled,
             fad_embedder=fad_embedder, n_fad=n_fad, fad_device=fad_device,
             fad_reference=fad_reference, wav_root=wav_root,
-            text_vec_for=_text_vec_for, dist_info=dist_info,
+            dist_info=dist_info,
             subset_specs=subset_specs, mir_curves=mir_curves,
             tag_prefix=tag_prefix, split_name=split_name, prefix=prefix)
 
@@ -2744,7 +2479,7 @@ def evaluate_and_log_metrics(
             fidelity_evaluator=fidelity_evaluator, test_dataset=test_dataset,
             probe_sets=probe_sets, n_frames=n_frames, prefix=prefix,
             metrics_seed=metrics_seed, image_root=image_root,
-            text_vec_for=_text_vec_for, dist_info=_di, inpaint_only=True)
+            dist_info=_di, inpaint_only=True)
         return None, None, None
 
     ref_frames = (fd_codec_ref_stats["n_total"]
@@ -2782,7 +2517,7 @@ def evaluate_and_log_metrics(
                 continue
             (_frames_real, frame_cond_real, _lab, text_emb, image_emb,
              text_ctx) = val_dataset[idx]
-            text_emb = _text_vec_for(val_dataset, idx, text_emb)
+            text_emb = val_dataset.generation_text(idx, text_emb)
             if conditioned:
                 fc = {k: v.unsqueeze(0).to(device).float()
                       for k, v in frame_cond_real.items()
@@ -2839,7 +2574,7 @@ def evaluate_and_log_metrics(
                 idx = indices[j]
                 (_frames_real, frame_cond_real, _lab, text_emb, image_emb,
                  text_ctx) = val_dataset[idx]
-                text_emb = _text_vec_for(val_dataset, idx, text_emb)
+                text_emb = val_dataset.generation_text(idx, text_emb)
                 fcs.append(frame_cond_real)
                 gcs.append((text_emb, image_emb))
                 ctxs.append(text_ctx)
@@ -2968,7 +2703,7 @@ def evaluate_and_log_metrics(
                         sample_id=i)
                 for c in gsim_names:
                     t = cond_globals[i].get(c) if i < len(cond_globals) else None
-                    if t is None:
+                    if t is None or not np.any(t):
                         continue
                     try:
                         emb = global_embedders[c].embed(wn, lc.active().sample_rate)
@@ -3255,7 +2990,7 @@ def evaluate_and_log_metrics(
         fidelity_evaluator=fidelity_evaluator, test_dataset=test_dataset,
         probe_sets=probe_sets, n_frames=n_frames, prefix=prefix,
         metrics_seed=metrics_seed, image_root=image_root,
-        text_vec_for=_text_vec_for, dist_info=_di)
+        dist_info=_di)
 
     return fd_codec_cond, kl_cond["kl_real_gen"], kl_cond["kl_gen_real"]
 
@@ -3399,10 +3134,8 @@ def _build_probe_set(cfg, registry, fidelity_evaluator, dataset,
                              getattr(_probe_extractor, "_device", "cpu"))
         _bank = None
         if _cond == "text":
-            _bank, _why = text_probe_bank(
-                load_caption_table(dataset.latent_root),
-                n_panels=_n_probes)
-            print(f"[text-probe] {_why}")
+            _bank = text_probe_bank(dataset._text_table.get("labels"),
+                                    dataset.text_source, n_panels=_n_probes)
         _ps = build_condition_probe_set(
             _cond, _probe_root, dataset.n_frames,
             extractor=_probe_extractor,
@@ -3513,7 +3246,6 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
         "global_configs":       global_configs,
         "n_frames":             n_frames,
         "run_name":             run_name,
-        "validation_protocol":  VALIDATION_PROTOCOL,
         "rng_state":            _capture_rng_state(data_generator),
     }
     if cfg.training.use_ema and ema is not None:
@@ -3820,13 +3552,7 @@ if __name__ == "__main__":
     _fingerprint = _cache_fingerprint(cfg, _n_frames_fp, DIST)
     if DIST.enabled and not DIST.is_main:
         dist_barrier(DIST)
-    _old_fd_cache = os.path.join(cache_dir, "fd_dac_ref_stats.pt")
-    if os.path.exists(_old_fd_cache) and not os.path.exists(fd_codec_cache_path):
-        os.replace(_old_fd_cache, fd_codec_cache_path)
-        print("[cache] fd_dac_ref_stats.pt is now called fd_codec_ref_stats.pt.")
-    _validate_cache(cache_dir, _fingerprint,
-                    guarded_files=[normalizer_path, fd_codec_cache_path,
-                                   fad_cache_path])
+    _validate_cache(cache_dir, _fingerprint)
     if DIST.enabled and DIST.is_main:
         dist_barrier(DIST)
 
@@ -3865,9 +3591,7 @@ if __name__ == "__main__":
     if _unknown:
         raise SystemExit(
             f"[metrics] metrics.enabled contains {_unknown}, which the CONDITIONED "
-            f"pipeline does not provide. Available: {list(COND_METRICS)}. "
-            f"(fad_encodec needs the Encodec embedder and is not wired here; "
-            f"fad_vggish is.)")
+            f"pipeline does not provide. Available: {list(COND_METRICS)}.")
     print(f"[metrics] enabled: {metrics_enabled or '(none: distributional metrics off)'}")
 
     influence_family, mir_threshold = read_influence_settings(metrics_cfg)
@@ -3953,13 +3677,11 @@ if __name__ == "__main__":
     _norm_split = DIST.enabled and dist_broadcast_object(
         not os.path.exists(normalizer_path), DIST)
     cond_root = cfg.paths.condition_root if Path(cfg.paths.condition_root).exists() else None
-    img_root  = cfg.paths.image_root     if Path(cfg.paths.image_root).exists()     else None
 
     train_dataset, val_dataset, test_dataset, normalizer, label_map, split_info = \
         build_conditioned_datasets(
             latent_root=cfg.paths.dataset_root,
             condition_root=cond_root,
-            image_root=img_root,
             duration_s=cfg.model.duration_s,
             normalizer_path=(normalizer_path
                              if os.path.exists(normalizer_path) and not _norm_split
@@ -3967,8 +3689,8 @@ if __name__ == "__main__":
             registry=registry,
             preload=False,
             strict_conditions=strict_conditions,
-            text_source=cfg.conditioning.get("text_source", "audio"),
-            text_mix_p=cfg.conditioning.get("text_mix_p", 0.5),
+            text_source=cfg.conditioning.text_source,
+            validation_text_source=cfg.sampling.get("validation_text_source", None),
             splits_path=cfg.paths.get("splits_path", None),
             normalizer_shard=(DIST.rank, DIST.world) if _norm_split else None,
             normalizer_merge=dist_normalizer_merge(DIST) if _norm_split else None,
@@ -4047,8 +3769,7 @@ if __name__ == "__main__":
             float(cfg.sampling.t_min), float(cfg.sampling.t_max))
         fixed_val_inputs.append((fixed_x0, fixed_t))
     n_fixed_val_samples = sum(int(vb[0].shape[0]) for vb in fixed_val_batches)
-    print(f"[validation] fixed protocol={VALIDATION_PROTOCOL} | "
-          f"shuffle={validation_shuffle} | seed={validation_seed} | "
+    print(f"[validation] shuffle={validation_shuffle} | seed={validation_seed} | "
           f"batches={len(fixed_val_batches)} | "
           f"samples={n_fixed_val_samples}")
 
@@ -4231,15 +3952,8 @@ if __name__ == "__main__":
     TEXT_CTX_DIM = int(getattr(train_dataset, "_ctx_dim", 0) or 0)
     if TEXT_CROSS_EVERY > 0 and "text" in GLOBAL_CONFIGS and TEXT_CTX_DIM <= 0:
         raise RuntimeError(
-            "model.text_cross_every > 0 but this dataset carries no caption "
-            "TOKEN sequences (global_conditions/text_labels_tok.npy), so the "
-            "cross-attention would attend to the null token at every step and "
-            "learn nothing -- silently, which is why this refuses to start "
-            "instead of warning.\n"
-            "  Re-run the preprocessing on the SAME output dir with "
-            "--global_conds text: it rewrites only the sidecar, reads back the CLAP "
-            "vectors already on disk and does not touch a single audio file."
-        )
+            "model.text_cross_every > 0 attends to the tokens of a written "
+            "text: it needs conditioning.text_source label or text.")
     ATTENTION = str(cfg.model.get("attention", "standard"))
     QK_NORM = bool(cfg.model.get("qk_norm", False))
     INPAINTING = bool(cfg.training.get("inpainting", False))
@@ -4316,14 +4030,13 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"paths.init_from: {init_from} not found")
         print(f"Warm start from: {init_from}")
         _ck = torch.load(init_from, map_location="cpu", weights_only=False)
-        check_ckpt_reinject_gate(_ck, init_from)
-        _ck_codec = lc.codec_from_ckpt(_ck)
+        _ck_codec = _ck["codec"]
         if _ck_codec != lc.active().name:
             raise RuntimeError(
                 f"{init_from} was trained on {_ck_codec} latents, this dataset "
                 f"is {lc.active().name}. The two codecs have different latent "
                 f"widths and frame rates: the weights cannot be carried over.")
-        _ck_att = ckpt_attention(_ck)
+        _ck_att = _ck["attention"]
         if _ck_att != ATTENTION:
             raise RuntimeError(
                 f"{init_from} was trained with model.attention='{_ck_att}', "
@@ -4332,7 +4045,7 @@ if __name__ == "__main__":
                 f"what the existing ones compute, so it needs a run from "
                 f"scratch (leave paths.init_from empty), or set "
                 f"model.attention={_ck_att} to warm-start as before.")
-        _ck_qk = ckpt_qk_norm(_ck)
+        _ck_qk = _ck["qk_norm"]
         if _ck_qk != QK_NORM:
             raise RuntimeError(
                 f"{init_from} was trained with model.qk_norm={_ck_qk}, this run "
@@ -4341,7 +4054,7 @@ if __name__ == "__main__":
                 f"q/k weights compute, so it needs a run from scratch (leave "
                 f"paths.init_from empty), or set model.qk_norm={_ck_qk} to "
                 f"warm-start as before.")
-        if ckpt_inpainting(_ck) and not INPAINTING:
+        if _ck["inpainting"] and not INPAINTING:
             raise RuntimeError(
                 f"{init_from} was trained with training.inpainting=true, this "
                 f"run builds the model without the inpainting context layers. "
@@ -4395,7 +4108,7 @@ if __name__ == "__main__":
                 f"checkpoint; if you passed model.kind on the command line, "
                 f"remove it or set it to '{ckpt_kind}'.)"
             )
-        ckpt_cross = int(ckpt.get("text_cross_every", 0))
+        ckpt_cross = ckpt["text_cross_every"]
         if ckpt_cross != TEXT_CROSS_EVERY:
             raise RuntimeError(
                 f"Checkpoint was trained with model.text_cross_every="
@@ -4409,7 +4122,7 @@ if __name__ == "__main__":
                 f"so nothing is lost by warm-starting from this checkpoint "
                 f"with paths.init_from instead, if the run supports it."
             )
-        ckpt_reinject = int(ckpt.get("frame_reinject_every", 0))
+        ckpt_reinject = ckpt["frame_reinject_every"]
         if ckpt_reinject != FRAME_REINJECT_EVERY:
             raise RuntimeError(
                 f"Checkpoint was trained with model.frame_reinject_every="
@@ -4423,15 +4136,14 @@ if __name__ == "__main__":
                 f"different value, do not use --resume: this is a different "
                 f"architecture and needs its own run.)"
             )
-        check_ckpt_reinject_gate(ckpt, cfg.paths.resume_from)
-        ckpt_codec = lc.codec_from_ckpt(ckpt)
+        ckpt_codec = ckpt["codec"]
         if ckpt_codec != lc.active().name:
             raise RuntimeError(
                 f"Checkpoint was trained on {ckpt_codec} latents but this "
                 f"dataset is {lc.active().name} (its dataset_meta.json). A "
                 f"resume needs the dataset it was trained on: point "
                 f"paths.dataset_root at it.")
-        ckpt_att = ckpt_attention(ckpt)
+        ckpt_att = ckpt["attention"]
         if ckpt_att != ATTENTION:
             raise RuntimeError(
                 f"Checkpoint was trained with model.attention='{ckpt_att}' but "
@@ -4441,25 +4153,23 @@ if __name__ == "__main__":
                 f"per-head RMSNorm) in every block. Pass "
                 f"model.attention={ckpt_att} to resume this run; a different "
                 f"attention is a NEW run from scratch.")
-        ckpt_qk = ckpt_qk_norm(ckpt)
+        ckpt_qk = ckpt["qk_norm"]
         if ckpt_qk != QK_NORM:
             raise RuntimeError(
                 f"Checkpoint was trained with model.qk_norm={ckpt_qk} but the "
                 f"model was built with qk_norm={QK_NORM}. They must match to "
                 f"resume: the QK-norm changes what the q/k weights compute and "
                 f"adds its own gains in every attention layer. Pass "
-                f"model.qk_norm={ckpt_qk} to resume this run (--resume reads it "
-                f"off the checkpoint weights by itself); a different qk_norm is "
-                f"a NEW run from scratch.")
-        ckpt_ip = ckpt_inpainting(ckpt)
+                f"model.qk_norm={ckpt_qk} to resume this run; a different qk_norm "
+                f"is a NEW run from scratch.")
+        ckpt_ip = ckpt["inpainting"]
         if ckpt_ip != INPAINTING:
             raise RuntimeError(
                 f"Checkpoint was trained with training.inpainting={ckpt_ip} but "
                 f"the model was built with inpainting={INPAINTING}. They must "
                 f"match to resume: the inpainting context adds its own layers "
                 f"in every block. Pass training.inpainting={ckpt_ip} to resume "
-                f"this run (--resume reads it off the checkpoint weights by "
-                f"itself); to add inpainting to a trained model, start a NEW "
+                f"this run; to add inpainting to a trained model, start a NEW "
                 f"run with paths.init_from -- its layers start at zero.")
 
         ckpt_frame_dims = ckpt.get("frame_cond_dims", None)
@@ -4493,12 +4203,6 @@ if __name__ == "__main__":
         _restore_rng_state(ckpt.get("rng_state"), data_generator)
         start_step = ckpt["step"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        saved_val_protocol = ckpt.get("validation_protocol", None)
-        if saved_val_protocol != VALIDATION_PROTOCOL:
-            print("[validation] Checkpoint best_val_loss was measured with a "
-                  "different/stochastic protocol; resetting best_val_loss so it "
-                  "is not compared with the new fixed validation curve.")
-            best_val_loss = float("inf")
         print(f"  -> Step {start_step} | best_val_loss: {best_val_loss:.6f}")
         writer.add_text("resumed_from", resume_from, global_step=start_step)
 

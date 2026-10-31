@@ -39,19 +39,14 @@ split_seed:   42
 no_stratify:  false            # true = one global bucket instead of per-class balance
 resplit: false                 # true = redecide the whole split
 split_only:          false     # true = only create/extend splits.json
-import_legacy_split: false
 
 # outputs
 save_wav: "none"               # "none" | "all" | splits, e.g. "val"
 conditions: null               # e.g. "f0,chroma,rhythm,energy,chord,midi" (midi: song.mid next to the audio)
 global_conds: null             # "text" | "image" | "text,image"
 image_root:   null             # image_root/<class>/*.jpg
-text_vocab:   null             # phrase file, one per line; null = built-in vocabulary
-text_labels_n: 2               # terms of the per-chunk text: 1 = class, 2 = class + nearest phrase, ...
 single_class: false
 class_name:   null
-label_source: "dir"            # "dir" (class = folder) | "csv"
-label_csv:    null             # for label_source: csv
 
 # execution
 device:      "cuda"

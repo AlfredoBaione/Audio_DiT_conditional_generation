@@ -30,7 +30,7 @@ it (there are still no split folders on disk).
 | `conditions.py` | Condition registry + extractors (f0/chroma/rhythm/energy/chord/midi, CLAP-text, CLIP-image) and the `FrameConditionEncoder`. |
 | `crema_chord.py` + `crema_chord_weights.npz` | PyTorch port of crema's chord model, with its original weights: the backbone of the `chord` condition (see §1, *The `chord` condition*). |
 | `midi_transcriber.py` | YourMT3+ (audio → MIDI notes), the re-extraction of the `midi` condition from generated audio; downloads its code and checkpoint on first use (see §1, *The `midi` condition*). `--selftest` checks a machine. |
-| `audio_dataset_npy.py` | Unconditional latent dataset **and** the split reader (`load_source_split`). `compute_split` is the old in-code split, kept for `--import_legacy_split` and the unconditional builder. |
+| `dataset_utils.py` | The latent normalizer and the split reader (`load_source_split`). |
 | `audio_dataset_cond.py` | Conditioned dataset + `build_conditioned_datasets` (reads the recorded split). |
 | `network_cond.py` | The `ConditionedAudioDiT` model. |
 | `training_cond.py` | Training loop, cache validation, TensorBoard logging. |
@@ -140,25 +140,24 @@ OUT/
   wav/<class...>/*.wav                # only with --save_wav (per split)
   global_conditions/image/<class>.npy # per-CLASS conditions: --global_conds image
   global_conditions/image/<class>.json#   the image file names, in row order
-  global_conditions/text_vocab.npy    # --global_conds text: the label vocabulary,
-  global_conditions/text_vocab.json   #   CLAP-encoded once (see §3, panels)
-  global_conditions/text_labels.jsonl # --global_conds text: per-CHUNK description,
-  global_conditions/text_labels_cos.npy #  class + nearest phrases, plus the
-  global_conditions/text_labels.json  #   full cosine table (see below)
+  global_conditions/text_table.json   # --global_conds text: labels, texts and
+                                      #   which source has which (see below)
+  global_conditions/label_emb.npy     #   CLAP text embedding of each label
+  global_conditions/label_tok*.npy    #   and its token sequence
+  global_conditions/text_emb.npy      #   the same for each text
+  global_conditions/text_tok*.npy
   dataset_meta.json                   # chunk + acoustic params (re-run safety)
   splits.json                         # source -> train/val/test, plus the
                                       #   per-split counts in BOTH units (see §2)
   source_manifest.json                # what each source was (size/mtime) and which
                                       #   chunks it produced -> detects sources
                                       #   edited in place (stale latents) and
-                                      #   deleted sources (orphan outputs);
-                                      #   also HOW the classes were decided
-                                      #   (--label_source, see below)
+                                      #   deleted sources (orphan outputs)
 ```
 
 Useful flags: `--codec` (see below), `--chunk_duration`, `--chunk_overlap`,
-`--global_conds text,image` (+ `--image_root`), `--label_source` (where the class
-comes from, see below), `--num_gpus` (one process per GPU, see below),
+`--global_conds text,image` (+ `--image_root`), `--num_gpus` (one process per GPU,
+see below),
 `--num_workers` (parallel CPU work; keep **0 on Windows**), `--batch_size` (GPU
 batch: encoder + f0/rhythm/text), `--cpu_batch_size` (batch of the CPU conditions
 in each worker), `--force`, and `--config` to keep all of it in a YAML instead.
@@ -181,7 +180,7 @@ python_gpu_lock -n 2 -- python preprocess_stream.py <SRC> <OUT> --device cuda \
   them (file i to GPU i mod N), and each file is done entirely by one GPU.
 - **Once, by the first process:** `splits.json` and `dataset_meta.json` before
   the others start; after all of them have finished, `source_manifest.json`, the
-  per-class image bank, the text vocabulary and `text_labels`, the chunk counts.
+  per-class image bank, the text table, the chunk counts.
 - **Same dataset as on one GPU:** same files, same split, meta, manifest and
   wavs. The values move as when `--batch_size` changes, because a chunk shares
   its GPU batch with other chunks: on the 15 Oct test (56 chunks) 10 latents
@@ -234,89 +233,57 @@ python preprocess_stream.py <SRC> <OUT_ENCODEC> --device cuda --codec encodec   
 - The EnCodec weights are downloaded from HuggingFace the first time
   (`transformers`, already a requirement), like the DAC's.
 
-### Where the class of a source comes from — `--label_source`
+### Label and text of a source — `--global_conds text`
 
-The class of a source is **the output folder it is encoded into**, and everything
-downstream reads it back from there: the stratified split (§2), `_class_of_file`
-in the training dataset, the per-class image bank, the panel captions. Nothing
-after the preprocessing knows how that folder name was decided.
+`--global_conds text` saves three CLAP embeddings; the training gives the model
+one of them (`conditioning.text_source`, §3):
 
-| `--label_source` | the class of a file is | for |
+| embedding | comes from | stored in |
 |---|---|---|
-| `dir` (default) | its own subdirectory under `<SRC>` — `SRC/rock/x.mp3` → `latents/rock/` | corpora already laid out by class |
-| `csv` | what `--label_csv` says it is, and *that* becomes the output folder | corpora that ship one flat audio folder plus a metadata file |
+| audio | the chunk's audio | key `text` of the chunk's `.npz` |
+| label | the CSV files, else the source's folder | `global_conditions/label_emb.npy` |
+| text | the CSV files, else a `.txt` next to the audio | `global_conditions/text_emb.npy` |
 
-```bash
-python preprocess_stream.py <SRC> <OUT> --device cuda \
-    --label_source csv --label_csv metadata.csv
-```
+For each source, in this order:
 
-**Two flags, and a fixed contract for the CSV** — no options around it:
-
-```
-file,label
-violin_01.wav,violin
-drum_07.wav,drum
-```
-
-* one **file** column, named `file` or `filename`; one **label** column, named
-  `label` or `class`. Case does not matter, so `FileName,Class` reads as is;
-* the file column holds the name, or the path relative to `<SRC>`;
-* the label is the class, used **verbatim** as the folder name;
-* **every source file must have a row.**
-
-Two accepted spellings per column, not a flag: they are the two the world
-actually uses and they are mutually exclusive in practice. A CSV carrying *both*
-`label` and `class` is one whose author meant two different things, so that is
-an error too — rename or drop one column.
-
-Everything else is fixed *in the CSV*: a third column name, a typo in a label, a
-file with no row. A CSV is a text file under your control, and every flag that
-"handles" one of those cases is a rule that will be silently wrong on the next
-corpus.
-
-The raw audio is never moved or copied — only the encoded output is grouped by
-class. And **switching modes renames nothing**: `src_hash` and every chunk file
-name are computed from the *source* path, so the manifest, a resumed run and the
-split's source groups are unaffected by which mode is in use.
-
-Rows are matched to files by **path relative to `<SRC>`**, then by **bare file
-name**, then by either of those **case-insensitively** (a CSV and a filesystem
-routinely disagree on case, and on Windows the disagreement is invisible).
-
-Every run prints what the CSV covered, plus the class histogram — the cheapest
-check that the labels are the ones you expect:
+1. **Every `*.csv` under `<SRC>` is read.** A CSV is used when it has a file column
+   (`file`, `filename` or `file_name`, any case) and a label column (`label`,
+   `class`) or a text column (`text`, `description`, `caption`); the others are
+   ignored.
+2. **No label from the CSV files:** the name of the source's folder. A file directly
+   in `<SRC>` has no label, unless `--class_name` gives one.
+3. **No text from the CSV files:** a `.txt` with the audio's name, next to it.
+4. **Neither:** the audio embedding alone.
 
 ```
-[labels] metadata.csv: 2628 row(s), 4 label(s)
-[labels] 2628/2628 source file(s) labelled from metadata.csv (2628 row(s))
-  2628 files, 4 classes
-  classes: drum 700, guitar 700, violin 700, piano 528
+schaeffer/metadata.csv:   file_name,...,description
+Lemmo/sinusoide-dist-06.wav -> text "it is a sinusoid distorted with an LFO ..."
+                               label "Lemmo" (the CSV has no label column)
 ```
 
-Five things stop the run rather than being guessed:
+- Rows match by path relative to `<SRC>`, then by bare file name, ignoring case and
+  how accented letters are encoded. A cell with no letter or digit (`*`) is empty.
+- A source with several values, because two CSV files disagree, keeps them all: a
+  training sample draws one at random, a validation or test sample keeps the same
+  one. A wrong CSV is used as it is: take it out of `<SRC>`.
+- A text belongs to the source file, so all its chunks have the same one.
+- The last line says what was found:
+  `[text] 806 sources: 806 with a label (55 distinct), 802 with a text (771 distinct), 0 with more than one value`.
+- **Label and text need no audio.** `source_manifest.json` already says which chunks
+  come from which source, so with only the CSV files or the `.txt` under `<SRC>` the
+  run writes the table and stops. Only the audio embedding reads the audio.
 
-* **a column that cannot be identified**, or two candidates for the same role.
-* **a source file with no row.** The CSV must cover the corpus.
-* **an ambiguous file** — a bare name claimed by two rows with *different*
-  labels. Put the relative path in the `file` column, or drop the duplicate row.
-* **a label that cannot be a directory name** (`gui/tar`, `A:B`). The class name
-  *is* the folder name, so sanitizing it silently would break the
-  `image_root/<class>` match for exactly those classes.
-* **a change of mode on an existing `<OUT>`.** The mode is recorded in
-  `source_manifest.json`; re-running the other way does not overwrite the
-  dataset, it writes a *second* copy under different class folders. Use a fresh
-  output dir.
+The output folders mirror `<SRC>`, whatever the CSV files say: `SRC/rock/x.mp3` →
+`latents/rock/`, and a file directly in `<SRC>` goes under `--class_name` or the name
+of `<SRC>`. A source already in the manifest keeps its folder, so a re-run with a new
+CSV changes only the table. The split is balanced on the first label of each source.
 
-> **Name classes as plain words.** A label is a folder name *and* a phrase handed
-> to a text encoder when the `text` condition is active, and the second job is
-> unforgiving. Measured 9 Sept 2026 with `laion/clap-htsat-unfused`, mean cosine
-> between four instrument classes: **0.883** named `Sound_Drum` … `Sound_Violin`
-> (max 0.975 — `Sound_Guitar` and `Sound_Piano` differ by 0.025), **0.375** as
-> hand-written phrases, **0.103** as the bare nouns `drum`, `guitar`, `piano`,
-> `violin`. The shared prefix is most of what the tokenizer sees. Nothing in the
-> code rewrites a name to fix this: a name rewritten at encode time would stop
-> being the name the folder, the split and the panels talk about.
+> **Name labels as plain words.** A label is a phrase handed to a text encoder, and
+> the job is unforgiving. Measured 9 Sept 2026 with `laion/clap-htsat-unfused`, mean
+> cosine between four instrument classes: **0.883** named `Sound_Drum` …
+> `Sound_Violin` (max 0.975 — `Sound_Guitar` and `Sound_Piano` differ by 0.025),
+> **0.375** as hand-written phrases, **0.103** as the bare nouns `drum`, `guitar`,
+> `piano`, `violin`. The shared prefix is most of what the tokenizer sees.
 
 **Conditions: `--conditions` and `--global` are independent and compose.** Either
 can be used alone, both together, and each takes any subset — `--conditions f0`,
@@ -330,14 +297,9 @@ value comes from**, which is what decides where it is stored:
 | | computed from | written to | when |
 |---|---|---|---|
 | every `--conditions` name | that chunk's audio | the chunk's `.npz`, `(T, dim)` | in the stream |
-| `--global_conds text` | that chunk's audio | the **same** `.npz`, `(dim,)` | in the stream |
+| `--global_conds text`, audio | that chunk's audio | the **same** `.npz`, `(dim,)` | in the stream |
+| `--global_conds text`, label and text | see above | `global_conditions/` | after the stream |
 | `--global_conds image` | `--image_root/<class>/*` | `global_conditions/image/<class>.npy` | after the stream |
-
-So `text` is extracted and resumed exactly like `f0`: it is the CLAP embedding
-of the chunk's own audio, which at inference is swapped for the CLAP embedding
-of a written prompt (the two towers share one space). It is *not* the embedding
-of the class name — that would make it carry the same single bit as `image`,
-and no ablation could then separate the two.
 
 `--global_conds image` encodes **every** picture of a class, not a sample of them: the
 training draws one at random per epoch, so a cap here would silently cap that
@@ -353,82 +315,6 @@ recompute every chunk condition in the dataset). A class whose folder is
 unchanged is never re-encoded, and CLIP is not even loaded when none changed.
 Growing a bank changes the image condition of that class, so a checkpoint
 trained before the change was trained on a different bank.
-
-`--global_conds text` also writes `global_conditions/text_vocab.{npy,json}`: the
-phrase list in `conditions.TEXT_LABEL_VOCAB`, CLAP-encoded once and stored WITH
-the dataset. The stored `text` condition is the embedding of a chunk's own
-audio, and CLAP has no decoder, so a panel has no sentence to show; the
-vocabulary lets it name the **nearest phrase** instead, always printed with its
-cosine because it is a retrieval, not a translation. Editing the list and
-re-running the preprocessing rewrites the labels without touching a single
-chunk of audio.
-
-### The per-chunk text description — `--text_labels_n`
-
-The stored `text` condition is a 512-d CLAP vector and CLAP has no decoder, so
-nothing about a chunk is readable from it directly. `--global_conds text` therefore
-also writes, **for every chunk of the dataset**, the text that describes it:
-
-```
-global_conditions/text_labels.jsonl
-  {"chunk": "Sound_Violin/xxx__c0003", "class": "Sound_Violin",
-   "phrases": [["a bowed tremolo", 0.3112]],
-   "caption": "Sound_Violin · \"a bowed tremolo\" (+0.31)"}
-global_conditions/text_labels_cos.npy    (n_chunks, n_phrases) float16
-global_conditions/text_labels.json       fingerprint, phrase list, counts
-```
-
-`--text_labels_n` counts the caption's terms **including the class**: 1 = the
-class alone, 2 = class + the nearest phrase, 3 = class + the two nearest.
-
-Two properties are worth stating explicitly, because they are the reason the
-file exists at all rather than being computed on the fly:
-
-* **It covers the whole dataset, not the panels.** This description used to be
-  computed inside the training process, at panel-drawing time, for the ~16
-  validation samples that get a panel, and it existed nowhere else. How many
-  panels a machine can afford must not decide how much of the corpus is
-  described. It is a property of the dataset, so it lives with the dataset.
-* **The training does not decide how much of it to show.** It reads the caption
-  the dataset carries (`load_text_captions`), so the words under a panel are the
-  words on disk by construction. A dataset without the sidecar (built before it
-  existed) falls back to the old in-process retrieval, so older runs keep their
-  captions.
-
-The full cosine table is stored alongside — (n_chunks × n_phrases) float16, about
-20 MB for 50k chunks and 200 phrases — so `--text_labels_n` is not a commitment:
-a different N, a threshold, "every chunk scoring above 0.3 on *a dry close
-recording*", are all re-derived from the `.npy` without re-reading one `.npz`.
-Row *i* of the table is line *i* of the `.jsonl`.
-
-Alongside the descriptions, the CLAP **text** embedding of each DISTINCT caption
-is stored (`text_labels_emb.npy`) — four vectors for a four-class corpus at
-`--text_labels_n 1`, not one per chunk. That is what lets the validation
-generate FROM the description (`sampling.validation_text_from_caption`, §3)
-without CLAP ever entering the training process.
-
-The caption is encoded **verbatim**: the only difference between what you read
-and what CLAP is given is punctuation (`violin · "a bowed tremolo" (+0.31)` is
-encoded as `violin, a bowed tremolo` — quotes and cosines are bookkeeping for a
-reader). Both strings are stored, as `captions` and `captions_text`.
-
-Name classes as plain words — see the box under `--label_source`: the label is
-what the text encoder is handed, and `Sound_Guitar` vs `Sound_Piano` scores 0.975
-where `guitar` vs `piano` scores far lower.
-
-The mean cosine between the caption vectors is printed at the end of every run
-that writes them — a flat text curve three hours into a training should never be
-the first sign that the captions were inseparable.
-
-Rebuilt automatically whenever the vocabulary changes (the fingerprint covers
-the phrases, the CLAP checkpoint and N). **Changing the vocabulary therefore
-costs one cheap pass and no audio is touched**: the vectors are already on disk
-and no model is loaded for this step.
-
-Read the phrases for what they are: a **closed-vocabulary retrieval**, never a
-description. The class is exact — it is the chunk's folder — while a phrase at
-+0.08 is merely the least bad match in the list, which is why the cosine is
-stored and printed next to every one of them.
 
 `--save_wav` takes **which splits** to write: `none` (default), `all`, or a subset
 such as `val` / `val,test`. A bare `--save_wav` still means `all`. These WAVs are
@@ -598,7 +484,7 @@ instruments are merged and velocity is not kept.
 
 There are **no split folders on disk**: the split is a lookup table,
 `OUT/splits.json`, written by `preprocess_stream.py` and **read** by the training
-(`load_source_split` in `audio_dataset_npy.py`). It is assigned over the **source
+(`load_source_split` in `dataset_utils.py`). It is assigned over the **source
 files**, before anything is decoded:
 
 - **stratified by class** (each class contributes to every split by ratio),
@@ -635,15 +521,10 @@ a run at a split file kept elsewhere. The recorded **assignment** (not just its
 parameters) is part of the cache fingerprint, so growing the dataset correctly
 invalidates the normalizer.
 
-Datasets built before the split moved here have no `splits.json` and the training
-stops with an actionable message. Give them one, once:
+A dataset with no `splits.json` stops the training. Give it one, with no decoding and
+no models loaded:
 
 ```bash
-# reproduces the split the training used to compute in-code (bit for bit),
-# so a run already in flight keeps exactly the same val/test sets:
-python preprocess_stream.py <SRC> <OUT> --import_legacy_split
-
-# or a fresh split, no decoding, no models loaded:
 python preprocess_stream.py <SRC> <OUT> --split_only
 ```
 
@@ -823,7 +704,7 @@ x = x + cross_attn(norm_cross(x), text_tokens)     <- new
 x = x + gate_mlp * mlp (modulate(norm2(x)))
 ```
 
-Q comes from `x`, K and V from the caption's **token states** (768-d, CLAP's
+Q comes from `x`, K and V from the **token states** of the label or text (768-d, CLAP's
 text tower before the projection — not the pooled 512-d vector, which is a
 single key and therefore a learned bias, not an attention). The conditioning
 becomes time-varying and content-dependent, and its capacity grows with the
@@ -851,33 +732,31 @@ At step 0 the gradient reaches only `W_o` (the trunk is fully zero-gated by
 adaLN-Zero and the zero final layer); `K`/`V`/`Q` start learning once `W_o` has
 left the origin, and the null token once some sample is dropped.
 
-**What it needs from the dataset.** `global_conditions/text_labels_tok.npy`,
-written by `preprocess_stream.py --global_conds text` alongside the pooled caption
-embeddings. A run with `text_cross_every > 0` on a dataset without it **refuses
-to start** rather than attending to the null token for a week.
+**What it needs.** `conditioning.text_source` `label` or `text`: the tokens are those
+of the string the model receives. With `audio` the run **refuses to start**: CLAP's
+audio tower returns one vector, so there is no sequence to attend over.
 
 **Cost.** On `L` with a stride of 1: +88M parameters on 467M (+19%), plus the
 optimizer state that goes with them.
 
 ### What the text slot is fed — `conditioning.text_source`
 
-Independent of the cross-attention, and about the *pooled* vector only:
-
 | value | the text slot receives |
 |---|---|
-| `audio` | the chunk's own CLAP **audio** embedding (the AudioLDM arrangement; what every run before 14 Sept 2026 did) |
-| `caption` | the CLAP **text** embedding of that chunk's written description — the vector a prompt puts there at inference |
-| `mix` | one or the other per sample, `text_mix_p` of the caption; random on train, deterministic on val/test |
+| `audio` | the chunk's own CLAP **audio** embedding |
+| `label` (default) | the CLAP **text** embedding of the source's label |
+| `text` | the CLAP **text** embedding of the source's text |
+
+A source without the chosen label or text gets the null vector, the one the
+condition dropout uses; such a chunk is not scored by `text/clap_sim`. The startup
+says how many: `[CondDataset/train] text slot: text | 9/1348 files without it -> null
+vector`.
 
 Measured on `dataset_ready_f0_chr_en_ryt_text_instruments` (14 Sept 2026):
 audio-to-audio cosines within a class sit at +0.70..+0.82, which is what the
-model sees in training, while a chunk's cosine to its own caption's text vector
+model sees in training, while a chunk's cosine to the text vector of its label
 is +0.24..+0.52. Under `audio`, inference hands the slot a vector from a region
 it was never trained on.
-
-The **cross-attention context is not governed by this**: it is always the
-caption's tokens, because CLAP's audio tower returns one vector and there is no
-sequence to attend over.
 
 What it does **not** fix: a condition that carries no information on the data.
 On material where CREPE returns mostly unvoiced (musique concrète, heavily
@@ -977,9 +856,7 @@ does not say they hold for pre-training, so `training.lr` keeps its value.
 
 - The startup log prints what is in effect: `LR schedule: ...` and
   `Optimizer: AdamW | betas=... | eps=... | weight_decay=... | grad_clip=...`.
-- **Resume:** keys a checkpoint predates are set to what it was trained with
-  (`cosine`, [0.9, 0.999], 1e-8, one group), not to the YAML defaults.
-  `grad_clip` and the schedule shape passed on the command line take effect;
+- **Resume:** `grad_clip` and the schedule shape passed on the command line take effect;
   lr, betas, eps and weight_decay come back with the optimizer state, and the
   startup log says so when they differ from the config.
 
@@ -1049,13 +926,11 @@ which needs their distillation and adversarial post-training.
 python training_cond.py ... sampling.t_schedule=logsnr_uniform sampling.euler_steps=50
 ```
 
-- **Sampling only.** The weights do not depend on it: any checkpoint, older ones
-  included, can be generated either way.
-- **A YAML without the key** (the server's, if not updated) reads `uniform`, and
-  the command-line override still works: the key is put in at startup. On a
-  resume the checkpoint's value is kept unless the command line says otherwise.
+- **Sampling only.** The weights do not depend on it: any checkpoint can be
+  generated either way. On a resume the checkpoint's value is kept unless the
+  command line says otherwise.
 - **Who reads it.** `test_cond.py`, `sampling_cond.py` and `compare_guidance.py`
-  take the checkpoint's (`uniform` for a checkpoint older than the option);
+  take the checkpoint's;
   `sampling.t_schedule=logsnr_uniform` on the test's command line and `--t_schedule logsnr_uniform`
   for the other two override it. `compare_schedules.py --schedules uniform logsnr_uniform`
   generates the two from the same noise.
@@ -1106,7 +981,7 @@ training:
   generated from scratch in the panels (no generation, subset or uncond cards,
   no target-vs-generation images); the startup log says `Uncond cards: 0
   (inpainting only: nothing is generated from scratch)`.
-- **Checkpoints.** The flag is read off the weights: a resume keeps it, a resume
+- **Checkpoints.** The checkpoint records the flag: a resume keeps it, a resume
   with the other value stops and says why. `paths.init_from` from a model
   without inpainting works (the new layers start at zero); the other way stops.
 - **Validation, on fixed thirds.** Besides `Validation/Loss` (full mask, as
@@ -1350,32 +1225,14 @@ installed still conditions the model; its column reads n/a. Read the absolute
 cosine of an audio-image pair knowing that it is small even when the
 conditioning works (see the probes section).
 
-### Validating on the description instead of the source audio
+### What the validation generates from — `sampling.validation_text_source`
 
-`sampling.validation_text_from_caption` (default `false`) changes **what the
-validation generations are conditioned on**, and nothing else.
-
-|  | text slot of a validation generation | `text/clap_sim` is then |
-|---|---|---|
-| `false` | the chunk's own CLAP **audio** embedding — what training uses | generation vs **source audio**, in CLAP space |
-| `true` | the CLAP **text** embedding of that sample's written description | generation vs **text**: a real adherence score |
-
-With `true`, the description is the one `preprocess_stream.py` stored for every
-chunk (`--text_labels_n`: the class, plus the nearest vocabulary phrases), so
-with `--text_labels_n 1` on a per-instrument dataset the validation generates
-from `"Sound_Violin"`, `"Sound_Piano"`, ... — i.e. it measures instrument
-controllability directly. The table's `text/clap_sim` column is then the cosine
-between each generation and the description it was given.
-
-It is the vector a prompt puts in that slot at inference, so this makes the
-validation measure what the model will actually be asked to do. **Training is
-untouched, and so is the validation loss** — that keeps the training's own
-conditioning, otherwise the two loss curves stop being comparable and stop
-saying anything about overfitting. Only the generations behind the metrics and
-the panels change.
-
-Needs `global_conditions/text_labels_emb.npy` in the dataset (written by
-`--global_conds text`). Without it the run says so and falls back.
+`null` (default) generates from what the model is trained on (`conditioning.text_source`);
+`audio`, `label` or `text` generates from that embedding instead. For example
+`text_source: audio` with `validation_text_source: label` trains on the audio and
+generates from the written label, the vector a prompt puts in that slot at inference, so
+`text/clap_sim` measures the adherence to a text. **Training is untouched, and so is
+the validation loss**: only the generations behind the metrics and the panels change.
 
 ### FAD-VGGish (optional, off by default)
 
@@ -1435,9 +1292,6 @@ compute node without internet, pre-fetch them once from a login node with
 TORCH_HOME=/data/anasynth_nonbp/baione/.cache/torch \
 python -c "import torch; torch.hub.load('harritaylor/torchvggish','vggish'); print('vggish ok')"
 ```
-
-`fad_encodec` exists in `metrics.py` but is **not** wired into this pipeline:
-listing it is a hard error at startup, not a silent skip.
 
 ### Unconditional training with the same code
 
@@ -1557,13 +1411,10 @@ step and the weights (`EMA` / `Model`); with `sampling.influence_subsets`, also
 conditions by name, `text` / `image` (the vectors), and `text_tokens` /
 `text_mask` when the model has the cross-attention. `text.txt` is the exact
 sentence CLAP encoded: always for a probe (its prompt); for a test sample, its
-caption when the text slot received the caption's vector — otherwise a line
-saying the slot received the CLAP audio embedding of the chunk, which no
-sentence produced; with the cross-attention it also names the caption whose
-tokens the model read. Files are at their real level; only the TensorBoard
+label or text — otherwise a line saying the slot received the CLAP audio embedding
+of the chunk, or the null vector. Files are at their real level; only the TensorBoard
 cards are peak-normalized. The validation generations the table is computed on
-are not written to disk (`sampling.n_val_save` is gone since 5 Oct 2026; a
-config still holding it gets one log line).
+are not written to disk.
 
 A run conditioned ONLY on globals — no frame condition, so no waveform to put
 beside the recording — has blocks with just the recording and the generation:
@@ -1623,7 +1474,7 @@ listening and looking material only: they have no rows in the table.
 | rhythm | click grids at fixed tempi, downbeat every N, accelerando | a waveform |
 | chord | sustained triads, I-IV-V, single pitch class, clusters (the chroma bank's earlier list, kept as its own) | a waveform |
 | midi | scale, sustained chord, arpeggio, a repeated note, melody + bass, I-IV-V-I, low and high register, stabs then rest; drums alone (backbeat, rock groove, open hi-hats, tom fill); drums with bass / walking bass / a small band | **notes**: the target is their roll; the waveform is only to listen to |
-| **text** | chosen by the dataset (see below): its own labels, in turn, when its captions are single labels (`drum`, `guitar`, `piano`, `violin`, `drum`, …); otherwise 16 instrument/style descriptions ("solo pipe organ in a large reverberant church", "fast electronic dance beat…") | a **string**, CLAP-encoded |
+| **text** | the dataset's labels, in turn (`drum`, `guitar`, `piano`, `violin`, `drum`, …); with `text_source: text` or a dataset without labels, 16 instrument/style descriptions ("solo pipe organ in a large reverberant church", "fast electronic dance beat…") | a **string**, CLAP-encoded |
 | **image** | 16 abstract figures — colour fields, stripes, checkerboard, rings, gradient, noise | a **.png**, CLIP-encoded |
 
 The two families differ only in medium. A frame target is a `(n_frames, dim)`
@@ -1634,17 +1485,10 @@ probe drives the model in exactly the space it was conditioned in. Nothing
 re-extracts a picture from audio, so a global probe has no "target vs
 re-extracted" plot: the image is shown as-is and the prompt names the panel.
 
-> **The text bank follows the dataset.** The probe speaks at the level of
-> detail of the text the model is trained on, which the preprocessing records
-> as `n_terms` in `global_conditions/text_labels.json` (1 = the caption is the
-> class alone). Single labels → the probe uses exactly those labels, the
-> strings CLAP was given, repeated in turn to fill the panels (each panel
-> starts from its own noise, so a repeat is one more generation, not a copy).
-> Richer captions → the 16 descriptions. A dataset without text has no text
-> condition and so no text probe at all. At startup the training prints which
-> bank it took: `[text-probe] the dataset's captions are single labels ->
-> those labels, in turn: drum, guitar, piano, violin`. The labels are read
-> from the dataset, never written in the code.
+> **The text bank.** The 16 descriptions are out of the box: they are never taken
+> from the dataset. A repeated label is one more generation, not a copy, because each
+> panel starts from its own noise. A dataset without the text condition has no text
+> probe.
 
 > **Read the abstract IMAGE bank knowing what it is.** What reaches the model is
 > not the picture but CLIP's *reading* of it, and a flat colour field has no
@@ -1711,11 +1555,9 @@ probe_XX/image_condition             the probe figure, in the same block
 The two global conditions occupy the same blocks by other means: the **image**
 is shown as a card (there is nothing to compare it against), and the **text**
 prompt names the block itself — `probe_03 [string quartet playing a slow
-sustained chord]`, or `probe_03 [violin]` on a dataset of single labels — and
-for a test sample its caption from the dataset (or, on a dataset written before
-the captions sidecar, the category plus the nearest phrase to its stored CLAP
-vector, `test_00 [Baroque sacred · "solo pipe organ" (+0.58)]`: a retrieval
-over `text_vocab`, which is why the cosine is beside it).
+sustained chord]`, or `probe_03 [violin]` with labels — and for a test sample the
+label or text it was given, cut to 60 characters, or its class when the slot receives
+the audio embedding.
 
 Each image is drawn in the form that suits the shape — f0 on a log-Hz axis with
 a voicing ribbon, energy and rhythm as overlaid curves, chroma and chord as
@@ -1848,8 +1690,7 @@ The command line wins over both: dotlist overrides as for the training (e.g.
 `sampling.n_metrics_samples=all metrics.codec_device=cuda`), plus the shortcuts
 `--metrics_samples N|all`, `--n_samples` (= `n_test_panels`), `--steps`,
 `--guidance`, `--seed`, `--duration_s`. A key that does not exist stops the test.
-The Euler grid is the checkpoint's `sampling.t_schedule` (`uniform` for a
-checkpoint older than the option): e.g. `--steps 50 sampling.t_schedule=logsnr_uniform`
+The Euler grid is the checkpoint's `sampling.t_schedule`: e.g. `--steps 50 sampling.t_schedule=logsnr_uniform`
 tests it on Stable Audio 3's grid; the JSON records `euler_steps` and
 `t_schedule`.
 
@@ -1867,8 +1708,8 @@ The panels are the training's: the same test samples (for the same
 same noise, so for the same checkpoint the test shows the generations the
 training showed at that step. The text / image a generation is conditioned on is
 the training's too: a test sample carries the one stored by the preprocessing
-(the CLAP text vector of its caption when `sampling.validation_text_from_caption`
-is on), a probe the stimulus of `probe_conditions.py`. An unconditional
+(`conditioning.text_source`, or `sampling.validation_text_source` when set), a probe
+the stimulus of `probe_conditions.py`. An unconditional
 checkpoint gets no table and no panels: the metrics on a single axis, the uncond
 cards, the real test recordings (`ground truth/real_test_XX`; with inpainting,
 the `test_XX/` groups instead) and the config. A checkpoint trained with

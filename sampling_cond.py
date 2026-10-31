@@ -22,12 +22,8 @@ import torch
 import numpy as np
 import soundfile as sf
 
-from audio_dataset_npy import LatentNormalizer
-from network_cond import (ConditionedAudioDiT,
-                          ckpt_frame_reinject_every,
-                          ckpt_text_cross_every, ckpt_text_ctx_dim,
-                          check_ckpt_reinject_gate, ckpt_attention,
-                          ckpt_qk_norm, ckpt_inpainting)
+from dataset_utils import LatentNormalizer
+from network_cond import ConditionedAudioDiT, ckpt_text_ctx_dim
 import latent_codec as lc
 from conditions import (
     ConditionRegistry,
@@ -41,7 +37,6 @@ T_MAX = 0.999
 
 
 T_SCHEDULES = ("uniform", "logsnr_uniform")
-T_SCHEDULE_RENAMED = {"sa3": "logsnr_uniform"}
 
 LOGSNR_MIN, LOGSNR_MAX = -6.2, 2.0
 
@@ -75,12 +70,6 @@ def euler_grid(steps, t_lo, t_hi, schedule="uniform", t_start=None):
         return [(g[i], g[i + 1] - g[i]) for i in range(len(g) - 1)]
     raise ValueError(f"t_schedule {schedule!r}: expected one of "
                      f"{list(T_SCHEDULES)}")
-
-
-def ckpt_t_schedule(ckpt):
-    smp = ((ckpt.get("config", None) or {}).get("sampling", None) or {})
-    v = str(smp.get("t_schedule", None) or "uniform")
-    return T_SCHEDULE_RENAMED.get(v, v)
 
 
 @torch.no_grad()
@@ -418,8 +407,7 @@ def main():
                              "(equal steps) or 'logsnr_uniform' (Stable Audio 3's grid, "
                              "equally spaced in log-SNR, crowded at the noise "
                              "end). Default: the one the checkpoint's run "
-                             "generated with (its sampling.t_schedule; "
-                             "'uniform' for a checkpoint older than the option).")
+                             "generated with (its sampling.t_schedule).")
     parser.add_argument("--n_samples", type=int, default=4)
     parser.add_argument("--duration", type=float, default=None,
                         help="Generation length in seconds (generate mode). If "
@@ -457,28 +445,20 @@ def main():
     print(f"Carico checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
-    CODEC = lc.activate(lc.codec_from_ckpt(ckpt))
+    CODEC = lc.activate(ckpt["codec"])
     print(f"Codec: {CODEC.name} ({CODEC.sample_rate} Hz, "
           f"{CODEC.frames_per_s:.2f} frames/s, {CODEC.latent_dim}-d)")
 
-    frame_cond_dims     = ckpt.get("frame_cond_dims",     {})
-    frame_cond_out_dims = ckpt.get("frame_cond_out_dims", {})
-    global_configs_ckpt = ckpt.get("global_configs",      {})
-    if frame_cond_dims and not frame_cond_out_dims:
-        from conditions import ConditionRegistry
-        _reg = ConditionRegistry(
-            enabled_frame=list(frame_cond_dims.keys()), enabled_global=[],
-        )
-        frame_cond_out_dims = _reg.frame_cond_out_dims
+    frame_cond_dims     = ckpt["frame_cond_dims"]
+    frame_cond_out_dims = ckpt["frame_cond_out_dims"]
+    global_configs_ckpt = ckpt["global_configs"]
 
-    frame_reinject_every = ckpt_frame_reinject_every(ckpt)
-    check_ckpt_reinject_gate(ckpt, args.checkpoint)
-
-    text_cross_every = ckpt_text_cross_every(ckpt)
+    frame_reinject_every = ckpt["frame_reinject_every"]
+    text_cross_every = ckpt["text_cross_every"]
     text_ctx_dim = ckpt_text_ctx_dim(ckpt)
-    attention = ckpt_attention(ckpt)
-    qk_norm = ckpt_qk_norm(ckpt)
-    inpainting = ckpt_inpainting(ckpt)
+    attention = ckpt["attention"]
+    qk_norm = ckpt["qk_norm"]
+    inpainting = ckpt["inpainting"]
 
     model = ConditionedAudioDiT(
         kind=ckpt.get("model_kind", "L"),
@@ -508,7 +488,7 @@ def main():
     print(f"Normalizer: {norm_path}")
     normalizer.load(norm_path)
 
-    t_schedule = args.t_schedule or ckpt_t_schedule(ckpt)
+    t_schedule = args.t_schedule or ckpt["config"]["sampling"]["t_schedule"]
     print(f"Euler steps: {args.steps} | t schedule: {t_schedule}"
           + (" (the checkpoint's)" if args.t_schedule is None else ""))
 

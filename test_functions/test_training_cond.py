@@ -18,8 +18,6 @@ import training_cond as tc
 from network_cond import ConditionedAudioDiT
 
 CFG_PATH = str(ROOT / "configs" / "training_cond_default.yaml")
-NEW_TRAINING_KEYS = ("lr_schedule", "lr_inv_gamma", "lr_power",
-                     "weight_decay_matrices_only", "adam_betas", "adam_eps")
 
 
 def _old_cosine(num_steps, warmup_steps, decay_start_frac):
@@ -37,7 +35,8 @@ def _old_cosine(num_steps, warmup_steps, decay_start_frac):
 
 def _train_cfg(**kw):
     base = dict(lr=1e-4, num_steps=1000001, warmup_steps=5000,
-                decay_start_frac=0.8, weight_decay=0.0)
+                decay_start_frac=0.8, weight_decay=0.0,
+                adam_betas=[0.9, 0.999], adam_eps=1e-8)
     base.update(kw)
     return OmegaConf.create(base)
 
@@ -201,37 +200,16 @@ def test_config_keys_new_run_and_resume():
     print("  new run: qk_norm on, inverse_power schedule; betas, weight decay "
           "and clipping as before")
 
-    old = OmegaConf.to_container(OmegaConf.load(CFG_PATH))
-    del old["model"]["qk_norm"]
-    for k in NEW_TRAINING_KEYS:
-        del old["training"][k]
+    new = OmegaConf.to_container(OmegaConf.load(CFG_PATH))
+    new["training"]["adam_betas"] = [0.9, 0.95]
     with tempfile.TemporaryDirectory() as d:
-        p_old = str(Path(d) / "old.pt")
-        torch.save({"config": old,
-                    "model_state_dict": {"blocks.0.attn.qkv.weight": torch.zeros(1)}},
-                   p_old)
-        cfg = _load_config(["--resume", p_old])
-        assert cfg.model.qk_norm is False
-        assert cfg.training.lr_schedule == "cosine"
-        assert list(cfg.training.adam_betas) == [0.9, 0.999]
-        assert cfg.training.adam_eps == 1e-8
-        assert cfg.training.weight_decay_matrices_only is False
-        cfg = _load_config(["--resume", p_old, "training.lr_schedule=inverse_power"])
-        assert cfg.training.lr_schedule == "inverse_power"
-        print("  resume of a checkpoint that predates the keys: qk_norm off, "
-              "cosine, torch betas, one group; the command line still wins")
-
-        new = OmegaConf.to_container(OmegaConf.load(CFG_PATH))
-        new["training"]["adam_betas"] = [0.9, 0.95]
         p_new = str(Path(d) / "new.pt")
-        torch.save({"config": new, "qk_norm": True,
-                    "model_state_dict": {"blocks.0.attn.q_norm.weight": torch.ones(1)}},
-                   p_new)
+        torch.save({"config": new}, p_new)
         cfg = _load_config(["--resume", p_new])
         assert cfg.model.qk_norm is True
         assert cfg.training.lr_schedule == "inverse_power"
         assert list(cfg.training.adam_betas) == [0.9, 0.95]
-        print("  resume of a new checkpoint: its own values")
+        print("  resume: the checkpoint's own values")
 
     for bad in (["training.lr_schedule=linear"], ["training.adam_betas=[0.9]"],
                 ["training.adam_betas=[0.9,1.0]"], ["training.adam_eps=0"],

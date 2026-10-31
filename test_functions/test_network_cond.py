@@ -12,8 +12,7 @@ import torch
 import torch.nn as nn
 import latent_codec as lc
 from network_cond import (ConditionedAudioDiT, DifferentialSelfAttention,
-                          apply_rotary_pos_emb, ckpt_attention, ckpt_qk_norm,
-                          QK_NORM_EPS)
+                          apply_rotary_pos_emb, QK_NORM_EPS)
 
 B, N = 2, 430
 TOKEN_DIM = lc.active().latent_dim   # 72 con DAC (default), 128 con EnCodec
@@ -232,18 +231,6 @@ def test_differential_attention():
     print(f"  grad check:      lambda vectors and RMSNorm gains of all "
           f"{nl} blocks receive gradient")
 
-    assert ckpt_attention({"model_state_dict": sd_s}) == "standard"
-    assert ckpt_attention({"model_state_dict": sd_d}) == "differential"
-    assert ckpt_attention({"ema_state_dict": sd_d, "attention": "differential"}) == "differential"
-    assert ckpt_attention({}) == "standard"
-    try:
-        ckpt_attention({"model_state_dict": sd_s, "attention": "differential"})
-        raise AssertionError("a field contradicting the weights should raise")
-    except RuntimeError:
-        pass
-    print("  ckpt_attention:  standard / differential read off the weights; "
-          "a contradicting field is refused")
-
     for bad in ("diff", "Differential", ""):
         try:
             ConditionedAudioDiT(**plain_kw, attention=bad)
@@ -302,20 +289,7 @@ def test_qk_norm_weights_and_checkpoints():
         except RuntimeError:
             pass
 
-        assert ckpt_qk_norm({"model_state_dict": sd_off}) is False
-        assert ckpt_qk_norm({"model_state_dict": sd_on}) is True
-        assert ckpt_qk_norm({"ema_state_dict": sd_on, "qk_norm": True}) is True
-        assert ckpt_qk_norm({"config": {"model": {"qk_norm": True}}}) is True
-        assert ckpt_qk_norm({}) is False
-        for sd, field in ((sd_off, True), (sd_on, False)):
-            try:
-                ckpt_qk_norm({"model_state_dict": sd, "qk_norm": field})
-                raise AssertionError("a field contradicting the weights should raise")
-            except RuntimeError:
-                pass
     assert not ConditionedAudioDiT(**plain_kw).qk_norm
-    print("  ckpt_qk_norm: read off the weights; legacy checkpoints -> False; "
-          "a contradicting field is refused")
 
 
 def test_qk_norm_self_attention():
@@ -430,7 +404,6 @@ def test_qk_norm_cross_attention():
     assert n_cross == 3
     assert len(extra) == 2 * (6 + n_cross), extra
     assert sum(".cross_attn." in k for k in extra) == 2 * n_cross
-    assert ckpt_qk_norm({"model_state_dict": m_on.state_dict()}) is True
 
     hid, nh, L = 512, 8, 5
     hd = hid // nh

@@ -10,82 +10,31 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from audio_dataset_npy import (
+from dataset_utils import (
     LatentNormalizer, SUPPORTED_EXTS,
     frames_per_chunk,
-    load_source_split, _class_of_file, _chunks_from_files,
+    load_source_split, _class_of_file, _source_group_of, _chunks_from_files,
     _meta_latent_frames, NORMALIZER_MAX_CHUNKS,
 )
 from conditions import ConditionRegistry
 import latent_codec as lc
 
 
-def caption_dir(latent_root):
-    return Path(latent_root).parent / "global_conditions"
+TEXT_SOURCES = ("audio", "label", "text")
 
 
-def chunk_key_for(latent_root, cond_path):
-    try:
-        if cond_path is None:
-            return None
-        root = Path(latent_root).parent / "conditions"
-        return Path(cond_path).relative_to(root).with_suffix("").as_posix()
-    except Exception:
-        return None
-
-
-def load_caption_table(latent_root):
-    d = caption_dir(latent_root)
-    meta_p, jsonl_p = d / "text_labels.json", d / "text_labels.jsonl"
-    if not (meta_p.exists() and jsonl_p.exists()):
+def load_text_table(latent_root):
+    d = Path(latent_root).parent / "global_conditions"
+    p = d / "text_table.json"
+    if not p.exists():
         return {}
-    try:
-        meta = json.loads(meta_p.read_text(encoding="utf-8"))
-        captions = list(meta.get("captions", []))
-        n_cap = len(captions)
-        if n_cap == 0:
-            return {}
-        ids = {}
-        with open(jsonl_p, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                r = json.loads(line)
-                cid = r.get("caption_id")
-                if r.get("chunk") and cid is not None and 0 <= cid < n_cap:
-                    ids[r["chunk"]] = int(cid)
-        out = {"ids": ids, "captions": captions}
-        ctext = list(meta.get("captions_text", []))
-        if len(ctext) == n_cap:
-            out["captions_text"] = ctext
-        if meta.get("n_terms") is not None:
-            out["n_terms"] = int(meta["n_terms"])
-
-        emb_p = d / "text_labels_emb.npy"
-        if emb_p.exists():
-            emb = np.load(str(emb_p)).astype(np.float32)
-            if emb.ndim == 2 and emb.shape[0] == n_cap:
-                out["emb"] = emb
-            else:
-                print(f"[captions] text_labels_emb.npy is {emb.shape} for "
-                      f"{n_cap} caption(s) -> ignored")
-
-        tok_p, len_p = (d / "text_labels_tok.npy", d / "text_labels_tok_len.npy")
-        if tok_p.exists() and len_p.exists():
-            tok = np.load(str(tok_p)).astype(np.float32)
-            tlen = np.load(str(len_p)).astype(np.int64)
-            if (tok.ndim == 3 and tok.shape[0] == n_cap
-                    and tlen.shape == (n_cap,)
-                    and int(tlen.max()) <= tok.shape[1]):
-                out["tok"], out["tok_len"] = tok, tlen
-            else:
-                print(f"[captions] text_labels_tok.npy is {tok.shape} / "
-                      f"{tlen.shape} for {n_cap} caption(s) -> ignored")
-        return out
-    except Exception as e:
-        print(f"[captions] sidecar unreadable ({type(e).__name__}: {e})")
-        return {}
+    table = json.loads(p.read_text(encoding="utf-8"))
+    for kind in ("label", "text"):
+        if table[f"{kind}s"]:
+            table[f"{kind}_emb"] = np.load(str(d / f"{kind}_emb.npy"))
+            table[f"{kind}_tok"] = np.load(str(d / f"{kind}_tok.npy"), mmap_mode="r")
+            table[f"{kind}_tok_len"] = np.load(str(d / f"{kind}_tok_len.npy"))
+    return table
 
 
 class ConditionedAudioDataset(Dataset):
@@ -96,14 +45,13 @@ class ConditionedAudioDataset(Dataset):
         split:           str,
         latent_root:     str,
         condition_root:  Optional[str] = None,
-        image_root:      Optional[str] = None,
         duration_s:      float = 5.0,
         normalizer:      Optional[LatentNormalizer] = None,
         registry:        Optional[ConditionRegistry] = None,
         preload_latents: bool  = True,
         strict_conditions: bool = True,
-        text_source:     str   = "audio",
-        text_mix_p:      float = 0.5,
+        text_source:     str   = "label",
+        generation_text_source: Optional[str] = None,
         file_checks_dist=None,
     ):
         self.files          = [Path(f) for f in files]
@@ -135,26 +83,12 @@ class ConditionedAudioDataset(Dataset):
         if preload_latents:
             self._preload_latents()
 
-        self._text_dim: int = 0
-        self._probe_text_dim()
-
-        self.text_source = str(text_source or "audio").lower()
-        if self.text_source not in ("audio", "caption", "mix"):
-            raise ValueError(
-                f"text_source must be 'audio', 'caption' or 'mix', got "
-                f"{text_source!r}")
-        self.text_mix_p = float(text_mix_p)
-        self._captions = load_caption_table(self.latent_root) if self._text_dim else {}
-        self._cap_warned = False
-        if self._text_dim and self.text_source != "audio" and "emb" not in self._captions:
-            raise RuntimeError(
-                f"conditioning.text_source='{self.text_source}' needs the CLAP "
-                f"TEXT embedding of each caption, and this dataset has none "
-                f"(global_conditions/text_labels_emb.npy). Re-run the "
-                f"preprocessing on the same output dir with --global_conds text: it "
-                f"rewrites only the sidecar and does not touch the audio.")
-        self._ctx_dim = int(self._captions["tok"].shape[2]) if "tok" in self._captions else 0
-        self._ctx_len = int(self._captions["tok"].shape[1]) if "tok" in self._captions else 0
+        self.text_source = None
+        self.generation_text_source = None
+        self._text_table = {}
+        self._text_dim = self._ctx_dim = self._ctx_len = 0
+        if registry is not None and "text" in registry.global_extractors:
+            self._setup_text(text_source, generation_text_source or text_source)
 
         self._image_embeddings: Dict[str, List[np.ndarray]] = {}
         self._image_files: Dict[str, List[str]] = {}
@@ -172,11 +106,11 @@ class ConditionedAudioDataset(Dataset):
               f"image={'ON' if self._image_embeddings else 'OFF'}")
         if self._text_dim:
             print(f"[CondDataset/{self.split}] text slot: {self.text_source}"
-                  + (f" (p={self.text_mix_p})" if self.text_source == "mix" else "")
-                  + f" | {len(self._captions.get('captions', []))} distinct "
-                    f"caption(s) | cross-attention context: "
-                  + (f"{self._ctx_len} token(s) x {self._ctx_dim}"
-                     if self._ctx_dim else "NOT in this dataset"))
+                  + (f" | generations: {self.generation_text_source}"
+                     if self.generation_text_source != self.text_source else "")
+                  + ("" if self.text_source == "audio" else
+                     f" | {sum(not self._text_ids(f, self.text_source) for f in self.files)}"
+                     f"/{len(self.files)} files without it -> null vector"))
 
     def _get_frame_names(self) -> List[str]:
         if self.registry is None:
@@ -319,37 +253,75 @@ class ConditionedAudioDataset(Dataset):
         gb = sum(t.nelement() * 4 for t in self._latent_cache.values()) / 1e9
         print(f"[CondDataset/{self.split}] {gb:.2f} GB in RAM")
 
+    def _setup_text(self, source, generation_source):
+        for s in (source, generation_source):
+            if s not in TEXT_SOURCES:
+                raise ValueError(f"the text source must be one of "
+                                 f"{list(TEXT_SOURCES)}, got {s!r}.")
+        self.text_source = source
+        self.generation_text_source = generation_source
+        self._text_table = load_text_table(self.latent_root)
+        for s in {source, generation_source} - {"audio"}:
+            if f"{s}_emb" not in self._text_table:
+                raise RuntimeError(
+                    f"[CondDataset/{self.split}] text source '{s}': this dataset "
+                    f"has no {s} embeddings. Write them with:\n"
+                    f"    python preprocess_stream.py SRC "
+                    f"{self.latent_root.parent} --global_conds text")
+        if source == "audio":
+            self._probe_text_dim()
+        else:
+            self._text_dim = int(self._text_table[f"{source}_emb"].shape[1])
+            _, self._ctx_len, self._ctx_dim = self._text_table[f"{source}_tok"].shape
+
     def _probe_text_dim(self):
-        if self.registry is None or "text" not in self.registry.global_extractors:
-            return
         for _npy, cond_path, _s, _l, _c in self.samples:
             if cond_path is None:
                 continue
             try:
                 with np.load(str(cond_path)) as data:
                     if "text" in data:
-                        arr = data["text"]
-                        if arr.ndim != 1:
-                            raise RuntimeError(
-                                f"'text' in {cond_path} has shape {arr.shape}; "
-                                f"a global condition is one vector, (dim,). "
-                                f"This .npz was written by an older "
-                                f"preprocess_stream.py -- re-extract it.")
-                        self._text_dim = int(arr.shape[0])
-                        print(f"[CondDataset/{self.split}] text: per-chunk CLAP "
-                              f"embeddings from the .npz (dim={self._text_dim})")
+                        self._text_dim = int(data["text"].shape[0])
                         return
-            except RuntimeError:
-                raise
             except Exception:
                 continue
         raise RuntimeError(
-            f"[CondDataset/{self.split}] the 'text' global condition is active "
-            f"but no chunk carries it. Extract it with:\n"
+            f"[CondDataset/{self.split}] text source 'audio': no chunk carries "
+            f"the CLAP audio embedding. Extract it with:\n"
             f"    python preprocess_stream.py SRC {self.latent_root.parent} "
-            f"--global_conds text\n"
-            f"(it re-reads the audio but re-encodes no latent, and keeps every "
-            f"condition already on disk).")
+            f"--global_conds text")
+
+    def _text_ids(self, npy_path, kind):
+        key = _source_group_of(Path(npy_path), self.latent_root)
+        return self._text_table["sources"].get(key, {}).get(f"{kind}s", [])
+
+    def _text_id(self, npy_path, idx, kind):
+        ids = self._text_ids(npy_path, kind)
+        if not ids:
+            return None
+        if len(ids) == 1:
+            return ids[0]
+        return random.choice(ids) if self.split == "train" else ids[idx % len(ids)]
+
+    def generation_text(self, idx, text_emb):
+        kind = self.generation_text_source
+        if kind == self.text_source:
+            return text_emb
+        npy_path, cond_path = self.samples[idx][:2]
+        if kind == "audio":
+            with np.load(str(cond_path)) as data:
+                return torch.from_numpy(data["text"].astype(np.float32))
+        cid = self._text_id(npy_path, idx, kind)
+        if cid is None:
+            return torch.zeros(self._text_dim)
+        return torch.from_numpy(self._text_table[f"{kind}_emb"][cid].copy())
+
+    def generation_string(self, idx):
+        kind = self.generation_text_source
+        if kind in (None, "audio"):
+            return None
+        cid = self._text_id(self.samples[idx][0], idx, kind)
+        return None if cid is None else self._text_table[f"{kind}s"][cid]
 
     @staticmethod
     def _image_split_of(file_name: str) -> str:
@@ -456,9 +428,9 @@ class ConditionedAudioDataset(Dataset):
         frame_cond = {}
         frame_names = self._get_frame_names()
 
-        want_text = self._text_dim > 0
+        want_audio_text = self.text_source == "audio"
         text_raw = None
-        if cond_path is not None and (frame_names or want_text):
+        if cond_path is not None and (frame_names or want_audio_text):
             try:
                 data = np.load(str(cond_path))
             except Exception as e:
@@ -526,8 +498,13 @@ class ConditionedAudioDataset(Dataset):
                 dim = self.registry.frame_cond_dims[name]
                 frame_cond[name] = torch.zeros(self.n_frames, dim)
 
-        if not want_text:
+        cid = None
+        if not self._text_dim:
             text_emb = torch.zeros(1)
+        elif not want_audio_text:
+            cid = self._text_id(npy_path, idx, self.text_source)
+            text_emb = (torch.zeros(self._text_dim) if cid is None else
+                        torch.from_numpy(self._text_table[f"{self.text_source}_emb"][cid].copy()))
         elif text_raw is not None:
             t = np.asarray(text_raw, dtype=np.float32).reshape(-1)
             if t.shape[0] != self._text_dim or not np.isfinite(t).all():
@@ -562,58 +539,21 @@ class ConditionedAudioDataset(Dataset):
         else:
             img_emb = torch.zeros(1)
 
-        cid = self._caption_id_for(cond_path)
-        if self._text_dim and self._use_caption_for(idx):
-            cap = self._captions.get("emb")
-            if cap is not None and cid is not None:
-                text_emb = torch.from_numpy(cap[cid].copy())
-            elif self.strict_conditions:
-                raise RuntimeError(
-                    f"text_source='{self.text_source}' but {npy_path.name} has "
-                    f"no caption in global_conditions/text_labels.jsonl "
-                    f"(key={chunk_key_for(self.latent_root, cond_path)!r}). "
-                    f"Re-run the preprocessing with --global_conds text, or set "
-                    f"training.strict_conditions=false to fall back to the "
-                    f"chunk's own audio vector.")
-            else:
-                self._warn_cap_once("no caption for this chunk -> audio vector")
-
         text_ctx = self.text_context_for(cid)
 
         return frames, frame_cond, label_idx, text_emb, img_emb, text_ctx
 
-    def _warn_cap_once(self, msg):
-        if not self._cap_warned:
-            self._cap_warned = True
-            print(f"[CondDataset/{self.split}] captions: {msg} "
-                  f"(warned once)")
-
-    def _caption_id_for(self, cond_path):
-        key = chunk_key_for(self.latent_root, cond_path)
-        if key is None:
-            return None
-        return self._captions.get("ids", {}).get(key)
-
-    def _use_caption_for(self, idx: int) -> bool:
-        if self.text_source == "audio":
-            return False
-        if self.text_source == "caption":
-            return True
-        if self.split == "train":
-            return random.random() < self.text_mix_p
-        return (idx % 2) == 0
-
     def text_context_for(self, cid):
         L = max(1, self._ctx_len)
         D = max(1, self._ctx_dim)
-        tok = self._captions.get("tok")
-        if tok is None or cid is None:
+        if cid is None:
             return {"tokens": torch.zeros(L, D),
                     "mask": torch.zeros(L, dtype=torch.bool)}
-        n = int(self._captions["tok_len"][cid])
+        n = int(self._text_table[f"{self.text_source}_tok_len"][cid])
         mask = torch.zeros(L, dtype=torch.bool)
         mask[:n] = True
-        return {"tokens": torch.from_numpy(tok[cid].copy()), "mask": mask}
+        tok = self._text_table[f"{self.text_source}_tok"][cid]
+        return {"tokens": torch.from_numpy(tok.astype(np.float32)), "mask": mask}
 
 
 def collate_conditioned(batch):
@@ -638,15 +578,14 @@ def collate_conditioned(batch):
 def build_conditioned_datasets(
     latent_root:     str,
     condition_root:  Optional[str] = None,
-    image_root:      Optional[str] = None,
     duration_s:      float = 5.0,
     normalizer_path: Optional[str] = None,
     registry:        Optional[ConditionRegistry] = None,
     preload:         bool = True,
     strict_conditions: bool = True,
     splits_path:     Optional[str] = None,
-    text_source:     str = "audio",
-    text_mix_p:      float = 0.5,
+    text_source:     str = "label",
+    validation_text_source: Optional[str] = None,
     normalizer_shard: Optional[Tuple[int, int]] = None,
     normalizer_merge=None,
     file_checks_dist=None,
@@ -679,32 +618,28 @@ def build_conditioned_datasets(
             progress=normalizer_shard is None or normalizer_shard[0] == 0)
         del chunks
 
-    if image_root:
-        print("[build_conditioned_datasets] note: image_root is no longer read "
-              "at training time. The image condition comes from the dataset's "
-              "own global_conditions/image/ bank (preprocess_stream.py "
-              "--global_conds image --image_root ...).")
-
     common = dict(
         label_to_idx=label_to_idx,
         latent_root=latent_root,
         condition_root=condition_root,
-        image_root=image_root,
         duration_s=duration_s,
         normalizer=normalizer,
         registry=registry,
         strict_conditions=strict_conditions,
         text_source=text_source,
-        text_mix_p=text_mix_p,
         file_checks_dist=file_checks_dist,
     )
 
     train = ConditionedAudioDataset(files=splits["train"], split="train",
                                     preload_latents=preload, **common)
     val = ConditionedAudioDataset(files=splits["val"], split="val",
-                                  preload_latents=False, **common)
+                                  preload_latents=False,
+                                  generation_text_source=validation_text_source,
+                                  **common)
     test = ConditionedAudioDataset(files=splits["test"], split="test",
-                                   preload_latents=False, **common)
+                                   preload_latents=False,
+                                   generation_text_source=validation_text_source,
+                                   **common)
 
     split_info = {
         "file_counts": split["file_counts"],

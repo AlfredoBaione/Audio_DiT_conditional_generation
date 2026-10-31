@@ -16,13 +16,9 @@ from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from audio_dataset_npy import LatentNormalizer
+from dataset_utils import LatentNormalizer
 from audio_dataset_cond import ConditionedAudioDataset, load_source_split
-from network_cond import (ConditionedAudioDiT,
-                          ckpt_frame_reinject_every,
-                          ckpt_text_cross_every, ckpt_text_ctx_dim,
-                          check_ckpt_reinject_gate, ckpt_attention,
-                          ckpt_qk_norm, ckpt_inpainting)
+from network_cond import ConditionedAudioDiT, ckpt_text_ctx_dim
 from conditions import ConditionRegistry
 import latent_codec as lc
 from metrics import (precompute_latent_reference, precompute_audio_reference,
@@ -95,35 +91,18 @@ def load_config():
         raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
     _meta = torch.load(args.ckpt, map_location="cpu", weights_only=False,
                        mmap=True)
-    ckpt_config = _meta.get("config")
-    ckpt_model_kind = _meta.get("model_kind")
+    cfg = OmegaConf.create(_meta["config"])
     del _meta
-
-    if ckpt_config is not None:
-        cfg = OmegaConf.create(ckpt_config)
-        print("[test_cond] Config restored from checkpoint "
-              f"(model.kind={cfg.model.kind}, duration_s={cfg.model.duration_s}, "
-              f"dataset_root={cfg.paths.dataset_root}, "
-              f"enabled_frame={cfg.conditioning.enabled_frame}, "
-              f"enabled_global={cfg.conditioning.enabled_global}).")
-    else:
-        train_yaml = "configs/training_cond_default.yaml"
-        if not os.path.exists(train_yaml):
-            raise FileNotFoundError(
-                f"The checkpoint stores no training config and {train_yaml} "
-                f"is not here to stand in for it.")
-        cfg = OmegaConf.load(train_yaml)
-        if ckpt_model_kind is not None:
-            cfg.model.kind = ckpt_model_kind
-        print(f"[test_cond] the checkpoint stores no config: base = "
-              f"{train_yaml} (model.kind={cfg.model.kind}).")
-    tc.drop_obsolete_sampling_keys(cfg)
+    print("[test_cond] Config restored from checkpoint "
+          f"(model.kind={cfg.model.kind}, duration_s={cfg.model.duration_s}, "
+          f"dataset_root={cfg.paths.dataset_root}, "
+          f"enabled_frame={cfg.conditioning.enabled_frame}, "
+          f"enabled_global={cfg.conditioning.enabled_global}).")
 
     if not os.path.exists(args.config):
         raise FileNotFoundError(f"Test config not found: {args.config}")
     cfg = OmegaConf.merge(cfg, OmegaConf.load(args.config))
     print(f"[test_cond] Test config: {args.config}")
-    tc.drop_obsolete_sampling_keys(cfg)
 
     cfg = tc.merge_cli_overrides(
         cfg, unknown, f"the checkpoint's config + {args.config}")
@@ -251,7 +230,7 @@ def main():
                       mmap=True)
     ckpt_step = int(ckpt.get("step", 0) or 0)
 
-    CODEC = lc.activate(lc.codec_from_ckpt(ckpt))
+    CODEC = lc.activate(ckpt["codec"])
     _ds_codec = lc.dataset_codec(cfg.paths.dataset_root)
     if _ds_codec != CODEC.name:
         raise SystemExit(
@@ -261,30 +240,24 @@ def main():
     print(f"[test_cond] Codec:                {CODEC.name} ({CODEC.sample_rate} Hz, "
           f"{CODEC.frames_per_s:.2f} frames/s, {CODEC.latent_dim}-d)")
 
-    model_kind          = ckpt.get("model_kind",          cfg.model.kind)
-    frame_cond_dims     = ckpt.get("frame_cond_dims",     {})
-    frame_cond_out_dims = ckpt.get("frame_cond_out_dims", {})
-    global_configs      = ckpt.get("global_configs",      {})
-    if frame_cond_dims and not frame_cond_out_dims:
-        _reg = ConditionRegistry(
-            enabled_frame=list(frame_cond_dims.keys()), enabled_global=[],
-        )
-        frame_cond_out_dims = _reg.frame_cond_out_dims
+    model_kind          = ckpt["model_kind"]
+    frame_cond_dims     = ckpt["frame_cond_dims"]
+    frame_cond_out_dims = ckpt["frame_cond_out_dims"]
+    global_configs      = ckpt["global_configs"]
     print(f"[test_cond] Model kind:           {model_kind}")
     print(f"[test_cond] Frame cond dims:      {frame_cond_dims}")
     print(f"[test_cond] Frame cond out dims:  {frame_cond_out_dims}")
     print(f"[test_cond] Global cond configs:  {global_configs}")
 
-    frame_reinject_every = ckpt_frame_reinject_every(ckpt)
-    check_ckpt_reinject_gate(ckpt, args.ckpt)
+    frame_reinject_every = ckpt["frame_reinject_every"]
     print(f"[test_cond] Frame re-injection:    "
           f"{'every ' + str(frame_reinject_every) + ' block(s)' if frame_reinject_every > 0 else 'OFF'}")
 
-    text_cross_every = ckpt_text_cross_every(ckpt)
+    text_cross_every = ckpt["text_cross_every"]
     text_ctx_dim = ckpt_text_ctx_dim(ckpt)
-    attention = ckpt_attention(ckpt)
-    qk_norm = ckpt_qk_norm(ckpt)
-    inpainting = ckpt_inpainting(ckpt)
+    attention = ckpt["attention"]
+    qk_norm = ckpt["qk_norm"]
+    inpainting = ckpt["inpainting"]
     inpaint_only = inpainting and tc.inpaint_mask_probs(cfg.training)[0] == 0.0
     print(f"[test_cond] Self-attention:        {attention}")
     print(f"[test_cond] QK-norm:               {'on' if qk_norm else 'off'}")
@@ -352,8 +325,6 @@ def main():
 
     cond_root = (cfg.paths.condition_root
                  if Path(cfg.paths.condition_root).exists() else None)
-    img_root  = (cfg.paths.image_root
-                 if Path(cfg.paths.image_root).exists() else None)
 
     split = load_source_split(
         cfg.paths.dataset_root,
@@ -379,14 +350,13 @@ def main():
         split="test",
         latent_root=cfg.paths.dataset_root,
         condition_root=cond_root,
-        image_root=img_root,
         duration_s=cfg.model.duration_s,
         normalizer=normalizer,
         registry=registry,
         preload_latents=False,
         strict_conditions=not args.allow_invalid_conditions,
-        text_source=cfg.conditioning.get("text_source", "audio"),
-        text_mix_p=cfg.conditioning.get("text_mix_p", 0.5),
+        text_source=cfg.conditioning.text_source,
+        generation_text_source=cfg.sampling.get("validation_text_source", None),
     )
     total = len(test_dataset)
     if total == 0:
@@ -574,8 +544,7 @@ def main():
         "metrics_enabled": metrics_enabled, "fad_reference": fad_mode,
         "metrics_uncond": compute_uncond, "influence_family": influence_family,
         "mir_threshold": mir_threshold,
-        "text_from_caption": bool(cfg.sampling.get(
-            "validation_text_from_caption", False)),
+        "validation_text_source": cfg.sampling.get("validation_text_source", None),
         "codec_device": str(cfg.metrics.get("codec_device", "cpu")),
         "gpus": DIST.world,
         "minutes": round(elapsed / 60, 2),

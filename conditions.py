@@ -6,7 +6,6 @@ import torch.nn as nn
 import torchaudio
 import numpy as np
 import inspect
-import random
 from pathlib import Path
 from typing import Dict, List, Optional
 from abc import ABC, abstractmethod
@@ -755,7 +754,8 @@ class CLAPTextCondition(GlobalConditionExtractor):
     @torch.no_grad()
     def encode_text(self, text: str) -> np.ndarray:
         self._load()
-        inputs = self._processor([text], return_tensors="pt", padding=True)
+        inputs = self._processor([text], return_tensors="pt", padding=True,
+                                 truncation=True)
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         out = self._model(**inputs)
         feat = out.text_embeds
@@ -765,7 +765,8 @@ class CLAPTextCondition(GlobalConditionExtractor):
     @torch.no_grad()
     def encode_batch(self, texts: List[str]) -> np.ndarray:
         self._load()
-        inputs = self._processor(list(texts), return_tensors="pt", padding=True)
+        inputs = self._processor(list(texts), return_tensors="pt", padding=True,
+                                 truncation=True)
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         out = self._model(**inputs)
         feat = out.text_embeds
@@ -780,7 +781,8 @@ class CLAPTextCondition(GlobalConditionExtractor):
     @torch.no_grad()
     def encode_tokens(self, texts: List[str]):
         self._load()
-        inputs = self._processor(list(texts), return_tensors="pt", padding=True)
+        inputs = self._processor(list(texts), return_tensors="pt", padding=True,
+                                 truncation=True)
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         out = self._model(**inputs)
         h = out.last_hidden_state.float()
@@ -879,38 +881,6 @@ class ClapAudioEmbedder:
                 torch.cuda.empty_cache()
 
 
-TEXT_LABEL_VOCAB = [
-    "solo pipe organ", "a cappella choir", "harpsichord", "solo piano",
-    "string quartet", "solo violin", "solo cello", "acoustic guitar",
-    "electric guitar", "distorted electric guitar", "electric bass",
-    "drum kit", "hand percussion", "brass section", "solo trumpet",
-    "woodwinds", "synthesizer", "analog synthesizer bass", "orchestra",
-    "a single sustained note", "a dense polyphonic texture",
-    "a solo melodic line", "a low bass register", "a high bright register",
-    "sparse and quiet", "loud and dense",
-    "a steady four on the floor beat", "a fast rhythmic pattern",
-    "a slow tempo", "no clear pulse", "a strong groove",
-    "a large reverberant church", "a dry close recording",
-    "a live concert recording", "a lo-fi noisy recording",
-    "baroque sacred music", "gregorian chant", "classical music",
-    "romantic orchestral music", "rock music", "heavy metal",
-    "electronic dance music", "ambient music", "experimental noise",
-    "jazz", "folk music", "film score",
-    "a plucked pizzicato attack", "a bowed tremolo", "breathy air noise",
-    "silence", "white noise",
-]
-
-
-def nearest_phrases(vec, vocab_emb, phrases, k: int = 2):
-    v = np.asarray(vec, dtype=np.float32).reshape(-1)
-    M = np.asarray(vocab_emb, dtype=np.float32)
-    if v.size == 0 or M.size == 0 or M.shape[1] != v.shape[0]:
-        return []
-    sims = M @ v
-    order = np.argsort(-sims)[:max(1, int(k))]
-    return [(phrases[i], float(sims[i])) for i in order if i < len(phrases)]
-
-
 class Wav2ClipAudioEmbedder:
     SR = 16000
 
@@ -1000,52 +970,6 @@ class ImageCondition(GlobalConditionExtractor):
             self._model.cpu()
             del self._model
             self._model = None
-
-
-class ImageDatasetManager:
-    EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-    def __init__(self, image_root: str, split: Optional[str] = None):
-        self.image_root = Path(image_root)
-        self.split = split
-        self.class_images: Dict[str, List[Path]] = {}
-        self._scan()
-
-    def _scan(self):
-        if not self.image_root.exists():
-            print(f"[ImageDataset] WARNING: {self.image_root} not found")
-            return
-
-        if self.split is not None:
-            base = self.image_root / self.split
-            if not base.exists():
-                print(f"[ImageDataset/{self.split}] {base} does not exist, "
-                      f"using legacy layout {self.image_root}")
-                base = self.image_root
-        else:
-            base = self.image_root
-
-        for d in sorted(base.iterdir()):
-            if d.is_dir():
-                imgs = [f for f in sorted(d.iterdir())
-                        if f.suffix.lower() in self.EXTS]
-                if imgs:
-                    self.class_images[d.name] = imgs
-        total = sum(len(v) for v in self.class_images.values())
-        tag = f"/{self.split}" if self.split else ""
-        print(f"[ImageDataset{tag}] {len(self.class_images)} classes, {total} images")
-
-    def has_class(self, class_name: str) -> bool:
-        return class_name in self.class_images
-
-    def get_random_image(self, class_name: str, rng=None) -> Optional[Path]:
-        imgs = self.class_images.get(class_name, [])
-        if not imgs:
-            return None
-        return (rng or random).choice(imgs)
-
-    def get_all_images(self, class_name: str) -> List[Path]:
-        return self.class_images.get(class_name, [])
 
 
 CONDITION_CONFIG = {

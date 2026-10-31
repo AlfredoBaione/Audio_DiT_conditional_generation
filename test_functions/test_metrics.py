@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from metrics import (compute_frechet_distance, gaussian_kl_fullcov,
-                     compute_fd_codec, compute_kl_both)
+                     compute_codec_metrics)
 
 
 def _two_gaussians(d=128):
@@ -50,13 +50,11 @@ def test_block_accumulation():
         "sigma": torch.eye(dim, dtype=torch.float64),
         "n_total": 1000,
     }
-    fd_codec = compute_fd_codec(gen_latents, ref_stats, device="cpu", block_size=4)
-    kl = compute_kl_both(gen_latents, ref_stats, device="cpu", block_size=4)
-    print(f"  FD-codec: {fd_codec:.4f}")
-    print(f"  KL(real||gen): {kl['kl_real_gen']:.4f} | KL(gen||real): {kl['kl_gen_real']:.4f}")
-    fd_a = compute_fd_codec(gen_latents, ref_stats, device="cpu", block_size=4)
-    fd_b = compute_fd_codec(gen_latents, ref_stats, device="cpu", block_size=16)
-    assert abs(fd_a - fd_b) < 1e-9
+    a = compute_codec_metrics(gen_latents, ref_stats, device="cpu", block_size=4)
+    b = compute_codec_metrics(gen_latents, ref_stats, device="cpu", block_size=16)
+    print(f"  FD-codec: {a['fd_codec']:.4f}")
+    print(f"  KL(real||gen): {a['kl_real_gen']:.4f} | KL(gen||real): {a['kl_gen_real']:.4f}")
+    assert abs(a["fd_codec"] - b["fd_codec"]) < 1e-9
 
 
 if __name__ == "__main__":

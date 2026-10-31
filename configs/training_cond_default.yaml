@@ -58,7 +58,7 @@ sampling:
   n_test_panels: 8
   n_probe_panels: 8
   n_metrics_samples: 512
-  validation_text_from_caption: true
+  validation_text_source: null  # null = text_source | audio | label | text
   influence_subsets: []      # [] = off | ["all", "loo", "singletons"] | [["f0"], ["f0", "energy"]]
   metrics_uncond: false
   metrics_samples_per_forward: 1   # 0 = serial sampler; N = N samples per forward
@@ -80,8 +80,7 @@ conditioning:
   p_drop_global: 0.05
   p_drop_each_frame: 0.0     # > 0 = each frame condition also dropped alone
   guidance_scale: 3.0
-  text_source: caption       # audio | caption | mix
-  text_mix_p: 0.5            # mix only: probability of the caption
+  text_source: label         # audio | label | text
   enabled_frame:  ["f0"]     # f0, chroma, rhythm, energy, chord, midi
   enabled_global: []         # text, image
 

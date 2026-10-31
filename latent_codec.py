@@ -59,28 +59,6 @@ def dataset_codec(latent_root) -> str:
     return codec_from_meta(meta)
 
 
-def codec_from_ckpt(ckpt: dict) -> str:
-    name = codec_from_meta({"codec": ckpt.get("codec", None)})
-    width = ckpt_token_dim(ckpt)
-    if width is not None and width != get_spec(name).latent_dim:
-        raise RuntimeError(
-            f"this checkpoint says codec={name!r} ({get_spec(name).latent_dim}-d "
-            f"latents) but its weights produce {width}-d tokens. The weights are "
-            f"what gets loaded; the field is wrong -- the checkpoint was edited "
-            f"or assembled by hand.")
-    return name
-
-
-def ckpt_token_dim(ckpt: dict) -> Optional[int]:
-    for key in ("model_state_dict", "ema_state_dict"):
-        sd = ckpt.get(key, None)
-        if isinstance(sd, dict):
-            w = sd.get("final_layer.linear.weight", None)
-            if w is not None and hasattr(w, "shape"):
-                return int(w.shape[0])
-    return None
-
-
 _ACTIVE = [CODECS[DEFAULT_CODEC]]
 
 

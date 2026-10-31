@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from audio_dataset_npy import  MAX_FRAMES
+from dataset_utils import  MAX_FRAMES
 from conditions import FrameConditionEncoder, GlobalConditionEncoder
 
 
@@ -699,132 +699,8 @@ class ConditionedAudioDiT(nn.Module):
         return x
 
 
-def ckpt_frame_reinject_every(ckpt: dict) -> int:
-    v = ckpt.get("frame_reinject_every", None)
-    if v is None:
-        cfg = ckpt.get("config", None)
-        if isinstance(cfg, dict):
-            v = (cfg.get("model", None) or {}).get("frame_reinject_every", None)
-    return int(v or 0)
-
-
-def ckpt_text_cross_every(ckpt: dict) -> int:
-    v = ckpt.get("text_cross_every", None)
-    if v is None:
-        cfg = ckpt.get("config", None)
-        if isinstance(cfg, dict):
-            v = (cfg.get("model", None) or {}).get("text_cross_every", None)
-    return int(v or 0)
-
-
 def ckpt_text_ctx_dim(ckpt: dict) -> int:
-    sd = ckpt.get("model_state_dict", None)
-    if not isinstance(sd, dict) or not sd:
-        sd = ckpt.get("ema_state_dict", None)
-    if not isinstance(sd, dict):
-        return 0
-    for k, v in sd.items():
-        if k.endswith("cross_attn.kv.weight") and hasattr(v, "shape"):
+    for k, v in ckpt["model_state_dict"].items():
+        if k.endswith("cross_attn.kv.weight"):
             return int(v.shape[1])
     return 0
-
-
-def ckpt_attention(ckpt: dict) -> str:
-    sd = ckpt.get("model_state_dict", None)
-    if not isinstance(sd, dict) or not sd:
-        sd = ckpt.get("ema_state_dict", None)
-    from_weights = None
-    if isinstance(sd, dict) and sd:
-        from_weights = ("differential"
-                        if any(k.endswith("attn.lambda_q1") for k in sd)
-                        else "standard")
-    field = ckpt.get("attention", None)
-    if field is None:
-        cfg = ckpt.get("config", None)
-        if isinstance(cfg, dict):
-            field = (cfg.get("model", None) or {}).get("attention", None)
-    if from_weights is None:
-        return str(field or "standard")
-    if field is not None and str(field) != from_weights:
-        raise RuntimeError(
-            f"this checkpoint says attention={field!r} but its weights are "
-            f"those of the {from_weights!r} attention "
-            f"({'with' if from_weights == 'differential' else 'without'} "
-            f"the lambda vectors). The weights are what gets loaded; the field "
-            f"is wrong -- the checkpoint was edited or assembled by hand.")
-    return from_weights
-
-
-def ckpt_qk_norm(ckpt: dict) -> bool:
-    sd = ckpt.get("model_state_dict", None)
-    if not isinstance(sd, dict) or not sd:
-        sd = ckpt.get("ema_state_dict", None)
-    from_weights = None
-    if isinstance(sd, dict) and sd:
-        from_weights = any(k.endswith("attn.q_norm.weight") for k in sd)
-    field = ckpt.get("qk_norm", None)
-    if field is None:
-        cfg = ckpt.get("config", None)
-        if isinstance(cfg, dict):
-            field = (cfg.get("model", None) or {}).get("qk_norm", None)
-    if from_weights is None:
-        return bool(field or False)
-    if field is not None and bool(field) != from_weights:
-        raise RuntimeError(
-            f"this checkpoint says qk_norm={field!r} but its weights are "
-            f"{'with' if from_weights else 'without'} the q_norm/k_norm "
-            f"gains. The weights are what gets loaded; the field is wrong -- "
-            f"the checkpoint was edited or assembled by hand.")
-    return from_weights
-
-
-def ckpt_inpainting(ckpt: dict) -> bool:
-    sd = ckpt.get("model_state_dict", None)
-    if not isinstance(sd, dict) or not sd:
-        sd = ckpt.get("ema_state_dict", None)
-    from_weights = None
-    if isinstance(sd, dict) and sd:
-        from_weights = any(".inpaint_embed." in k for k in sd)
-    field = ckpt.get("inpainting", None)
-    if field is None:
-        cfg = ckpt.get("config", None)
-        if isinstance(cfg, dict):
-            field = (cfg.get("training", None) or {}).get("inpainting", None)
-    if from_weights is None:
-        return bool(field or False)
-    if field is not None and bool(field) != from_weights:
-        raise RuntimeError(
-            f"this checkpoint says inpainting={field!r} but its weights are "
-            f"{'with' if from_weights else 'without'} the inpainting context "
-            f"layers. The weights are what gets loaded; the field is wrong -- "
-            f"the checkpoint was edited or assembled by hand.")
-    return from_weights
-
-
-def check_ckpt_reinject_gate(ckpt: dict, where: str = "this checkpoint") -> None:
-    if ckpt_frame_reinject_every(ckpt) <= 0:
-        return
-    sd = ckpt.get("model_state_dict", None)
-    if not isinstance(sd, dict):
-        sd = ckpt.get("ema_state_dict", None)
-    if not isinstance(sd, dict) or not sd:
-        return
-    if any(k.startswith("frame_reinject_gate.") for k in sd):
-        return
-    if not any(k.startswith("frame_reinject.") for k in sd):
-        return
-    raise RuntimeError(
-        f"{where} was trained with model.frame_reinject_every="
-        f"{ckpt_frame_reinject_every(ckpt)} BEFORE the per-condition gate on "
-        f"the re-injection existed, so it has the per-block projections but "
-        f"none of the `frame_reinject_gate.*` weights this code builds. It "
-        f"cannot be loaded or resumed as-is: the two are different "
-        f"architectures that happen to agree on every other field.\n"
-        f"  - to keep using that checkpoint, check out the code from before "
-        f"the gate (network_cond.py.pre-reinject-gate.bak);\n"
-        f"  - to use this code, start a NEW run -- a gate initialised to 1 "
-        f"makes step 0 identical to the ungated model, so nothing is lost "
-        f"except the steps already spent."
-    )
-
-

@@ -2,7 +2,6 @@
 
 import os
 import torch
-import numpy as np
 from typing import Optional
 from pathlib import Path
 from tqdm import tqdm
@@ -163,12 +162,6 @@ def precompute_latent_reference(
     return stats
 
 
-def precompute_fd_codec_reference(val_dataset, cache_path=None, device=None,
-                                  batch_accum: int = 50) -> dict:
-    return precompute_latent_reference(
-        val_dataset, cache_path=cache_path, device=device, batch_accum=batch_accum)
-
-
 def _generated_mu_sigma(generated_latents: torch.Tensor, device: str,
                         block_size: int = 16):
     dim = generated_latents.shape[-1]
@@ -187,47 +180,6 @@ def _generated_mu_sigma(generated_latents: torch.Tensor, device: str,
 
     mu_gen, sigma_gen, _ = compute_mu_sigma(sum_x, sum_xx, count)
     return mu_gen, sigma_gen
-
-
-def compute_fd_codec(
-    generated_latents: torch.Tensor,
-    ref_stats: dict,
-    device: str = "cuda",
-    block_size: int = 16,
-) -> float:
-    mu_gen, sigma_gen = _generated_mu_sigma(generated_latents, device, block_size)
-
-    mu_ref = ref_stats["mu"].to(device)
-    sigma_ref = ref_stats["sigma"].to(device)
-
-    fd = compute_frechet_distance(mu_ref, sigma_ref, mu_gen, sigma_gen)
-
-    del mu_gen, sigma_gen, mu_ref, sigma_ref
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    return float(fd.item())
-
-
-def compute_kl_both(
-    generated_latents: torch.Tensor,
-    ref_stats: dict,
-    device: str = "cuda",
-    block_size: int = 16,
-) -> dict:
-    mu_gen, sigma_gen = _generated_mu_sigma(generated_latents, device, block_size)
-
-    mu_ref = ref_stats["mu"].to(device)
-    sigma_ref = ref_stats["sigma"].to(device)
-
-    kl_real_gen = gaussian_kl_fullcov(mu_ref, sigma_ref, mu_gen, sigma_gen)
-    kl_gen_real = gaussian_kl_fullcov(mu_gen, sigma_gen, mu_ref, sigma_ref)
-
-    del mu_gen, sigma_gen, mu_ref, sigma_ref
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    return {"kl_real_gen": kl_real_gen, "kl_gen_real": kl_gen_real}
 
 
 CODEC_METRICS = ("fd_codec", "kl_codec")
@@ -262,48 +214,6 @@ def compute_codec_metrics(
         torch.cuda.empty_cache()
 
     return out
-
-
-class EncodecEmbedder:
-    def __init__(self, audio_sr_model: int = 24000, device: str = "cpu"):
-        self.audio_sr_model = audio_sr_model
-        self.device = device
-        self._model = None
-        self.embedding_dim = None
-
-    def _load(self):
-        if self._model is not None:
-            return
-        try:
-            from encodec import EncodecModel
-        except ImportError:
-            raise ImportError("encodec not found. Install with: pip install encodec")
-        model = (EncodecModel.encodec_model_48khz() if self.audio_sr_model == 48000
-                 else EncodecModel.encodec_model_24khz())
-        model.set_target_bandwidth(24.0)
-        model.eval().to(self.device)
-        self._model = model
-        self.embedding_dim = model.encoder.dimension
-        print(f"[Encodec] {self.audio_sr_model // 1000}kHz on {self.device} "
-              f"(dim={self.embedding_dim})")
-
-    @torch.no_grad()
-    def embed(self, audio: torch.Tensor, audio_sr: int) -> torch.Tensor:
-        self._load()
-        x = audio.to(self.device).float()
-        if self._model.sample_rate != audio_sr:
-            import librosa
-            x_np = librosa.resample(
-                x.detach().cpu().numpy(),
-                orig_sr=audio_sr, target_sr=self._model.sample_rate, axis=-1)
-            x = torch.from_numpy(np.ascontiguousarray(x_np, dtype=np.float32)).to(self.device)
-        if self._model.sample_rate == 48000:
-            if x.shape[1] != 2:
-                x = torch.cat((x, x), dim=1)
-        elif x.shape[1] > 1:
-            x = x.mean(dim=1, keepdim=True)
-        e = self._model.encoder(x)
-        return e.permute(0, 2, 1).reshape(-1, e.shape[1])
 
 
 class VGGishEmbedder:
@@ -394,24 +304,6 @@ def precompute_audio_reference(val_wav_source, embedder, cache_path=None,
     return stats
 
 
-@torch.no_grad()
-def _decode_embed_mu_sigma(generated_latents, normalizer, embedder, device, desc):
-    from audio_dataset_npy import decode_latents
-    import latent_codec as lc
-    sr = lc.active().sample_rate
-
-    def _iter():
-        for i in range(generated_latents.shape[0]):
-            z = generated_latents[i].T
-            z = normalizer.denormalize(z)
-            wav = decode_latents(z, device=device)
-            yield wav.unsqueeze(0), sr
-
-    return _audio_clips_to_mu_sigma(_iter(), generated_latents.shape[0], embedder, device, desc)
-
-
-ALL_METRICS = ("fd_codec", "kl_codec", "fad_encodec", "fad_vggish")
-
 COND_METRICS = ("fd_codec", "kl_codec", "fad_vggish")
 
 
@@ -430,117 +322,3 @@ def compute_fad(mu_gen, sigma_gen, ref_stats: dict, device: str = "cuda") -> flo
     if device == "cuda":
         torch.cuda.empty_cache()
     return float(fad.item())
-
-
-def make_embedders(enabled, device: str = "cuda", encodec_sr: int = 24000) -> dict:
-    emb = {}
-    if "fad_encodec" in enabled:
-        emb["encodec"] = EncodecEmbedder(audio_sr_model=encodec_sr, device=device)
-    if "fad_vggish" in enabled:
-        emb["vggish"] = VGGishEmbedder(device=device)
-    return emb
-
-
-def build_references(enabled, val_dataset, val_wav_root, embedders, cache_dir,
-                     device: str = "cuda", strict: bool = True) -> dict:
-    cache_dir = Path(cache_dir)
-    refs = {}
-    if "fd_codec" in enabled or "kl_codec" in enabled:
-        refs["codec"] = precompute_latent_reference(
-            val_dataset, cache_path=str(cache_dir / "latent_ref_stats.pt"), device=device)
-    for name, key, fname in (("fad_encodec", "encodec", "fad_encodec_ref_stats.pt"),
-                             ("fad_vggish",  "vggish",  "fad_vggish_ref_stats.pt")):
-        if name not in enabled:
-            continue
-        try:
-            refs[key] = precompute_audio_reference(
-                val_wav_root, embedders[key],
-                cache_path=str(cache_dir / fname), device=device)
-        except Exception as e:
-            need = (f"need real val wavs under '{val_wav_root}', a working audio "
-                    f"backend (FFmpeg/torchcodec)"
-                    + (" and network access for VGGish weights" if key == "vggish" else "")
-                    + ".")
-            if strict:
-                raise RuntimeError(
-                    f"[Metrics] FATAL: metric '{name}' is enabled but its reference "
-                    f"could not be built ({type(e).__name__}: {e}). {need} "
-                    f"Fix the environment, remove '{name}' from metrics.enabled, "
-                    f"or call build_references(strict=False) to skip it and "
-                    f"continue.") from e
-            print(f"[Metrics] WARNING (strict=false): could not build the {name} "
-                  f"reference ({type(e).__name__}: {e}). Skipping {name} this run — {need}")
-    return refs
-
-
-@torch.no_grad()
-def evaluate_generation(model, normalizer, val_dataset, *, enabled, references,
-                        embedders=None, n_samples: int = 64, euler_steps: int = 50,
-                        t_min: float = 0.001, t_max: float = 0.999,
-                        seed: Optional[int] = None,
-                        device: str = "cuda", use_amp: bool = False) -> dict:
-    try:
-        from sampling import euler_integrate
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "evaluate_generation() is the unconditional metrics path (needs the "
-            "uncond sampling.py / euler_integrate); the conditioned pipeline does "
-            "not use it -- see precompute_latent_reference + condition_metrics.") from e
-    embedders = embedders or {}
-    model.eval()
-    n_frames = val_dataset.n_frames
-    token_dim = val_dataset[0][0].shape[-1]
-
-    gen_rng = None
-    if seed is not None:
-        gen_rng = torch.Generator(device=device)
-        gen_rng.manual_seed(int(seed))
-
-    gen_list = []
-    n_skipped = 0
-    for _ in tqdm(range(n_samples), desc="Metrics: generating samples"):
-        x = torch.randn(1, n_frames, token_dim, device=device, generator=gen_rng)
-        x = euler_integrate(model, x, steps=euler_steps,
-                            t_min=t_min, t_max=t_max, use_amp=use_amp)
-        gf = x[0].cpu()
-        if torch.isfinite(gf).all():
-            gen_list.append(gf)
-        else:
-            n_skipped += 1
-        del x
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    if n_skipped:
-        print(f"[Metrics] WARNING: {n_skipped}/{n_samples} generated samples "
-              f"were non-finite and skipped.")
-    if not gen_list:
-        print("[Metrics] WARNING: all generated samples were non-finite; "
-              "skipping metrics this eval.")
-        return {}
-
-    generated_latents = torch.stack(gen_list)
-
-    out = {}
-    if "fd_codec" in enabled:
-        out["fd_codec"] = compute_fd_codec(generated_latents, references["codec"], device=device)
-    if "kl_codec" in enabled:
-        kl = compute_kl_both(generated_latents, references["codec"], device=device)
-        out["kl_real_gen"] = kl["kl_real_gen"]
-        out["kl_gen_real"] = kl["kl_gen_real"]
-    for name, key in (("fad_encodec", "encodec"), ("fad_vggish", "vggish")):
-        if (name in enabled and key in references
-                and embedders is not None and embedders.get(key) is not None):
-            mu_g, sigma_g, _ = _decode_embed_mu_sigma(
-                generated_latents, normalizer, embedders[key], device,
-                desc=f"Metrics: {name} (decode+embed)")
-            ref = references[key]
-            out[name] = float(compute_frechet_distance(
-                ref["mu"].to(device), ref["sigma"].to(device), mu_g, sigma_g).item())
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    out["generated_latents"] = generated_latents
-    return out
-
-

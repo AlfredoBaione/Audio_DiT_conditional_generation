@@ -20,6 +20,7 @@ if os.path.isdir(_IRCAM_LOCAL):
     os.environ["TORCH_HOME"] = os.path.join(_cache, "torch")
 
 import re
+import csv
 import json
 import math
 import random
@@ -32,6 +33,7 @@ import faulthandler
 import queue
 import signal
 import multiprocessing
+import unicodedata
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
@@ -184,166 +186,6 @@ def sanitize_filename(name: str) -> str:
     return name if name else "unknown"
 
 
-LABEL_SOURCES = ("dir", "csv")
-
-CSV_FILE_COLS = ("file", "filename")
-CSV_LABEL_COLS = ("label", "class")
-
-_LABEL_FORBIDDEN = set('/\\:*?"<>|') | {chr(c) for c in range(32)}
-
-_AMBIGUOUS = object()
-
-
-def _validate_class_label(label: str, where: str) -> str:
-    s = str(label).strip()
-    if not s:
-        raise SystemExit(f"[labels] {where}: empty class label.")
-    bad = sorted(set(s) & _LABEL_FORBIDDEN)
-    if bad or s in (".", ".."):
-        raise SystemExit(
-            f"[labels] {where}: the label {s!r} cannot be a directory name "
-            f"(offending character(s): {bad or [s]}). The class name IS the "
-            f"output folder name here, so it is refused rather than silently "
-            f"rewritten -- a rewritten name would no longer match "
-            f"image_root/<class>. Fix it in the CSV.")
-    return s
-
-
-def _norm_rel_key(s) -> str:
-    s = str(s).strip().strip('"').replace("\\", "/")
-    while s.startswith("./"):
-        s = s[2:]
-    return s.lstrip("/")
-
-
-def _index_put(d: dict, key: str, row: int, label_of) -> None:
-    if not key:
-        return
-    prev = d.get(key)
-    if prev is None:
-        d[key] = row
-    elif prev is _AMBIGUOUS:
-        return
-    elif label_of(prev) != label_of(row):
-        d[key] = _AMBIGUOUS
-
-
-class CsvLabelResolver:
-    def __init__(self, csv_path: Path, rows: List[Tuple[str, str]]):
-        self.csv_path = Path(csv_path)
-        self.rows = list(rows)
-        self.used = set()
-
-        def label_of(i):
-            return self.rows[i][1]
-
-        self._by_rel = {}
-        self._by_name = {}
-        self._by_rel_lc = {}
-        self._by_name_lc = {}
-        for i, (rel, _lab) in enumerate(self.rows):
-            name = rel.rsplit("/", 1)[-1]
-            _index_put(self._by_rel, rel, i, label_of)
-            _index_put(self._by_name, name, i, label_of)
-            _index_put(self._by_rel_lc, rel.lower(), i, label_of)
-            _index_put(self._by_name_lc, name.lower(), i, label_of)
-
-    @property
-    def n_rows(self) -> int:
-        return len(self.rows)
-
-    @property
-    def labels(self) -> List[str]:
-        return sorted({lab for _, lab in self.rows})
-
-    def unmatched_rows(self) -> List[str]:
-        return [rel for i, (rel, _) in enumerate(self.rows) if i not in self.used]
-
-    def lookup(self, rel_posix: str) -> Tuple[Optional[str], str]:
-        name = rel_posix.rsplit("/", 1)[-1]
-        for d, key in ((self._by_rel, rel_posix),
-                       (self._by_name, name),
-                       (self._by_rel_lc, rel_posix.lower()),
-                       (self._by_name_lc, name.lower())):
-            hit = d.get(key)
-            if hit is None:
-                continue
-            if hit is _AMBIGUOUS:
-                return None, "ambiguous"
-            self.used.add(hit)
-            return self.rows[hit][1], "ok"
-        return None, "missing"
-
-
-def _pick_csv_column(path, fields, accepted, what: str) -> str:
-    hits = [f for f in fields if f.lower() in accepted]
-    if len(hits) == 1:
-        return hits[0]
-    if not hits:
-        raise SystemExit(
-            f"[labels] {Path(path).name} has no {what} column. Accepted names "
-            f"(any case): {list(accepted)}. The file has "
-            f"{fields or 'no header'}. Rename the column in the CSV -- there is "
-            f"deliberately no flag for this.")
-    raise SystemExit(
-        f"[labels] {Path(path).name} has {len(hits)} columns that could be the "
-        f"{what} column: {hits}. Which one is the {what} cannot be guessed, and "
-        f"guessing would put a whole corpus in the wrong folders. Rename or "
-        f"remove one of them in the CSV.")
-
-
-def load_label_csv(csv_path: str) -> "CsvLabelResolver":
-    import csv as _csv
-    p = Path(csv_path)
-    if not p.exists():
-        raise SystemExit(f"[labels] --label_csv {p} does not exist.")
-
-    with p.open("r", encoding="utf-8-sig", newline="") as fh:
-        reader = _csv.DictReader(fh)
-        fields = [(f or "").strip() for f in (reader.fieldnames or [])]
-        fcol = _pick_csv_column(p, fields, CSV_FILE_COLS, "file")
-        lcol = _pick_csv_column(p, fields, CSV_LABEL_COLS, "label")
-        rows, n_blank, n_seen = [], 0, 0
-        for raw in reader:
-            n_seen += 1
-            rel = _norm_rel_key(raw.get(fcol) or "")
-            lab = str(raw.get(lcol) or "").strip()
-            if not rel or not lab:
-                n_blank += 1
-                continue
-            rows.append((rel, _validate_class_label(lab, f"{p.name} row {n_seen}")))
-
-    if not rows:
-        raise SystemExit(
-            f"[labels] {p}: no usable row ({n_seen} read, {n_blank} with an "
-            f"empty cell).")
-    res = CsvLabelResolver(p, rows)
-    print(f"[labels] {p.name}: {len(rows)} row(s), {len(res.labels)} label(s)"
-          + (f", {n_blank} row(s) skipped for an empty cell" if n_blank else ""))
-    return res
-
-
-def build_label_resolver(args):
-    src = str(getattr(args, "label_source", "dir") or "dir").strip().lower()
-    if src not in LABEL_SOURCES:
-        raise SystemExit(f"[labels] label_source must be one of "
-                         f"{list(LABEL_SOURCES)}, got {src!r}.")
-    if src == "dir":
-        if getattr(args, "label_csv", None):
-            print("[labels] label_csv is set but label_source is 'dir': the CSV "
-                  "is NOT read, classes come from the directory tree.")
-        return None
-    if not getattr(args, "label_csv", None):
-        raise SystemExit("[labels] --label_source csv needs --label_csv "
-                         "<metadata.csv>.")
-    if getattr(args, "single_class", False):
-        raise SystemExit(
-            "[labels] --single_class and --label_source csv contradict each "
-            "other: the first puts every source in ONE class, the second gives "
-            "each file the class its CSV row names. Choose one.")
-    return load_label_csv(args.label_csv)
-
-
 def print_class_histogram(files, max_shown: int = 24) -> None:
     if not files:
         return
@@ -360,76 +202,23 @@ def print_class_histogram(files, max_shown: int = 24) -> None:
     print(f"  classes: {body}{tail}")
 
 
-def labels_provenance(args, resolver) -> dict:
-    prov = {"source": "csv" if resolver is not None else "dir"}
-    if resolver is not None:
-        prov.update({"csv": str(args.label_csv),
-                     "csv_name": resolver.csv_path.name})
-    elif getattr(args, "single_class", False):
-        prov["single_class"] = str(getattr(args, "class_name", None) or "")
-    return prov
-
-
-def load_labels_provenance(out_root: Path) -> dict:
-    p = out_root / MANIFEST_NAME
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8")).get("labels", {}) or {}
-    except Exception:
-        return {}
-
-
-def check_labels_provenance(out_root: Path, prov: dict) -> None:
-    old = load_labels_provenance(out_root)
-    if not old:
-        if not load_source_manifest(out_root):
-            return
-        old = {"source": "dir"}
-    if old.get("source") != prov.get("source"):
-        raise SystemExit(
-            f"[labels] {out_root} was built with label_source="
-            f"{old.get('source')!r} and this run uses {prov.get('source')!r}.\n"
-            f"The labelling mode decides the output FOLDER of every latent, so "
-            f"re-running with the other one does not overwrite the dataset -- "
-            f"it writes a SECOND copy under different class folders, and the "
-            f"split and the manifest then describe both at once. Use a FRESH "
-            f"output dir.")
-    differing = {k: (old.get(k), prov.get(k)) for k in ("csv_name",)
-                 if k in old and old.get(k) != prov.get(k)}
-    if differing:
-        print(f"[labels] WARNING: a different CSV from the one recorded for "
-              f"{out_root} (old vs new): {differing}. A source whose label "
-              f"changed keeps its OLD latents under the OLD class folder -- "
-              f"those become orphans (see --prune_orphans).")
-
-
-def scan_audio_files(
-    source_dir: str,
-    single_class: bool = False,
-    class_name: Optional[str] = None,
-    label_resolver=None,
-) -> List[Tuple[Path, Path, str, str, str]]:
+def scan_audio_files(source_dir: str, single_class: bool = False,
+                     class_name: Optional[str] = None,
+                     recorded: Optional[dict] = None,
+                     ) -> List[Tuple[Path, Path, str, str, str]]:
     src = Path(source_dir)
     files = sorted(
         p for p in src.rglob("*")
         if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTS
     )
+    recorded = recorded or {}
 
     out: List[Tuple[Path, Path, str, str, str]] = []
-    unlabelled: List[str] = []
-    ambiguous: List[str] = []
     for p in files:
         rel_posix = p.relative_to(src).as_posix()
-        if label_resolver is not None:
-            label, status = label_resolver.lookup(rel_posix)
-            if status == "ambiguous":
-                ambiguous.append(rel_posix)
-                continue
-            if status == "missing":
-                unlabelled.append(rel_posix)
-                continue
-            rel_parent = Path(label)
+        chunks = recorded.get(rel_posix, {}).get("chunks")
+        if chunks:
+            rel_parent = Path(chunks[0]).parent
         elif single_class:
             rel_parent = Path(class_name or src.name)
         else:
@@ -438,41 +227,68 @@ def scan_audio_files(
         leaf_class = rel_parent.name
         src_hash = hashlib.sha1(rel_posix.encode("utf-8")).hexdigest()[:8]
         out.append((p, rel_parent, leaf_class, src_hash, rel_posix))
-
-    if label_resolver is not None:
-        _report_csv_labelling(label_resolver, len(files), len(out),
-                              unlabelled, ambiguous)
     return out
 
 
-def _report_csv_labelling(resolver, n_files: int, n_kept: int,
-                          unlabelled: List[str], ambiguous: List[str]) -> None:
-    if ambiguous:
-        raise SystemExit(
-            f"[labels] {len(ambiguous)} source file(s) match SEVERAL rows of "
-            f"{resolver.csv_path.name} carrying DIFFERENT labels, so the CSV "
-            f"cannot say what class they are: "
-            f"{ambiguous[:8]}{' ...' if len(ambiguous) > 8 else ''}\n"
-            f"This happens when the file column holds bare names and the same "
-            f"name appears in two folders under different labels. Fix by "
-            f"putting the path relative to source_dir in the file column, or "
-            f"by removing the duplicate rows.")
+CSV_FILE_COLS = ("file", "filename", "file_name")
+CSV_LABEL_COLS = ("label", "class")
+CSV_TEXT_COLS = ("text", "description", "caption")
 
-    if unlabelled:
-        raise SystemExit(
-            f"[labels] {len(unlabelled)} source file(s) have no row in "
-            f"{resolver.csv_path.name}: "
-            f"{unlabelled[:8]}{' ...' if len(unlabelled) > 8 else ''}\n"
-            f"Every source must be named by the CSV. Add the rows, or point "
-            f"--label_csv at a CSV that covers this source_dir.")
 
-    print(f"[labels] {n_kept}/{n_files} source file(s) labelled from "
-          f"{resolver.csv_path.name} ({resolver.n_rows} row(s))")
-    unmatched = resolver.unmatched_rows()
-    if unmatched:
-        print(f"[labels] {len(unmatched)}/{resolver.n_rows} CSV row(s) matched "
-              f"no file under this source_dir: "
-              f"{unmatched[:8]}{' ...' if len(unmatched) > 8 else ''}")
+def _path_key(s) -> str:
+    s = unicodedata.normalize("NFC", str(s)).strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s.lstrip("/").casefold()
+
+
+def _clean_text(s) -> Optional[str]:
+    s = " ".join(str(s or "").split())
+    return s if any(c.isalnum() for c in s) else None
+
+
+def read_source_metadata(source_dir, rels) -> dict:
+    by_rel = {_path_key(r): r for r in rels}
+    by_name = {}
+    for key, r in by_rel.items():
+        by_name.setdefault(key.rsplit("/", 1)[-1], []).append(r)
+    out = {r: {"labels": [], "texts": []} for r in rels}
+    read, unmatched = [], 0
+    for p in sorted(Path(source_dir).rglob("*.csv")):
+        with p.open(encoding="utf-8-sig", errors="replace", newline="") as fh:
+            reader = csv.DictReader(fh)
+            fields = [f for f in (reader.fieldnames or []) if f]
+            file_cols = [f for f in fields if f.strip().lower() in CSV_FILE_COLS]
+            value_cols = {
+                "labels": [f for f in fields if f.strip().lower() in CSV_LABEL_COLS],
+                "texts": [f for f in fields if f.strip().lower() in CSV_TEXT_COLS],
+            }
+            if not file_cols or not any(value_cols.values()):
+                continue
+            read.append(p.name)
+            for row in reader:
+                key = _path_key(row.get(file_cols[0]) or "")
+                hits = ([by_rel[key]] if key in by_rel
+                        else by_name.get(key.rsplit("/", 1)[-1], []))
+                unmatched += not hits
+                for kind, cols in value_cols.items():
+                    for col in cols:
+                        value = _clean_text(row.get(col))
+                        for r in hits if value else ():
+                            if value not in out[r][kind]:
+                                out[r][kind].append(value)
+    if read:
+        print(f"[metadata] read {', '.join(read)}"
+              + (f"; {unmatched} row(s) match no audio file" if unmatched else ""))
+    return out
+
+
+def _stratified_by_label(files, metadata):
+    out = []
+    for p, rel_parent, leaf, src_hash, rel in files:
+        labels = metadata.get(rel, {}).get("labels")
+        out.append((p, rel_parent, labels[0] if labels else leaf, src_hash, rel))
+    return out
 
 
 MANIFEST_NAME = "source_manifest.json"
@@ -511,19 +327,14 @@ def audit_sources(prev: dict, files) -> Tuple[list, list]:
 
 
 def write_source_manifest(out_root: Path, prev: dict, produced: dict,
-                          removed: list, prune: bool,
-                          labels: Optional[dict] = None):
+                          removed: list, prune: bool):
     merged = dict(prev)
     if prune:
         for rel in removed:
             merged.pop(rel, None)
     merged.update(produced)
     p = out_root / MANIFEST_NAME
-    payload = {"sources": merged}
-    labels = labels or load_labels_provenance(out_root)
-    if labels:
-        payload["labels"] = labels
-    _atomic_write_json(p, payload)
+    _atomic_write_json(p, {"sources": merged})
     return len(merged)
 
 
@@ -620,7 +431,7 @@ def load_splits(out_root: Path) -> Optional[dict]:
 
 def assign_source_splits(files, ratios, seed: int, stratify_by_class: bool,
                          existing: Optional[dict] = None) -> Tuple[dict, int]:
-    from audio_dataset_npy import _allocate_three, _seed_for
+    from dataset_utils import _allocate_three, _seed_for
 
     existing = dict(existing or {})
     buckets: dict = {}
@@ -694,6 +505,12 @@ def write_splits(out_root: Path, groups: dict, params: dict, source: str):
     return payload
 
 
+def _chunk_group(rel_chunk: str) -> str:
+    parent, _, name = rel_chunk.rpartition("/")
+    stem = name.split("__")[0]
+    return f"{parent}/{stem}" if parent else stem
+
+
 def count_chunks_by_split(out_root: Path, groups: dict) -> Optional[dict]:
     sources = load_source_manifest(Path(out_root))
     if not sources:
@@ -702,10 +519,7 @@ def count_chunks_by_split(out_root: Path, groups: dict) -> Optional[dict]:
     unassigned = 0
     for info in sources.values():
         for rel_chunk in info.get("chunks", []):
-            parent, _, name = rel_chunk.rpartition("/")
-            stem = name.split("__")[0]
-            gk = f"{parent}/{stem}" if parent else stem
-            split = groups.get(gk)
+            split = groups.get(_chunk_group(rel_chunk))
             if split in counts:
                 counts[split] += 1
             else:
@@ -792,30 +606,6 @@ def resolve_splits(out_root: Path, files, ratios, seed: int,
                 f"source goes entirely to train, which is what keeps the split "
                 f"leakage-safe). Add more sources, disable stratification, or "
                 f"set the '{name}' ratio to 0 on purpose.")
-    return groups
-
-
-def import_legacy_split(out_root: Path, latent_root: Path, ratios, seed: int,
-                        stratify_by_class: bool) -> dict:
-    from audio_dataset_npy import compute_split, _source_group_of
-
-    latent_root = Path(latent_root)
-    if not latent_root.exists():
-        raise SystemExit(f"[split] --import_legacy_split: no latents under "
-                         f"{latent_root}. Nothing to import.")
-    res = compute_split(
-        latent_root, ratios=tuple(ratios), seed=seed,
-        group_by_source=True, stratify_by_class=stratify_by_class,
-        save_test_manifest=False,
-    )
-    groups = {}
-    for name in SPLIT_NAMES:
-        for f in res["splits"][name]:
-            groups[_source_group_of(Path(f), latent_root)] = name
-    params = _split_params(ratios, seed, stratify_by_class)
-    write_splits(out_root, groups, params, "imported-from-training-split")
-    print(f"[split] imported the in-code training split into "
-          f"{out_root / SPLITS_NAME}: {summarize_splits(groups)} source(s)")
     return groups
 
 
@@ -1144,269 +934,75 @@ def extract_and_merge_chunk_conditions(
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
-def write_text_label_vocab(registry, out_root: Path, vocab_path: Optional[str],
-                           force: bool = False) -> int:
-    import numpy as np
-    ext = getattr(registry, "global_extractors", {}).get("text")
-    if ext is None:
-        return 0
+TEXT_TABLE_NAME = "text_table.json"
 
-    if vocab_path:
-        p = Path(vocab_path)
-        if not p.exists():
-            print(f"[global/text] --text_vocab {p} not found -> using the "
-                  f"built-in vocabulary")
-            phrases = None
-        else:
-            phrases = [ln.strip() for ln in
-                       p.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            print(f"[global/text] vocabulary from {p}: {len(phrases)} phrases")
-    else:
-        phrases = None
-    if not phrases:
-        from conditions import TEXT_LABEL_VOCAB
-        phrases = list(TEXT_LABEL_VOCAB)
+
+def _encode_strings(ext, strings, d: Path, kind: str, batch: int = 64) -> None:
+    emb, toks, lens = [], [], []
+    for i in range(0, len(strings), batch):
+        part = strings[i:i + batch]
+        emb.append(np.asarray(ext.encode_batch(part), dtype=np.float32))
+        tok, n = ext.encode_tokens(part)
+        toks.append(tok.astype(np.float16))
+        lens.append(n)
+    width = max(t.shape[1] for t in toks)
+    toks = [np.pad(t, ((0, 0), (0, width - t.shape[1]), (0, 0))) for t in toks]
+    _atomic_save_npy(d / f"{kind}_emb.npy", np.concatenate(emb))
+    _atomic_save_npy(d / f"{kind}_tok.npy", np.concatenate(toks))
+    _atomic_save_npy(d / f"{kind}_tok_len.npy",
+                     np.concatenate(lens).astype(np.int32))
+
+
+def write_text_table(out_root: Path, source_dir, metadata: dict,
+                     class_name: Optional[str], ext, force: bool = False) -> None:
+    per_source = {}
+    for rel, info in load_source_manifest(out_root).items():
+        chunks = info.get("chunks")
+        if not chunks:
+            continue
+        meta = metadata.get(rel, {})
+        labels = list(meta.get("labels", []))
+        if not labels and (Path(rel).parent != Path(".") or class_name):
+            labels = [Path(chunks[0]).parent.name]
+        texts = list(meta.get("texts", []))
+        if not texts:
+            txt = (Path(source_dir) / rel).with_suffix(".txt")
+            value = (_clean_text(txt.read_text(encoding="utf-8", errors="replace"))
+                     if txt.exists() else None)
+            texts = [value] if value else []
+        per_source[_chunk_group(chunks[0])] = {"labels": labels, "texts": texts}
+
+    labels = sorted({v for e in per_source.values() for v in e["labels"]})
+    texts = sorted({v for e in per_source.values() for v in e["texts"]})
+    ids = {"labels": {v: i for i, v in enumerate(labels)},
+           "texts": {v: i for i, v in enumerate(texts)}}
+    sources = {key: {kind: [ids[kind][v] for v in e[kind]] for kind in ids}
+               for key, e in per_source.items()}
 
     d = out_root / "global_conditions"
-    d.mkdir(parents=True, exist_ok=True)
-    npy, js = d / "text_vocab.npy", d / "text_vocab.json"
-    if npy.exists() and js.exists() and not force:
-        try:
-            old = json.loads(js.read_text(encoding="utf-8"))
-            if list(old.get("phrases", [])) == phrases:
-                print(f"[global/text] label vocabulary already current "
-                      f"({len(phrases)} phrases)")
-                return len(phrases)
-        except Exception:
-            pass
+    table_p = d / TEXT_TABLE_NAME
+    model_name = getattr(ext, "model_name", None)
+    current = False
+    if table_p.exists() and not force:
+        old = json.loads(table_p.read_text(encoding="utf-8"))
+        current = (old["model_name"], old["labels"], old["texts"]) == (
+            model_name, labels, texts)
+    for kind, strings in (("label", labels), ("text", texts)):
+        if not strings:
+            for name in ("emb", "tok", "tok_len"):
+                (d / f"{kind}_{name}.npy").unlink(missing_ok=True)
+        elif not current:
+            _encode_strings(ext, strings, d, kind)
+    _atomic_write_json(table_p, {"model_name": model_name, "labels": labels,
+                                 "texts": texts, "sources": sources})
 
-    embs = np.asarray(ext.encode_batch(phrases), dtype=np.float32)
-    _atomic_save_npy(npy, embs)
-    _atomic_write_json(js, {"phrases": phrases,
-                            "model_name": getattr(ext, "model_name", None)})
-    print(f"[global/text] label vocabulary: {len(phrases)} phrases encoded "
-          f"-> {npy.name}")
-    return len(phrases)
-
-
-TEXT_LABELS_JSONL = "text_labels.jsonl"
-TEXT_LABELS_COS = "text_labels_cos.npy"
-TEXT_LABELS_EMB = "text_labels_emb.npy"
-TEXT_LABELS_TOK = "text_labels_tok.npy"
-TEXT_LABELS_TOKLEN = "text_labels_tok_len.npy"
-TEXT_LABELS_META = "text_labels.json"
-
-
-def _text_labels_fingerprint(phrases, model_name, n_terms) -> str:
-    h = hashlib.sha1()
-    h.update(repr(list(phrases)).encode("utf-8"))
-    h.update(str(model_name).encode("utf-8"))
-    h.update(str(int(n_terms)).encode("utf-8"))
-    return h.hexdigest()[:16]
-
-
-def format_text_caption(class_name: str, phrases_cos, quote: bool = True) -> str:
-    if not phrases_cos:
-        return str(class_name)
-    if not quote:
-        return ", ".join([str(class_name)] + [str(p) for p, _c in phrases_cos])
-    body = ", ".join(f"\"{p}\" ({c:+.2f})" for p, c in phrases_cos)
-    return f"{class_name} · {body}"
-
-
-def write_text_labels(out_root: Path, cond_root: Path, n_terms: int = 2,
-                      force: bool = False, text_extractor=None) -> int:
-    import numpy as np
-
-    d = out_root / "global_conditions"
-    vocab_npy, vocab_js = d / "text_vocab.npy", d / "text_vocab.json"
-    if not (vocab_npy.exists() and vocab_js.exists()):
-        print("[global/text] no text_vocab on disk -> no per-chunk labels "
-              "written (nothing to compare the vectors against).")
-        return 0
-    try:
-        meta = json.loads(vocab_js.read_text(encoding="utf-8"))
-        phrases = list(meta.get("phrases", []))
-        model_name = meta.get("model_name")
-        vocab = np.load(str(vocab_npy)).astype(np.float32)
-    except Exception as e:
-        print(f"[global/text] text_vocab unreadable ({type(e).__name__}: {e}) "
-              f"-> no per-chunk labels written.")
-        return 0
-    if not phrases or vocab.ndim != 2 or vocab.shape[0] != len(phrases):
-        print(f"[global/text] text_vocab is inconsistent "
-              f"({len(phrases)} phrases vs {getattr(vocab, 'shape', None)}) "
-              f"-> no per-chunk labels written.")
-        return 0
-
-    n_terms = max(1, int(n_terms))
-    k = min(max(0, n_terms - 1), len(phrases))
-
-    files = sorted(p for p in cond_root.rglob("*.npz")) if cond_root.exists() else []
-    if not files:
-        print("[global/text] no per-chunk conditions on disk -> no labels.")
-        return 0
-
-    fp = _text_labels_fingerprint(phrases, model_name, n_terms)
-    jsonl_p, cos_p, meta_p = (d / TEXT_LABELS_JSONL, d / TEXT_LABELS_COS,
-                              d / TEXT_LABELS_META)
-    if not force and jsonl_p.exists() and cos_p.exists() and meta_p.exists():
-        try:
-            old = json.loads(meta_p.read_text(encoding="utf-8"))
-            wants = []
-            if text_extractor is not None:
-                wants.append(d / TEXT_LABELS_EMB)
-                if hasattr(text_extractor, "encode_tokens"):
-                    wants += [d / TEXT_LABELS_TOK, d / TEXT_LABELS_TOKLEN]
-            absent = [p.name for p in wants if not p.exists()]
-            if (old.get("fingerprint") == fp
-                    and int(old.get("n_npz", -1)) == len(files)
-                    and not absent):
-                print(f"[global/text] per-chunk labels already current "
-                      f"({old.get('n_chunks')} chunks, {n_terms} term(s))")
-                return int(old.get("n_chunks", 0))
-            if absent and old.get("fingerprint") == fp:
-                print(f"[global/text] labels are current but {', '.join(absent)} "
-                      f"{'is' if len(absent) == 1 else 'are'} missing -> "
-                      f"rewriting the sidecar (no audio is read, no latent is "
-                      f"re-encoded)")
-        except Exception:
-            pass
-
-    rows, cos_rows, n_missing = [], [], 0
-    for p in files:
-        rel = p.relative_to(cond_root).with_suffix("").as_posix()
-        try:
-            with np.load(str(p)) as z:
-                if "text" not in z.files:
-                    n_missing += 1
-                    continue
-                vec = np.asarray(z["text"], dtype=np.float32).reshape(-1)
-        except Exception as e:
-            print(f"  [global/text] {rel}: {type(e).__name__}: {e} -> skipped")
-            n_missing += 1
-            continue
-        if vec.shape[0] != vocab.shape[1] or not np.isfinite(vec).all():
-            n_missing += 1
-            continue
-        sims = vocab @ vec
-        cos_rows.append(sims.astype(np.float16))
-        top = np.argsort(-sims)[:k] if k else []
-        best = [[phrases[i], round(float(sims[i]), 4)] for i in top]
-        cls = Path(rel).parent.name or ""
-        rows.append({"chunk": rel, "class": cls, "phrases": best,
-                     "caption": format_text_caption(cls, best)})
-
-    if not rows:
-        print(f"[global/text] no chunk carries a 'text' vector "
-              f"({len(files)} .npz inspected) -> no labels written.")
-        return 0
-
-    captions, captions_text, caption_id = [], [], {}
-    for r in rows:
-        enc = format_text_caption(r["class"], r["phrases"], quote=False)
-        if enc not in caption_id:
-            caption_id[enc] = len(captions_text)
-            captions_text.append(enc)
-            captions.append(r["caption"])
-        r["caption_id"] = caption_id[enc]
-    cap_emb = None
-    if text_extractor is not None:
-        try:
-            cap_emb = np.asarray(text_extractor.encode_batch(captions_text),
-                                 dtype=np.float32)
-            if cap_emb.ndim != 2 or cap_emb.shape[0] != len(captions):
-                raise ValueError(f"encode_batch returned {cap_emb.shape} for "
-                                 f"{len(captions)} caption(s)")
-        except Exception as e:
-            print(f"[global/text] caption embeddings NOT written "
-                  f"({type(e).__name__}: {e}). The descriptions are still "
-                  f"stored; sampling.validation_text_from_caption will have "
-                  f"nothing to read.")
-            cap_emb = None
-
-    cap_tok = cap_len = None
-    if text_extractor is not None and hasattr(text_extractor, "encode_tokens"):
-        try:
-            cap_tok, cap_len = text_extractor.encode_tokens(captions_text)
-            if cap_tok.ndim != 3 or cap_tok.shape[0] != len(captions):
-                raise ValueError(f"encode_tokens returned {cap_tok.shape} for "
-                                 f"{len(captions)} caption(s)")
-        except Exception as e:
-            print(f"[global/text] caption TOKEN sequences NOT written "
-                  f"({type(e).__name__}: {e}). A run with "
-                  f"model.text_cross_every > 0 will refuse to start on this "
-                  f"dataset; everything else is unaffected.")
-            cap_tok = cap_len = None
-
-    d.mkdir(parents=True, exist_ok=True)
-    tmp = jsonl_p.with_suffix(".jsonl.tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        for r in rows:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-    os.replace(str(tmp), str(jsonl_p))
-    _atomic_save_npy(cos_p, np.stack(cos_rows, axis=0))
-    if cap_emb is not None:
-        _atomic_save_npy(d / TEXT_LABELS_EMB, cap_emb)
-    else:
-        try:
-            (d / TEXT_LABELS_EMB).unlink()
-        except FileNotFoundError:
-            pass
-    if cap_tok is not None:
-        _atomic_save_npy(d / TEXT_LABELS_TOK, cap_tok.astype(np.float16))
-        _atomic_save_npy(d / TEXT_LABELS_TOKLEN, cap_len.astype(np.int32))
-    else:
-        for stale in (TEXT_LABELS_TOK, TEXT_LABELS_TOKLEN):
-            try:
-                (d / stale).unlink()
-            except FileNotFoundError:
-                pass
-    _atomic_write_json(meta_p, {
-        "fingerprint": fp, "n_chunks": len(rows), "n_npz": len(files),
-        "n_terms": n_terms,
-        "n_phrases": len(phrases), "model_name": model_name,
-        "phrases": phrases,
-        "captions": captions,
-        "captions_text": captions_text,
-        "caption_emb": bool(cap_emb is not None),
-        "caption_tokens": bool(cap_tok is not None),
-        "caption_tok_dim": int(cap_tok.shape[2]) if cap_tok is not None else 0,
-        "caption_tok_max_len": int(cap_tok.shape[1]) if cap_tok is not None else 0,
-        "cos_dtype": "float16",
-        "note": ("Row i of text_labels_cos.npy is line i of text_labels.jsonl. "
-                 "The phrases are a closed-vocabulary retrieval over the stored "
-                 "CLAP vector, not a description: read every one with its "
-                 "cosine. The class is exact, read off the chunk's folder."),
-    })
-
-    distinct = len({tuple(p for p, _c in r["phrases"]) for r in rows})
-    print(f"[global/text] per-chunk labels: {len(rows)} chunk(s), "
-          f"{n_terms} term(s) each, {distinct} distinct phrase combination(s) "
-          f"over {len(phrases)} phrases -> {jsonl_p.name}")
-    print(f"[global/text] {len(captions)} distinct caption(s)"
-          + (f", CLAP-text encoded -> {TEXT_LABELS_EMB}" if cap_emb is not None
-             else ", NOT encoded (no text extractor)"))
-    if cap_tok is not None:
-        print(f"[global/text] caption token sequences: "
-              f"{cap_tok.shape[0]} x {cap_tok.shape[1]} token(s) x "
-              f"{cap_tok.shape[2]} -> {TEXT_LABELS_TOK} "
-              f"(lengths {cap_len.min()}..{cap_len.max()}, float16). "
-              f"This is what model.text_cross_every reads.")
-    if cap_emb is not None:
-        if len(captions) > 1:
-            M = cap_emb @ cap_emb.T
-            off = M[~np.eye(len(captions), dtype=bool)]
-            print(f"[global/text] caption embeddings: mean cosine between "
-                  f"DIFFERENT captions {float(off.mean()):+.3f} "
-                  f"(max {float(off.max()):+.3f}) -- the lower, the more the "
-                  f"text slot can distinguish them")
-        for _c, _t in list(zip(captions, captions_text))[:4]:
-            print(f"    {_c!r}  ->  encoded as {_t!r}")
-    if n_missing:
-        print(f"[global/text] {n_missing} chunk(s) had no usable 'text' vector "
-              f"and are absent from the sidecar.")
-    return len(rows)
+    n_label = sum(bool(e["labels"]) for e in sources.values())
+    n_text = sum(bool(e["texts"]) for e in sources.values())
+    n_many = sum(len(e["labels"]) > 1 or len(e["texts"]) > 1
+                 for e in sources.values())
+    print(f"[text] {len(sources)} sources: {n_label} with a label "
+          f"({len(labels)} distinct), {n_text} with a text ({len(texts)} distinct), "
+          f"{n_many} with more than one value -> {table_p}")
 
 
 def extract_class_global_conditions(
@@ -2084,7 +1680,6 @@ def _meta_dict(args, chunk_length, chunk_overlap, latent_frames_per_chunk=None):
         "latent_frames_per_chunk": latent_frames_per_chunk,
         "latent_dim": lc.active().latent_dim,
         "codec": lc.active().name,
-        "dac_model": "44khz" if lc.active().name == "dac_44khz" else None,
         "min_chunk_sec": args.min_chunk_sec,
         "silence_threshold": args.silence_threshold,
         "max_silence_ratio": args.max_silence_ratio,
@@ -2107,11 +1702,8 @@ def check_or_write_meta(out_root: Path, meta: dict):
     p = out_root / "dataset_meta.json"
     if p.exists():
         old = json.loads(p.read_text())
-        if "codec" not in old and old.get("dac_model") == "44khz":
-            old = dict(old, codec="dac_44khz")
         conflicts = {k: (old[k], meta.get(k)) for k in meta
                      if k in old and old[k] != meta.get(k)}
-        unverifiable = [k for k in meta if k not in old]
         if conflicts:
             raise SystemExit(
                 f"[meta] the parameters differ from the existing dataset in "
@@ -2123,17 +1715,6 @@ def check_or_write_meta(out_root: Path, meta: dict):
                 f"mixed dataset is produced. It is meant for re-extracting "
                 f"conditions with the SAME parameters.)"
             )
-        if unverifiable:
-            print(f"[meta] WARNING: {len(unverifiable)} parameter(s) are NOT "
-                  f"recorded in {p} (dataset built by an older version): "
-                  f"{sorted(unverifiable)}.\n"
-                  f"      They CANNOT be checked against this run, and they are "
-                  f"deliberately not written into the meta (recording today's "
-                  f"values would certify them as the original ones without "
-                  f"evidence). Make sure you are passing the same values used "
-                  f"originally. For a dataset whose provenance is fully "
-                  f"verifiable, rebuild into a FRESH output dir with this "
-                  f"version.")
     else:
         _atomic_write_json(p, meta)
 
@@ -2256,12 +1837,6 @@ def build_parser():
                         help="Only create/extend splits.json and exit: no "
                              "decoding, no encoding, no conditions. This is how "
                              "an already-preprocessed dataset gets a split.")
-    parser.add_argument("--import_legacy_split", action="store_true",
-                        help="Write splits.json by reproducing the split the "
-                             "TRAINING used to compute in-code, from the latents "
-                             "on disk. Use it once on datasets built before the "
-                             "split moved here, so runs already in flight keep "
-                             "the exact same val/test sets. Implies --split_only.")
     parser.add_argument("--conditions", type=str, default=None,
                         help="Comma-separated frame conditions to extract, e.g. "
                              "'f0' or 'f0,energy'. None = skip conditions. "
@@ -2275,21 +1850,14 @@ def build_parser():
                              "('text' and/or 'image'). Independent of "
                              "--conditions: either flag can be used alone, "
                              "both together, and each takes any subset. "
-                             "'text' is computed PER CHUNK (the CLAP embedding "
-                             "of that chunk's audio) and is stored in the same "
-                             ".npz as the frame conditions, so it is extracted "
-                             "and resumed exactly like f0. 'image' is computed "
+                             "'text' writes the CLAP embedding of each chunk's "
+                             "audio in its .npz, and the CLAP embeddings of each "
+                             "source's label and text in global_conditions/: "
+                             "first from the CSV files under SRC, then the "
+                             "folder for the label and a .txt with the audio's "
+                             "name for the text. 'image' is computed "
                              "PER CLASS from --image_root into "
                              "global_conditions/image/<class>.npy.")
-    parser.add_argument("--text_vocab", type=str, default=None,
-                        help="Text file, one phrase per line, replacing the "
-                             "built-in label vocabulary (conditions.py "
-                             "TEXT_LABEL_VOCAB). It is encoded once into "
-                             "global_conditions/text_vocab.npy and is what the "
-                             "validation panels use to put WORDS next to a "
-                             "stored CLAP vector -- a nearest-phrase retrieval, "
-                             "shown with its cosine, not a translation. "
-                             "Changing it never re-touches the audio.")
     parser.add_argument("--image_root", type=str, default=None,
                         help="image_root/<class>/*.jpg for --global_conds image. The "
                              "class folder names must match the source audio's "
@@ -2298,33 +1866,6 @@ def build_parser():
 
     parser.add_argument("--single_class", action="store_true")
     parser.add_argument("--class_name", type=str, default=None)
-    parser.add_argument("--label_source", type=str, default="dir",
-                        help="Where the CLASS of each source comes from: 'dir' "
-                             "(default) the source subdirectory, as before; "
-                             "'csv' a metadata file. The class is the output "
-                             "folder either way, so a CSV-labelled corpus can "
-                             "live in one flat directory and still be split, "
-                             "conditioned and reported per class. Recorded in "
-                             "source_manifest.json: changing it on an existing "
-                             "output dir is refused (it would relocate every "
-                             "latent instead of overwriting it).")
-    parser.add_argument("--label_csv", type=str, default=None,
-                        help="The metadata CSV for --label_source csv. One "
-                             "file column ('file' or 'filename') and one label "
-                             "column ('label' or 'class'), any case; every "
-                             "source must have a row. Rows are matched to files "
-                             "by path relative to source_dir, then by bare file "
-                             "name, then by either case-insensitively.")
-    parser.add_argument("--text_labels_n", type=int, default=2,
-                        help="How many TERMS the per-chunk text description "
-                             "holds, the class included: 1 = the class alone, "
-                             "2 = class + the nearest vocabulary phrase, 3 = "
-                             "class + the two nearest. Written for EVERY chunk "
-                             "into global_conditions/text_labels.jsonl (with "
-                             "--global_conds text), together with the full cosine "
-                             "table, so another N can be re-derived later "
-                             "without re-reading a single .npz.")
-
     parser.add_argument("--skip_encoder", dest="skip_encoder",
                         action="store_true",
                         help="Do everything except the codec encoding (debug).")
@@ -2555,26 +2096,20 @@ def main():
     stratify = not args.no_stratify
     wav_splits = _parse_wav_splits(args.save_wav)
 
-    label_resolver = build_label_resolver(args)
-    labels_prov = labels_provenance(args, label_resolver)
-    check_labels_provenance(out_root, labels_prov)
+    prev_manifest = load_source_manifest(out_root)
 
-    if args.import_legacy_split or args.split_only:
-        if args.import_legacy_split:
-            groups = import_legacy_split(out_root, latent_root, split_ratios,
-                                         args.split_seed, stratify)
-        else:
-            print("Scanning source files ...")
-            files = scan_audio_files(args.source_dir, args.single_class,
-                                     args.class_name, label_resolver)
-            if not files:
-                raise SystemExit(f"[ERROR] No audio files under {args.source_dir}")
-            print(f"  {len(files)} files")
-            print_class_histogram(files)
-            groups = resolve_splits(out_root, files, split_ratios,
-                                    args.split_seed, stratify, args.resplit)
-            write_source_manifest(out_root, load_source_manifest(out_root),
-                                  {}, [], False, labels_prov)
+    if args.split_only:
+        print("Scanning source files ...")
+        files = scan_audio_files(args.source_dir, args.single_class,
+                                 args.class_name, prev_manifest)
+        if not files:
+            raise SystemExit(f"[ERROR] No audio files under {args.source_dir}")
+        print(f"  {len(files)} files")
+        print_class_histogram(files)
+        metadata = read_source_metadata(args.source_dir, [f[4] for f in files])
+        groups = resolve_splits(out_root, _stratified_by_label(files, metadata),
+                                split_ratios, args.split_seed, stratify,
+                                args.resplit)
         print(f"\nDONE (split only)\n  output: {out_root / SPLITS_NAME}")
         print_chunk_counts(out_root, groups)
         return
@@ -2652,9 +2187,16 @@ def main():
 
     print("Scanning source files ...")
     files = scan_audio_files(args.source_dir, args.single_class, args.class_name,
-                             label_resolver)
+                             prev_manifest)
+    metadata = read_source_metadata(
+        args.source_dir, sorted({f[4] for f in files} | set(prev_manifest)))
+    write_text = "text" in _split_globals_by_stage(registry)[0]
     if not files:
-        print(f"[ERROR] No audio files under {args.source_dir}")
+        if not prev_manifest:
+            print(f"[ERROR] No audio files under {args.source_dir}")
+        elif write_text:
+            write_text_table(out_root, args.source_dir, metadata, args.class_name,
+                             registry.global_extractors["text"], force=args.force)
         return
     classes = sorted({leaf for _, _, leaf, _, _ in files})
     print(f"  {len(files)} files, {len(classes)} classes")
@@ -2686,8 +2228,9 @@ def main():
         print(f"[companion] {companion_names}: every source has its file "
               f"({len(companions)}/{len(files)}, {' / '.join(_sfx)})")
 
-    split_groups = resolve_splits(out_root, files, split_ratios, args.split_seed,
-                                  stratify, args.resplit)
+    split_groups = resolve_splits(out_root, _stratified_by_label(files, metadata),
+                                  split_ratios, args.split_seed, stratify,
+                                  args.resplit)
 
     if not wav_splits:
         wav_sources = None
@@ -2770,7 +2313,6 @@ def main():
     meta = _meta_dict(args, chunk_length, chunk_overlap, n_frames_fixed)
     check_or_write_meta(out_root, meta)
 
-    prev_manifest = load_source_manifest(out_root)
     changed_srcs, removed_srcs = ([], [])
     if prev_manifest:
         changed_srcs, removed_srcs = audit_sources(prev_manifest, files)
@@ -2884,8 +2426,7 @@ def main():
             file_bar.close()
         if produced or prev_manifest:
             n_src = write_source_manifest(out_root, prev_manifest, produced,
-                                          removed_srcs, args.prune_orphans,
-                                          labels_prov)
+                                          removed_srcs, args.prune_orphans)
             print(f"[manifest] {out_root / MANIFEST_NAME}: {n_src} source(s) "
                   f"({len(produced)} seen this run)")
         if tmp_dir:
@@ -2895,14 +2436,9 @@ def main():
         extract_class_global_conditions(
             registry, out_root, classes, args.image_root, force=args.force
         )
-    if "text" in _split_globals_by_stage(registry)[0]:
-        write_text_label_vocab(registry, out_root,
-                               getattr(args, "text_vocab", None),
-                               force=args.force)
-        write_text_labels(out_root, cond_root,
-                          n_terms=getattr(args, "text_labels_n", 2),
-                          force=args.force,
-                          text_extractor=registry.global_extractors.get("text"))
+    if write_text:
+        write_text_table(out_root, args.source_dir, metadata, args.class_name,
+                         registry.global_extractors["text"], force=args.force)
 
     print("\nDONE")
     print(f"  latents encoded this run: {n_lat}")
