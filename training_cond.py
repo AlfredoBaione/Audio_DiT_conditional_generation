@@ -47,6 +47,7 @@ from tqdm import tqdm
 from dataset_utils import frames_per_chunk
 
 import latent_codec as lc
+import lora
 from network_cond import ConditionedAudioDiT, ATTENTION_KINDS
 from audio_dataset_cond import (
     build_conditioned_datasets, collate_conditioned,
@@ -349,6 +350,10 @@ def load_config():
 
     cfg = merge_cli_overrides(cfg, unknown, args.config)
 
+    if lora.adapter_of(cfg):
+        lora.check_config(cfg)
+        cfg.training.use_ema = False
+
     _smp = cfg.get("sampling", None)
     if _smp is not None:
         for _k in PANEL_KEYS.values():
@@ -491,7 +496,7 @@ def optimizer_layout(train_cfg) -> str:
 
 def build_optimizer(model, train_cfg, layout: str):
     wd = float(train_cfg.weight_decay)
-    named = list(model.named_parameters())
+    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     if layout == "matrices":
         groups = [
             {"params": [p for n, p in named if is_decayed_param(n, p)],
@@ -3225,7 +3230,8 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
                     frame_cond_dims, frame_cond_out_dims, global_configs,
                     data_generator=None, ema_ready=False):
     data = {
-        "model_state_dict":     model.state_dict(),
+        "model_state_dict":     (lora.adapter_state(model) if lora.adapter_of(cfg)
+                                 else model.state_dict()),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict":    scaler.state_dict(),
@@ -3553,6 +3559,8 @@ if __name__ == "__main__":
     if DIST.enabled and not DIST.is_main:
         dist_barrier(DIST)
     _validate_cache(cache_dir, _fingerprint)
+    if DIST.is_main and lora.adapter_of(cfg):
+        lora.install_normalizer(cfg.paths.normalizer_from, normalizer_path)
     if DIST.enabled and DIST.is_main:
         dist_barrier(DIST)
 
@@ -3977,6 +3985,9 @@ if __name__ == "__main__":
         inpainting=INPAINTING,
         token_dim=lc.active().latent_dim,
     ).to(device)
+    LORA = lora.adapter_of(cfg)
+    if LORA:
+        lora.attach(model, cfg)
     ema = EMAModel(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None
 
     optimizer = build_optimizer(model, cfg.training, optimizer_layout(cfg.training))
@@ -4018,7 +4029,7 @@ if __name__ == "__main__":
     best_val_loss = float("inf")
     start_step = 0
 
-    init_from = cfg.paths.get("init_from", None)
+    init_from = None if LORA else cfg.paths.get("init_from", None)
     if init_from and cfg.paths.resume_from:
         raise RuntimeError(
             "paths.init_from and paths.resume_from are both set. They are "
@@ -4182,7 +4193,10 @@ if __name__ == "__main__":
                 f"remove the override.)"
             )
 
-        model.load_state_dict(ckpt["model_state_dict"])
+        if LORA:
+            lora.load_adapters(model, ckpt["model_state_dict"])
+        else:
+            model.load_state_dict(ckpt["model_state_dict"])
         optimizer, scheduler, _rebuilt, _ignored = restore_optimizer(
             model, cfg.training, optimizer, scheduler, lr_lambda, ckpt)
         if _rebuilt:

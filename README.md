@@ -33,6 +33,7 @@ it (there are still no split folders on disk).
 | `dataset_utils.py` | The latent normalizer and the split reader (`load_source_split`). |
 | `audio_dataset_cond.py` | Conditioned dataset + `build_conditioned_datasets` (reads the recorded split). |
 | `network_cond.py` | The `ConditionedAudioDiT` model. |
+| `lora.py` | LoRA and DoRA adapters on a frozen trained model. |
 | `training_cond.py` | Training loop, cache validation, TensorBoard logging. |
 | `test_cond.py` | Test a checkpoint on the **recorded test set**: the training's metrics step and panels, on the test split (§4). |
 | `sampling_cond.py` | Generate / edit audio from a checkpoint with CFG. |
@@ -1012,6 +1013,60 @@ training:
 - `test_cond.py` does the same on the test split (`Test/Inpainting/`, the blocks
   of `Test/Condition_influence`), and `sampling_cond.py inpaint` regenerates a
   stretch of any audio file (§4).
+
+### Fine-tuning a trained model — `lora.*`
+
+A LoRA run freezes a trained model (the **base**) and trains only small adapters
+on its layers, on another dataset. A layer with weight `W` uses `W + B·A`, with `A`
+and `B` of rank `lora.rank`; `B` starts at zero, so the run starts from the base.
+With `dora-rows` every row of `W + B·A` is normalized and multiplied by its own
+trained norm, which starts at the norm of that row of `W`.
+
+| `lora.targets` | Layers of every block | Outside the blocks |
+|---|---|---|
+| `attention` | `attn.qkv`, `attn.proj`, `cross_attn.q/kv/proj` | none |
+| `blocks` | the same + `mlp.w1/w2/w3` | none |
+| `sa3` | the same | `t_embedder.mlp`, `global_encoder`, `input_proj`, `final_layer.linear` |
+
+The per-block `adaLN_modulation`, `frame_encoder`, `frame_reinject*` and
+`inpaint_embed` are never adapted.
+
+```bash
+python launch_training_cond.py --run_name <name> \
+    model.kind=L model.qk_norm=false \
+    'conditioning.enabled_frame=[energy]' \
+    paths.dataset_root=<new dataset>/latents \
+    paths.wav_root=<new dataset>/wav \
+    paths.condition_root=<new dataset>/conditions \
+    paths.cache_dir=<new cache> \
+    paths.init_from=<base checkpoint> \
+    paths.normalizer_from=<base cache>/normalizer.pt \
+    lora.adapter=dora-rows lora.rank=16 lora.targets=blocks \
+    training.num_steps=10001 training.warmup_steps=0 \
+    training.weight_decay=0.01 \
+    training.weight_decay_matrices_only=false \
+    'training.adam_betas=[0.9,0.95]' \
+    intervals.val=500 intervals.audio=1000 \
+    intervals.metrics=1000 intervals.ckpt=500
+```
+
+- **The base.** Only its weights are read (the EMA ones if it has them), so the
+  other fields of its checkpoint are not needed. `model.*` and
+  `conditioning.enabled_*` must be the ones it was trained with and the dataset
+  must have its codec: otherwise the run stops at the start and lists the weights
+  that do not fit. A LoRA cannot add a condition.
+- **The normalizer.** `paths.normalizer_from` is copied into `paths.cache_dir`: the
+  base expects latents scaled with it. A cache that holds another normalizer stops
+  the run, so a new dataset needs a new `paths.cache_dir`.
+- **Training.** `training.use_ema` is forced to false and the optimizer holds only
+  the adapters. With `inverse_power` the learning rate stays within 0.5% of
+  `training.lr` over 10000 steps.
+- **Checkpoints.** They hold the adapters and the path of the base
+  (`paths.init_from`), which must stay where it is. `--resume` works as usual.
+- **Test and generation.** `test_cond.py --ckpt` and `sampling_cond.py` take the
+  LoRA checkpoint and add the adapters to the base. `--lora_strength` goes from 0
+  (the base) to 1 (as trained). If the base has moved, pass
+  `paths.init_from=<new path>` to `test_cond.py`.
 
 ### Which metrics are computed
 

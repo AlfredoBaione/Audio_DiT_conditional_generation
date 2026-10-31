@@ -21,6 +21,7 @@ from audio_dataset_cond import ConditionedAudioDataset, load_source_split
 from network_cond import ConditionedAudioDiT, ckpt_text_ctx_dim
 from conditions import ConditionRegistry
 import latent_codec as lc
+import lora
 from metrics import (precompute_latent_reference, precompute_audio_reference,
                      compute_audio_mu_sigma, compute_mu_sigma, COND_METRICS)
 
@@ -80,6 +81,8 @@ def load_config():
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed of the generation noise (default: the "
                              "checkpoint's metrics.seed)")
+    parser.add_argument("--lora_strength", type=float, default=1.0,
+                        help="LoRA checkpoint: 0 = the base model, 1 = as trained.")
     parser.add_argument("--allow_invalid_conditions", action="store_true",
                         help="DEBUG ONLY: tolerate missing/corrupt conditions on the "
                              "test set (zero-fill them). Off by default so the "
@@ -228,6 +231,8 @@ def main():
     print("\n[test_cond] Loading checkpoint...")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False,
                       mmap=True)
+    if lora.adapter_of(cfg):
+        ckpt = lora.merge_checkpoint(ckpt, cfg.paths.init_from, args.lora_strength)
     ckpt_step = int(ckpt.get("step", 0) or 0)
 
     CODEC = lc.activate(ckpt["codec"])

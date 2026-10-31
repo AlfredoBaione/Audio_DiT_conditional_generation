@@ -84,6 +84,11 @@ conditioning:
   enabled_frame:  ["f0"]     # f0, chroma, rhythm, energy, chord, midi
   enabled_global: []         # text, image
 
+lora:
+  adapter: null              # null = off | lora | dora-rows; needs paths.init_from, paths.normalizer_from
+  rank: 16
+  targets: blocks            # attention | blocks | sa3
+
 paths:
   dataset_root:   "./dataset_ready_cond/latents"
   wav_root:       "./dataset_ready_cond/wav"
@@ -95,4 +100,5 @@ paths:
   f0_probe_dir:   null
   run_name:       null
   resume_from:    null
-  init_from:      null       # warm start; not with resume_from
+  init_from:      null       # warm start; not with resume_from; with lora: the base model
+  normalizer_from: null      # lora only: normalizer.pt of the base model

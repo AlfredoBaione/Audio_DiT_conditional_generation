@@ -25,6 +25,7 @@ import soundfile as sf
 from dataset_utils import LatentNormalizer
 from network_cond import ConditionedAudioDiT, ckpt_text_ctx_dim
 import latent_codec as lc
+import lora
 from conditions import (
     ConditionRegistry,
     CLAPTextCondition, ImageCondition,
@@ -408,6 +409,8 @@ def main():
                              "equally spaced in log-SNR, crowded at the noise "
                              "end). Default: the one the checkpoint's run "
                              "generated with (its sampling.t_schedule).")
+    parser.add_argument("--lora_strength", type=float, default=1.0,
+                        help="LoRA checkpoint: 0 = the base model, 1 = as trained.")
     parser.add_argument("--n_samples", type=int, default=4)
     parser.add_argument("--duration", type=float, default=None,
                         help="Generation length in seconds (generate mode). If "
@@ -444,6 +447,9 @@ def main():
 
     print(f"Carico checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if lora.adapter_of(ckpt["config"]):
+        ckpt = lora.merge_checkpoint(ckpt, ckpt["config"]["paths"]["init_from"],
+                                     args.lora_strength)
 
     CODEC = lc.activate(ckpt["codec"])
     print(f"Codec: {CODEC.name} ({CODEC.sample_rate} Hz, "
