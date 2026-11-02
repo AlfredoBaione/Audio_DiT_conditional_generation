@@ -48,7 +48,7 @@ from dataset_utils import frames_per_chunk
 
 import latent_codec as lc
 import lora
-from network_cond import ConditionedAudioDiT, ATTENTION_KINDS
+from network_cond import ConditionedAudioDiT, ATTENTION_KINDS, TEXT_CONDITIONING_KINDS
 from audio_dataset_cond import (
     build_conditioned_datasets, collate_conditioned,
 )
@@ -57,7 +57,8 @@ from conditions import (
     CONDITION_CONFIG,
     make_null_frame_conditions, make_null_global_conditions,
 )
-from sampling_cond import T_SCHEDULES, euler_grid
+from muon import MuonAdamW
+from sampling_cond import GUIDANCE_TYPES, T_SCHEDULES, euler_grid, guided_velocity
 from metrics import (
     precompute_latent_reference,
     compute_codec_metrics,
@@ -353,6 +354,10 @@ def load_config():
     if lora.adapter_of(cfg):
         lora.check_config(cfg)
         cfg.training.use_ema = False
+        cfg.training.optimizer = "adamw"
+        cfg.training.weight_decay_matrices_only = False
+        cfg.training.lr = float(cfg.lora.get("lr", 1.0e-4))
+        cfg.training.lr_schedule = "constant"
 
     _smp = cfg.get("sampling", None)
     if _smp is not None:
@@ -388,20 +393,24 @@ def load_config():
               f"p_drop_global={_p_gbl}. Classifier-free guidance needs a NULL "
               f"branch to extrapolate from: with no dropout on a branch, "
               f"guidance_scale on that branch is meaningless.")
-    del _p_all, _p_frm, _p_gbl, _p_each, _p_sum
 
     _att = cfg.model.get("attention", "standard")
     if _att not in ATTENTION_KINDS:
         raise SystemExit(
             f"[config] model.attention = {_att!r}, must be one of "
             f"{list(ATTENTION_KINDS)}. Nothing was run.")
+    guidance_type_of(cfg.sampling)
+    _txt = cfg.model.get("text_conditioning", "ada")
+    if _txt not in TEXT_CONDITIONING_KINDS:
+        raise SystemExit(
+            f"[config] model.text_conditioning = {_txt!r}, must be one of "
+            f"{list(TEXT_CONDITIONING_KINDS)}. Nothing was run.")
     _tsm = cfg.training.get("t_sampler", "logit_normal")
     if _tsm not in T_SAMPLERS:
         raise SystemExit(
             f"[config] training.t_sampler = {_tsm!r}, must be one of "
             f"{list(T_SAMPLERS)}. Nothing was run.")
     t_schedule_of(cfg.get("sampling", None))
-    del _att, _tsm
     if bool(cfg.training.get("inpainting", False)):
         inpaint_mask_probs(cfg.training)
 
@@ -426,11 +435,28 @@ def load_config():
         raise SystemExit(
             f"[config] training.adam_eps = {_trn.get('adam_eps')}, must be > 0. "
             f"Nothing was run.")
+    if _trn.get("optimizer", "adamw") not in OPTIMIZERS:
+        raise SystemExit(
+            f"[config] training.optimizer = {_trn.get('optimizer')!r}, must be one of "
+            f"{list(OPTIMIZERS)}. Nothing was run.")
+    if not (float(_trn.get("muon_lr", 1e-3)) > 0
+            and 0.0 <= float(_trn.get("muon_momentum", 0.95)) < 1.0):
+        raise SystemExit(
+            f"[config] training.muon_lr = {_trn.get('muon_lr')} must be > 0 and "
+            f"training.muon_momentum = {_trn.get('muon_momentum')} in [0, 1). "
+            f"Nothing was run.")
+    if not 0.0 <= float(_trn.get("lr_warmup", 0.0)) < 1.0:
+        raise SystemExit(
+            f"[config] training.lr_warmup = {_trn.get('lr_warmup')}, must be in [0, 1). "
+            f"Nothing was run.")
+    if float(_trn.get("ema_power", 0.0)) < 0:
+        raise SystemExit(
+            f"[config] training.ema_power = {_trn.get('ema_power')}, must be >= 0. "
+            f"Nothing was run.")
     if float(_trn.weight_decay) < 0:
         raise SystemExit(
             f"[config] training.weight_decay = {_trn.weight_decay}, must be >= 0. "
             f"Nothing was run.")
-    del _trn, _sch, _betas
 
     if args.resume is not None:
         cfg.paths.resume_from = args.resume
@@ -449,19 +475,26 @@ def load_config():
     return cfg, run_name
 
 
-LR_SCHEDULES = ("inverse_power", "cosine")
+LR_SCHEDULES = ("inverse_power", "cosine", "constant")
+OPTIMIZERS = ("adamw", "muon")
+MUON_FUSED_LAYERS = ("*.attn.qkv.*", "*.cross_attn.q.*", "*.cross_attn.kv.*", "*.mlp.proj.*")
 
 
 def make_lr_lambda(num_steps: int, warmup_steps: int, decay_start_frac: float,
                    schedule: str = "cosine", inv_gamma: float = 1.0e6,
-                   power: float = 0.5):
+                   power: float = 0.5, warmup_factor: float = 0.0):
     if schedule not in LR_SCHEDULES:
         raise ValueError(f"lr schedule must be one of {LR_SCHEDULES}, got {schedule!r}")
     decay_start = int(num_steps * decay_start_frac)
 
     def lr_lambda(step: int) -> float:
+        if schedule == "constant":
+            return 1.0
         if schedule == "inverse_power":
-            warm = step / warmup_steps if step < warmup_steps else 1.0
+            if warmup_factor > 0:
+                warm = 1.0 - warmup_factor ** (step + 1)
+            else:
+                warm = step / warmup_steps if step < warmup_steps else 1.0
             return warm * (1.0 + step / inv_gamma) ** (-power)
         if step < warmup_steps:
             return step / warmup_steps
@@ -481,14 +514,13 @@ def lr_lambda_from_cfg(train_cfg):
         schedule=str(train_cfg.get("lr_schedule", "cosine")),
         inv_gamma=float(train_cfg.get("lr_inv_gamma", 1.0e6)),
         power=float(train_cfg.get("lr_power", 0.5)),
+        warmup_factor=float(train_cfg.get("lr_warmup", 0.0)),
     )
 
 
-def is_decayed_param(name: str, p: torch.Tensor) -> bool:
-    return p.ndim >= 2 and not name.endswith("text_null")
-
-
 def optimizer_layout(train_cfg) -> str:
+    if str(train_cfg.get("optimizer", "adamw")) == "muon":
+        return "muon"
     return ("matrices"
             if bool(train_cfg.get("weight_decay_matrices_only", False))
             and float(train_cfg.weight_decay) > 0 else "single")
@@ -497,18 +529,26 @@ def optimizer_layout(train_cfg) -> str:
 def build_optimizer(model, train_cfg, layout: str):
     wd = float(train_cfg.weight_decay)
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    betas = train_cfg.adam_betas
+    if layout == "muon":
+        return MuonAdamW(named, muon_lr=float(train_cfg.get("muon_lr", 1e-3)),
+                         muon_momentum=float(train_cfg.get("muon_momentum", 0.95)),
+                         adam_lr=float(train_cfg.lr),
+                         adam_betas=(float(betas[0]), float(betas[1])),
+                         adam_eps=float(train_cfg.adam_eps), adam_weight_decay=wd,
+                         fused_patterns=MUON_FUSED_LAYERS)
     if layout == "matrices":
         groups = [
-            {"params": [p for n, p in named if is_decayed_param(n, p)],
+            {"params": [p for _, p in named if p.ndim >= 2],
              "weight_decay": wd},
-            {"params": [p for n, p in named if not is_decayed_param(n, p)],
+            {"params": [p for _, p in named if p.ndim < 2],
              "weight_decay": 0.0},
         ]
     elif layout == "single":
         groups = [{"params": [p for _, p in named], "weight_decay": wd}]
     else:
-        raise ValueError(f"optimizer layout must be 'single' or 'matrices', got {layout!r}")
-    betas = train_cfg.adam_betas
+        raise ValueError(f"optimizer layout must be 'single', 'matrices' or 'muon', "
+                         f"got {layout!r}")
     return torch.optim.AdamW(
         groups,
         lr=float(train_cfg.lr),
@@ -518,12 +558,22 @@ def build_optimizer(model, train_cfg, layout: str):
 
 
 def optimizer_overrides_ignored(optimizer, scheduler, train_cfg) -> list:
-    g = optimizer.param_groups[0]
+    muon = optimizer.param_groups[0].get("use_muon", False)
+    i = 1 if muon else 0
+    g = optimizer.param_groups[i]
     betas = tuple(float(b) for b in train_cfg.adam_betas)
     eps = float(train_cfg.adam_eps)
     out = []
-    if not math.isclose(scheduler.base_lrs[0], float(train_cfg.lr), rel_tol=1e-9):
-        out.append(f"lr={scheduler.base_lrs[0]:g} (training.lr={float(train_cfg.lr):g})")
+    if not math.isclose(scheduler.base_lrs[i], float(train_cfg.lr), rel_tol=1e-9):
+        out.append(f"lr={scheduler.base_lrs[i]:g} (training.lr={float(train_cfg.lr):g})")
+    if muon:
+        want_lr = float(train_cfg.get("muon_lr", 1e-3))
+        if not math.isclose(scheduler.base_lrs[0], want_lr, rel_tol=1e-9):
+            out.append(f"muon_lr={scheduler.base_lrs[0]:g} (training.muon_lr={want_lr:g})")
+        m = optimizer.param_groups[0]["momentum"]
+        want_m = float(train_cfg.get("muon_momentum", 0.95))
+        if not math.isclose(m, want_m, rel_tol=1e-9):
+            out.append(f"muon_momentum={m:g} (training.muon_momentum={want_m:g})")
     if tuple(float(b) for b in g["betas"]) != betas:
         out.append(f"betas={tuple(g['betas'])} (training.adam_betas={list(betas)})")
     if not math.isclose(g["eps"], eps, rel_tol=1e-9):
@@ -536,8 +586,9 @@ def optimizer_overrides_ignored(optimizer, scheduler, train_cfg) -> list:
 
 
 def restore_optimizer(model, train_cfg, optimizer, scheduler, lr_lambda, ckpt):
-    saved = ("matrices" if len(ckpt["optimizer_state_dict"]["param_groups"]) == 2
-             else "single")
+    groups = ckpt["optimizer_state_dict"]["param_groups"]
+    saved = ("muon" if groups[0].get("use_muon") else
+             "matrices" if len(groups) == 2 else "single")
     rebuilt = None
     if saved != optimizer_layout(train_cfg):
         optimizer = build_optimizer(model, train_cfg, saved)
@@ -549,13 +600,13 @@ def restore_optimizer(model, train_cfg, optimizer, scheduler, lr_lambda, ckpt):
             optimizer_overrides_ignored(optimizer, scheduler, train_cfg))
 
 
-def sample_logit_normal(batch_size, device, t_min, t_max, mean=0.0, std=1.0):
+def sample_logit_normal(batch_size, device, mean=0.0, std=1.0):
     u = torch.randn(batch_size, device=device) * std + mean
-    return torch.sigmoid(u).clamp(t_min, t_max)
+    return torch.sigmoid(u)
 
 
-def sample_t_uniform(batch_size, device, t_min, t_max):
-    return torch.rand(batch_size, device=device).clamp(t_min, t_max)
+def sample_t_uniform(batch_size, device):
+    return torch.rand(batch_size, device=device)
 
 
 T_SAMPLERS = ("logit_normal", "truncated_logit", "uniform")
@@ -591,31 +642,35 @@ def length_shift_mu(seq_len: int) -> float:
                          / (SHIFT_LEN_MAX - SHIFT_LEN_MIN))
 
 
-def sample_t_truncated_logit(batch_size, device, t_min, t_max, seq_len):
+def sample_t_truncated_logit(batch_size, device, seq_len):
     lo = torch.special.ndtr(torch.logit(torch.tensor(T_TRUNC, dtype=torch.float64)))
     c = lo + (1.0 - lo) * torch.rand(batch_size, device=device, dtype=torch.float64)
     s = torch.sigmoid(torch.special.ndtri(c))
     u = (s - T_TRUNC) / (1.0 - T_TRUNC)
     u = u.clamp(1e-12, 1.0 - 1e-12)
-    t = torch.sigmoid(torch.logit(u) - length_shift_mu(seq_len))
-    return t.float().clamp(t_min, t_max)
+    return torch.sigmoid(length_shift_mu(seq_len) - torch.logit(u)).float()
 
 
 def t_sampler_cdf(t_sampler, x, seq_len):
     x = torch.tensor(float(x), dtype=torch.float64)
     if t_sampler == "truncated_logit":
         lo = torch.special.ndtr(torch.logit(torch.tensor(T_TRUNC, dtype=torch.float64)))
-        u_x = torch.sigmoid(torch.logit(x) + length_shift_mu(seq_len))
+        u_x = torch.sigmoid(length_shift_mu(seq_len) - torch.logit(x))
         s_x = T_TRUNC + (1.0 - T_TRUNC) * u_x
-        return float((torch.special.ndtr(torch.logit(s_x)) - lo) / (1.0 - lo))
+        return float(1.0 - (torch.special.ndtr(torch.logit(s_x)) - lo) / (1.0 - lo))
     if t_sampler == "uniform":
         return float(x)
     return float(torch.special.ndtr(torch.logit(x)))
 
 
+def ema_decay_at(train_cfg, n: int) -> float:
+    decay = float(train_cfg.ema_decay)
+    power = float(train_cfg.get("ema_power", 0.0))
+    return decay if power <= 0 else min(decay, 1.0 - (1.0 + n) ** (-power))
+
+
 class EMAModel:
-    def __init__(self, model, decay=0.9999):
-        self.decay = decay
+    def __init__(self, model):
         self.model = copy.deepcopy(model)
         self.model.eval()
         for p in self.model.parameters():
@@ -632,10 +687,10 @@ class EMAModel:
                 ema_buffers[name].copy_(b.data)
 
     @torch.no_grad()
-    def update(self, model):
+    def update(self, model, decay):
         ema_params = dict(self.model.named_parameters())
         for name, p in model.named_parameters():
-            ema_params[name].lerp_(p.data, 1.0 - self.decay)
+            ema_params[name].lerp_(p.data, 1.0 - decay)
 
     def state_dict(self):
         return self.model.state_dict()
@@ -715,17 +770,39 @@ def random_inpaint_keep(B, n_frames, probs):
     return keep
 
 
-def compute_loss(model, batch, device, use_amp, t_min, t_max,
+@torch.no_grad()
+def ot_assign_noise(x1, noise, n_iters=20):
+    B = x1.shape[0]
+    a, b = x1.reshape(B, -1), noise.reshape(B, -1)
+    cost = ((a * a).sum(dim=1, keepdim=True) + (b * b).sum(dim=1, keepdim=True).T
+            - 2.0 * (a @ b.T))
+    log_p = -cost / cost.mean()
+    for _ in range(n_iters):
+        log_p = log_p - torch.logsumexp(log_p, dim=1, keepdim=True)
+        log_p = log_p - torch.logsumexp(log_p, dim=0, keepdim=True)
+    p = log_p.exp()
+    idx = torch.empty(B, dtype=torch.long, device=p.device)
+    used = torch.zeros(B, dtype=torch.bool, device=p.device)
+    for i in range(B):
+        p[i, used] = -1
+        idx[i] = p[i].argmax()
+        used[idx[i]] = True
+    return noise[idx]
+
+
+def compute_loss(model, batch, device, use_amp,
                  global_configs, p_drop_all, p_drop_frame, p_drop_global,
                  training=True, x0=None, t=None, p_drop_each_frame=0.0,
                  t_sampler="logit_normal", inpaint_probs=None,
-                 inpaint_keep=None, parts=None):
+                 inpaint_keep=None, parts=None, ot_coupling=False):
     frames, frame_cond, _labels, text_embs, image_embs, text_ctx = batch
 
     x1 = frames.to(device).float()
     B = x1.shape[0]
     if x0 is None:
         x0 = torch.randn_like(x1)
+        if ot_coupling and B > 1:
+            x0 = ot_assign_noise(x1, x0)
     else:
         if tuple(x0.shape) != tuple(x1.shape):
             raise ValueError(
@@ -734,18 +811,18 @@ def compute_loss(model, batch, device, use_amp, t_min, t_max,
 
     if t is None:
         if t_sampler == "truncated_logit":
-            t = sample_t_truncated_logit(B, device, t_min, t_max, seq_len=x1.shape[1])
+            t = sample_t_truncated_logit(B, device, seq_len=x1.shape[1])
         elif t_sampler == "uniform":
-            t = sample_t_uniform(B, device, t_min, t_max)
+            t = sample_t_uniform(B, device)
         else:
-            t = sample_logit_normal(B, device, t_min, t_max)
+            t = sample_logit_normal(B, device)
     else:
         if t.ndim != 1 or t.shape[0] != B:
             raise ValueError(f"fixed t has shape {tuple(t.shape)}, expected ({B},)")
         t = t.to(device=device, dtype=x1.dtype, non_blocking=True)
     t_expand = t.view(B, 1, 1)
-    xt = (1 - t_expand) * x0 + t_expand * x1
-    target = x1 - x0
+    xt = (1 - t_expand) * x1 + t_expand * x0
+    target = x0 - x1
 
     fc = {k: v.to(device).float() for k, v in frame_cond.items()}
     gc = {}
@@ -755,7 +832,7 @@ def compute_loss(model, batch, device, use_amp, t_min, t_max,
         gc["image"] = image_embs.to(device)
 
     ctx = ctx_mask = None
-    if (getattr(getattr(model, "module", model), "text_cross_layers", None)
+    if (getattr(getattr(model, "module", model), "text_in_cross", None)
             and text_ctx is not None):
         ctx = text_ctx["tokens"].to(device, non_blocking=True)
         ctx_mask = text_ctx["mask"].to(device, non_blocking=True)
@@ -808,6 +885,15 @@ def t_schedule_of(sampling_cfg) -> str:
     return v
 
 
+def guidance_type_of(sampling_cfg) -> str:
+    v = str(sampling_cfg.get("guidance_type", "apg"))
+    if v not in GUIDANCE_TYPES:
+        raise SystemExit(
+            f"[config] sampling.guidance_type = {v!r}, must be one of "
+            f"{list(GUIDANCE_TYPES)}. Nothing was run.")
+    return v
+
+
 def inpaint_context_of(keep, latent, device):
     m = keep.to(device=device, dtype=torch.float32).unsqueeze(-1)
     lat = latent.to(device=device, dtype=torch.float32)
@@ -815,10 +901,10 @@ def inpaint_context_of(keep, latent, device):
 
 
 @torch.no_grad()
-def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
+def euler_sample_cfg(model, n_frames, device, sampling_cfg, use_amp,
                       frame_cond, global_cond, guidance,
                       frame_dims, global_configs, gen_rng=None,
-                      text_ctx=None, t_schedule="uniform", inpaint=None):
+                      text_ctx=None, inpaint=None):
     model.eval()
     x = torch.randn(1, n_frames, lc.active().latent_dim, device=device, generator=gen_rng)
 
@@ -826,7 +912,7 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
     null_gc = make_null_global_conditions(1, global_configs or {}, device)
 
     ctx = ctx_mask = None
-    if getattr(model, "text_cross_layers", None) and text_ctx is not None:
+    if getattr(model, "text_in_cross", None) and text_ctx is not None:
         ctx = text_ctx["tokens"].to(device)
         ctx_mask = text_ctx["mask"].to(device)
 
@@ -838,7 +924,8 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
     has_cond = bool(frame_cond) or bool(global_cond) or (ctx is not None)
     use_cfg = (guidance > 1.0) and has_cond
 
-    for tv, dt in euler_grid(steps, t_min, t_max, t_schedule):
+    guidance_type = guidance_type_of(sampling_cfg)
+    for tv, dt in euler_grid(sampling_cfg.euler_steps, t_schedule_of(sampling_cfg)):
         t = torch.ones(1, device=device) * tv
         with torch.amp.autocast('cuda', enabled=use_amp):
             if use_cfg:
@@ -849,13 +936,14 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
                             inpaint_context=ip_ctx)
                 v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc,
                             text_context=None, inpaint_context=ip_ctx)
-                v = v_u + guidance * (v_c - v_u)
             else:
                 v = model(x, t,
                           frame_conditions=frame_cond or null_fc,
                           global_conditions=global_cond or null_gc,
                           text_context=ctx, text_context_mask=ctx_mask,
                           inpaint_context=ip_ctx)
+        if use_cfg:
+            v = guided_velocity(x, tv, v_c.float(), v_u.float(), guidance, guidance_type)
         x = x + v.float() * dt
 
     if ip_m is not None:
@@ -864,11 +952,10 @@ def euler_sample_cfg(model, n_frames, device, steps, t_min, t_max, use_amp,
 
 
 @torch.no_grad()
-def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_amp,
+def euler_sample_cfg_paired(model, n_frames, device, sampling_cfg, use_amp,
                             frame_cond, global_cond, guidance,
                             frame_dims, global_configs, gen_rng=None,
-                            text_ctx=None, x0=None, t_schedule="uniform",
-                            inpaint=None):
+                            text_ctx=None, x0=None, inpaint=None):
     model.eval()
     null_fc_1 = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
     null_gc_1 = make_null_global_conditions(1, global_configs or {}, device)
@@ -905,7 +992,7 @@ def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_am
                                  dim=0) for n in null_gc}
 
     ctx_batch = ctx_mask_batch = None
-    if getattr(model, "text_cross_layers", None) and text_ctx is not None:
+    if getattr(model, "text_in_cross", None) and text_ctx is not None:
         tok = text_ctx["tokens"].to(device)
         msk = text_ctx["mask"].to(device)
         if tok.shape[0] != B:
@@ -923,7 +1010,8 @@ def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_am
                              f"{(B, n_frames)}")
         ip_batch = torch.cat([_ip, _ip, _ip], dim=0)
 
-    for tv, dt in euler_grid(steps, t_min, t_max, t_schedule):
+    guidance_type = guidance_type_of(sampling_cfg)
+    for tv, dt in euler_grid(sampling_cfg.euler_steps, t_schedule_of(sampling_cfg)):
         t = torch.ones(3 * B, device=device) * tv
         xb = torch.cat([x_cond, x_cond, x_unc], dim=0)
         with torch.amp.autocast('cuda', enabled=use_amp):
@@ -935,7 +1023,7 @@ def euler_sample_cfg_paired(model, n_frames, device, steps, t_min, t_max, use_am
         v_c    = vb[0:B].float()
         v_null = vb[B:2 * B].float()
         v_u    = vb[2 * B:3 * B].float()
-        v_guided = v_null + guidance * (v_c - v_null)
+        v_guided = guided_velocity(x_cond, tv, v_c, v_null, guidance, guidance_type)
         x_cond = x_cond + v_guided * dt
         x_unc = x_unc + v_u * dt
 
@@ -1141,9 +1229,7 @@ def generate_and_log_uncond_cards(
             continue
         gen = euler_sample_cfg(
             model, n_frames, device,
-            steps=sampling_cfg.euler_steps,
-            t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-            t_schedule=t_schedule_of(sampling_cfg),
+            sampling_cfg=sampling_cfg,
             use_amp=use_amp,
             frame_cond=None, global_cond=None, guidance=1.0,
             frame_dims=frame_dims, global_configs=global_configs,
@@ -1297,7 +1383,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
     _probe_ctx_warned = []
 
     def _text_ctx(idxs):
-        if not getattr(model, "text_cross_layers", None):
+        if not getattr(model, "text_in_cross", None):
             return None
         ps = (probe_sets or {}).get("text")
         if ps is None or "text" not in gnames:
@@ -1343,9 +1429,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                     "generation", len(grp), len(grp),
                     lambda lo, hi: euler_sample_cfg_paired(
                         model, n_frames, device,
-                        steps=sampling_cfg.euler_steps,
-                        t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                        t_schedule=t_schedule_of(sampling_cfg),
+                        sampling_cfg=sampling_cfg,
                         use_amp=use_amp,
                         frame_cond=_frame_cond(grp[lo:hi]),
                         global_cond=_global_cond(grp[lo:hi]),
@@ -1365,9 +1449,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                     continue
                 out[i] = euler_sample_cfg(
                     model, n_frames, device,
-                    steps=sampling_cfg.euler_steps,
-                    t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                    t_schedule=t_schedule_of(sampling_cfg),
+                    sampling_cfg=sampling_cfg,
                     use_amp=use_amp,
                     frame_cond=_frame_cond([i]), global_cond=_global_cond([i]),
                     guidance=guidance,
@@ -1465,8 +1547,8 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         if _ctx is not None:
             arrays["text_tokens"] = _ctx["tokens"][0].cpu().numpy()
             arrays["text_mask"] = _ctx["mask"][0].cpu().numpy()
-        elif text_lines and getattr(model, "text_cross_layers", None):
-            text_lines.append("Cross-attention: the learned null token (this "
+        elif text_lines and getattr(model, "text_in_cross", None):
+            text_lines.append("Cross-attention: zero tokens, so no contribution (this "
                               "probe bank has no token sequences).")
         info = {"panel": f"probe_{i:02d}", "tensorboard_block": _blk,
                 "stimuli": {c: probe_sets[c].text(i) for c in names + gnames},
@@ -1559,7 +1641,7 @@ def test_text_given(dataset, idx, wants_ctx):
     info = {"slot": kind if sentence is not None or kind == "audio" else "null",
             "sentence": sentence}
     if wants_ctx and sentence is None:
-        lines.append("Cross-attention: the learned null token.")
+        lines.append("Cross-attention: zero tokens, so no contribution.")
     return lines, info
 
 
@@ -1581,7 +1663,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
     names = list(frame_dims or {})
     gnames = list(global_configs or {})
     sfx = panel_suffixes(test_dataset, ds_indices, global_configs)
-    wants_ctx = bool(getattr(model, "text_cross_layers", None))
+    wants_ctx = bool(getattr(model, "text_in_cross", None))
 
     items = []
     for idx in ds_indices:
@@ -1634,9 +1716,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     "generation", len(grp), len(grp),
                     lambda lo, hi: euler_sample_cfg_paired(
                         model, n_frames, device,
-                        steps=sampling_cfg.euler_steps,
-                        t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                        t_schedule=t_schedule_of(sampling_cfg),
+                        sampling_cfg=sampling_cfg,
                         use_amp=use_amp,
                         frame_cond=_fc(grp[lo:hi], subset),
                         global_cond=_gc(grp[lo:hi]),
@@ -1656,9 +1736,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     continue
                 out[j] = euler_sample_cfg(
                     model, n_frames, device,
-                    steps=sampling_cfg.euler_steps,
-                    t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                    t_schedule=t_schedule_of(sampling_cfg),
+                    sampling_cfg=sampling_cfg,
                     use_amp=use_amp,
                     frame_cond=_fc([j], subset), global_cond=_gc([j]),
                     guidance=guidance,
@@ -1846,9 +1924,7 @@ def run_uncond_inpaint_panels(test_dataset, ds_indices, model, normalizer,
                 continue
             z = euler_sample_cfg(
                 model, n_frames, device,
-                steps=sampling_cfg.euler_steps,
-                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                t_schedule=t_schedule_of(sampling_cfg),
+                sampling_cfg=sampling_cfg,
                 use_amp=use_amp,
                 frame_cond=None, global_cond=None, guidance=1.0,
                 frame_dims=frame_dims, global_configs=global_configs,
@@ -2090,7 +2166,7 @@ def evaluate_inpainting(
                if n_fad_use > 0 else set())
     spf = int(sampling_cfg.get("metrics_samples_per_forward", 1))
     paired = spf >= 1 and guidance > 1.0 and any_cond
-    wants_ctx = bool(getattr(model, "text_cross_layers", None))
+    wants_ctx = bool(getattr(model, "text_in_cross", None))
     codec_model = get_codec()
     _mi = f"{tag_prefix}/Inpainting"
     _fd = "dac" if lc.active().name == "dac_44khz" else "encodec"
@@ -2178,9 +2254,7 @@ def evaluate_inpainting(
                 def _part(a, b):
                     c, u = euler_sample_cfg_paired(
                         model, n_frames, device,
-                        steps=sampling_cfg.euler_steps,
-                        t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                        t_schedule=t_schedule_of(sampling_cfg),
+                        sampling_cfg=sampling_cfg,
                         use_amp=use_amp,
                         frame_cond={k: v[a:b] for k, v in fc.items()},
                         global_cond={k: v[a:b] for k, v in gc.items()},
@@ -2204,9 +2278,7 @@ def evaluate_inpainting(
             cond = conditioned and any_cond
             out_c[j] = euler_sample_cfg(
                 model, n_frames, device,
-                steps=sampling_cfg.euler_steps,
-                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                t_schedule=t_schedule_of(sampling_cfg),
+                sampling_cfg=sampling_cfg,
                 use_amp=use_amp,
                 frame_cond=_fc([j], subset) if cond else None,
                 global_cond=_gc([j]) if cond else None,
@@ -2494,7 +2566,7 @@ def evaluate_and_log_metrics(
           f"{', + uncond' if compute_uncond else ''}) "
           f"vs reference ({ref_frames} frames)...")
 
-    _wants_ctx = bool(getattr(model, "text_cross_layers", None))
+    _wants_ctx = bool(getattr(model, "text_in_cross", None))
 
     def _stack_ctx(items):
         if not _wants_ctx or not items:
@@ -2544,9 +2616,7 @@ def evaluate_and_log_metrics(
                 fc, gc, g, tctx = None, None, 1.0, None
             gen = euler_sample_cfg(
                 model, n_frames, device,
-                steps=sampling_cfg.euler_steps,
-                t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                t_schedule=t_schedule_of(sampling_cfg),
+                sampling_cfg=sampling_cfg,
                 use_amp=use_amp,
                 frame_cond=fc, global_cond=gc, guidance=g,
                 frame_dims=frame_dims, global_configs=global_configs,
@@ -2601,9 +2671,7 @@ def evaluate_and_log_metrics(
             def _part(lo, hi):
                 gen_c, gen_u = euler_sample_cfg_paired(
                     model, n_frames, device,
-                    steps=sampling_cfg.euler_steps,
-                    t_min=sampling_cfg.t_min, t_max=sampling_cfg.t_max,
-                    t_schedule=t_schedule_of(sampling_cfg),
+                    sampling_cfg=sampling_cfg,
                     use_amp=use_amp,
                     frame_cond={k: v[lo:hi] for k, v in fc.items()},
                     global_cond={k: v[lo:hi] for k, v in gc.items()},
@@ -3240,9 +3308,12 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
         "best_val_loss":        best_val_loss,
         "model_kind":           cfg.model.kind,
         "frame_reinject_every": int(cfg.model.get("frame_reinject_every", 0)),
-        "text_cross_every":     int(cfg.model.get("text_cross_every", 0)),
+        "text_conditioning":    str(cfg.model.get("text_conditioning", "ada")),
         "attention":            str(cfg.model.get("attention", "standard")),
         "qk_norm":              bool(cfg.model.get("qk_norm", False)),
+        "memory_tokens":        int(cfg.model.get("memory_tokens", 0)),
+        "t_features":           str(cfg.model.get("t_features", "high_freq")),
+        "adaln":                str(cfg.model.get("adaln", "shared")),
         "inpainting":           bool(cfg.training.get("inpainting", False)),
         "codec":                lc.active().name,
         "config":               OmegaConf.to_container(cfg, resolve=True),
@@ -3773,8 +3844,7 @@ if __name__ == "__main__":
         fixed_x0 = torch.randn(
             val_frames.shape, dtype=val_frames.dtype, generator=val_rng)
         u = torch.randn(val_frames.shape[0], generator=val_rng)
-        fixed_t = torch.sigmoid(u).clamp(
-            float(cfg.sampling.t_min), float(cfg.sampling.t_max))
+        fixed_t = torch.sigmoid(u)
         fixed_val_inputs.append((fixed_x0, fixed_t))
     n_fixed_val_samples = sum(int(vb[0].shape[0]) for vb in fixed_val_batches)
     print(f"[validation] shuffle={validation_shuffle} | seed={validation_seed} | "
@@ -3956,20 +4026,25 @@ if __name__ == "__main__":
 
     FRAME_REINJECT_EVERY = int(cfg.model.get("frame_reinject_every", 0))
 
-    TEXT_CROSS_EVERY = int(cfg.model.get("text_cross_every", 0))
+    TEXT_CONDITIONING = str(cfg.model.get("text_conditioning", "ada"))
     TEXT_CTX_DIM = int(getattr(train_dataset, "_ctx_dim", 0) or 0)
-    if TEXT_CROSS_EVERY > 0 and "text" in GLOBAL_CONFIGS and TEXT_CTX_DIM <= 0:
+    if TEXT_CONDITIONING != "ada" and "text" in GLOBAL_CONFIGS and TEXT_CTX_DIM <= 0:
         raise RuntimeError(
-            "model.text_cross_every > 0 attends to the tokens of a written "
+            f"model.text_conditioning={TEXT_CONDITIONING} attends to the tokens of a written "
             "text: it needs conditioning.text_source label or text.")
     ATTENTION = str(cfg.model.get("attention", "standard"))
     QK_NORM = bool(cfg.model.get("qk_norm", False))
+    MEMORY_TOKENS = int(cfg.model.get("memory_tokens", 0))
+    T_FEATURES = str(cfg.model.get("t_features", "high_freq"))
+    ADALN = str(cfg.model.get("adaln", "shared"))
     INPAINTING = bool(cfg.training.get("inpainting", False))
     print(f"[MODEL] Building ConditionedAudioDiT-{cfg.model.kind} "
           f"| frame={list(FRAME_COND_DIMS)} | global={list(GLOBAL_CONFIGS)} "
           f"| frame_reinject_every={FRAME_REINJECT_EVERY} "
-          f"| text_cross_every={TEXT_CROSS_EVERY} "
+          f"| text_conditioning={TEXT_CONDITIONING} "
           f"| attention={ATTENTION} | qk_norm={QK_NORM} "
+          f"| memory_tokens={MEMORY_TOKENS} "
+          f"| t_features={T_FEATURES} | adaln={ADALN} "
           f"| inpainting={INPAINTING}")
     model = ConditionedAudioDiT(
         kind=cfg.model.kind,
@@ -3978,17 +4053,20 @@ if __name__ == "__main__":
         frame_cond_out_dims=FRAME_COND_OUT_DIMS,
         global_cond_configs=GLOBAL_CONFIGS,
         frame_reinject_every=FRAME_REINJECT_EVERY,
-        text_cross_every=TEXT_CROSS_EVERY,
+        text_conditioning=TEXT_CONDITIONING,
         text_ctx_dim=TEXT_CTX_DIM,
         attention=ATTENTION,
         qk_norm=QK_NORM,
+        memory_tokens=MEMORY_TOKENS,
+        t_features=T_FEATURES,
+        adaln=ADALN,
         inpainting=INPAINTING,
         token_dim=lc.active().latent_dim,
     ).to(device)
     LORA = lora.adapter_of(cfg)
     if LORA:
         lora.attach(model, cfg)
-    ema = EMAModel(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None
+    ema = EMAModel(model) if cfg.training.use_ema else None
 
     optimizer = build_optimizer(model, cfg.training, optimizer_layout(cfg.training))
     lr_lambda = lr_lambda_from_cfg(cfg.training)
@@ -4041,44 +4119,18 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"paths.init_from: {init_from} not found")
         print(f"Warm start from: {init_from}")
         _ck = torch.load(init_from, map_location="cpu", weights_only=False)
-        _ck_codec = _ck["codec"]
-        if _ck_codec != lc.active().name:
+        if _ck["t_features"] != T_FEATURES:
             raise RuntimeError(
-                f"{init_from} was trained on {_ck_codec} latents, this dataset "
-                f"is {lc.active().name}. The two codecs have different latent "
-                f"widths and frame rates: the weights cannot be carried over.")
-        _ck_att = _ck["attention"]
-        if _ck_att != ATTENTION:
-            raise RuntimeError(
-                f"{init_from} was trained with model.attention='{_ck_att}', "
-                f"this run builds '{ATTENTION}'. A warm start may only ADD "
-                f"zero-initialised weights; changing the self-attention changes "
-                f"what the existing ones compute, so it needs a run from "
-                f"scratch (leave paths.init_from empty), or set "
-                f"model.attention={_ck_att} to warm-start as before.")
-        _ck_qk = _ck["qk_norm"]
-        if _ck_qk != QK_NORM:
-            raise RuntimeError(
-                f"{init_from} was trained with model.qk_norm={_ck_qk}, this run "
-                f"builds qk_norm={QK_NORM}. A warm start may only ADD "
-                f"zero-initialised weights; the QK-norm changes what the existing "
-                f"q/k weights compute, so it needs a run from scratch (leave "
-                f"paths.init_from empty), or set model.qk_norm={_ck_qk} to "
-                f"warm-start as before.")
-        if _ck["inpainting"] and not INPAINTING:
-            raise RuntimeError(
-                f"{init_from} was trained with training.inpainting=true, this "
-                f"run builds the model without the inpainting context layers. "
-                f"A warm start may only ADD zero-initialised weights, not drop "
-                f"trained ones: set training.inpainting=true to warm-start from "
-                f"it.")
+                f"{init_from} was trained with model.t_features={_ck['t_features']}, "
+                f"this run builds {T_FEATURES}: set model.t_features="
+                f"{_ck['t_features']} to warm-start from it.")
         _sd = (_ck.get("ema_state_dict") if _ck.get("ema_ready", True)
                and "ema_state_dict" in _ck else _ck.get("model_state_dict"))
         if not isinstance(_sd, dict):
             raise RuntimeError(f"{init_from} carries no model weights")
         _res = model.load_state_dict(_sd, strict=False)
         _new_parts = {
-            "the new cross-attention": ("cross_attn.", "text_null", "norm_cross."),
+            "the new cross-attention": ("cross_attn.", "text_proj.", "text_pad", "norm_cross."),
             "the new inpainting context layers": (".inpaint_embed.",),
         }
         _bad = [k for k in _res.missing_keys
@@ -4092,9 +4144,8 @@ if __name__ == "__main__":
                 f"  present in the checkpoint but not in this model: "
                 f"{list(_res.unexpected_keys)[:8]}"
                 f"{' ...' if len(_res.unexpected_keys) > 8 else ''}\n"
-                f"A warm start may only ADD zero-initialised weights. Rebuild "
-                f"this run with the same model.kind, conditions and "
-                f"frame_reinject_every as the checkpoint.")
+                f"A warm start may only ADD zero-initialised weights: use the "
+                f"same model.* and conditions as the checkpoint.")
         _added = [_w for _w, _p in _new_parts.items()
                   if any(n in k for k in _res.missing_keys for n in _p)]
         print(f"  {len(_sd) - len(_res.missing_keys)} tensor(s) loaded, "
@@ -4110,88 +4161,11 @@ if __name__ == "__main__":
         print(f"Resuming training from: {resume_from}")
         ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
 
-        ckpt_kind = ckpt.get("model_kind", None)
-        if ckpt_kind is not None and ckpt_kind != cfg.model.kind:
+        if ckpt["t_features"] != T_FEATURES:
             raise RuntimeError(
-                f"Checkpoint was trained with model.kind='{ckpt_kind}' but the "
-                f"model was built as '{cfg.model.kind}'. They must match to "
-                f"resume. (Normally the kind is restored automatically from the "
-                f"checkpoint; if you passed model.kind on the command line, "
-                f"remove it or set it to '{ckpt_kind}'.)"
-            )
-        ckpt_cross = ckpt["text_cross_every"]
-        if ckpt_cross != TEXT_CROSS_EVERY:
-            raise RuntimeError(
-                f"Checkpoint was trained with model.text_cross_every="
-                f"{ckpt_cross} but the model was built with "
-                f"{TEXT_CROSS_EVERY}. They must match to resume: the "
-                f"cross-attention adds four tensors per selected block plus "
-                f"the learned null token, so the two state_dicts cannot be "
-                f"put into one another. To START a NEW run with a different "
-                f"value, leave paths.resume_from empty -- a zero-initialised "
-                f"cross-attention computes the same function as none at all, "
-                f"so nothing is lost by warm-starting from this checkpoint "
-                f"with paths.init_from instead, if the run supports it."
-            )
-        ckpt_reinject = ckpt["frame_reinject_every"]
-        if ckpt_reinject != FRAME_REINJECT_EVERY:
-            raise RuntimeError(
-                f"Checkpoint was trained with model.frame_reinject_every="
-                f"{ckpt_reinject} but the model was built with "
-                f"{FRAME_REINJECT_EVERY}. They must match to resume: the "
-                f"per-block frame re-injection changes the weights themselves, "
-                f"not just a training setting. (Normally the value is restored "
-                f"automatically from the checkpoint config; if you passed "
-                f"model.frame_reinject_every on the command line, remove it or "
-                f"set it to {ckpt_reinject}. To START a NEW run with a "
-                f"different value, do not use --resume: this is a different "
-                f"architecture and needs its own run.)"
-            )
-        ckpt_codec = ckpt["codec"]
-        if ckpt_codec != lc.active().name:
-            raise RuntimeError(
-                f"Checkpoint was trained on {ckpt_codec} latents but this "
-                f"dataset is {lc.active().name} (its dataset_meta.json). A "
-                f"resume needs the dataset it was trained on: point "
-                f"paths.dataset_root at it.")
-        ckpt_att = ckpt["attention"]
-        if ckpt_att != ATTENTION:
-            raise RuntimeError(
-                f"Checkpoint was trained with model.attention='{ckpt_att}' but "
-                f"the model was built with '{ATTENTION}'. They must match to "
-                f"resume: the two read the same qkv weights differently, and "
-                f"the differential one has its own tensors (lambda vectors, "
-                f"per-head RMSNorm) in every block. Pass "
-                f"model.attention={ckpt_att} to resume this run; a different "
-                f"attention is a NEW run from scratch.")
-        ckpt_qk = ckpt["qk_norm"]
-        if ckpt_qk != QK_NORM:
-            raise RuntimeError(
-                f"Checkpoint was trained with model.qk_norm={ckpt_qk} but the "
-                f"model was built with qk_norm={QK_NORM}. They must match to "
-                f"resume: the QK-norm changes what the q/k weights compute and "
-                f"adds its own gains in every attention layer. Pass "
-                f"model.qk_norm={ckpt_qk} to resume this run; a different qk_norm "
-                f"is a NEW run from scratch.")
-        ckpt_ip = ckpt["inpainting"]
-        if ckpt_ip != INPAINTING:
-            raise RuntimeError(
-                f"Checkpoint was trained with training.inpainting={ckpt_ip} but "
-                f"the model was built with inpainting={INPAINTING}. They must "
-                f"match to resume: the inpainting context adds its own layers "
-                f"in every block. Pass training.inpainting={ckpt_ip} to resume "
-                f"this run; to add inpainting to a trained model, start a NEW "
-                f"run with paths.init_from -- its layers start at zero.")
-
-        ckpt_frame_dims = ckpt.get("frame_cond_dims", None)
-        if ckpt_frame_dims is not None and dict(ckpt_frame_dims) != dict(FRAME_COND_DIMS):
-            raise RuntimeError(
-                f"Checkpoint frame conditions {dict(ckpt_frame_dims)} do not match "
-                f"the ones built for this run {dict(FRAME_COND_DIMS)}. They must "
-                f"match to resume. (Normally conditioning.enabled_frame is restored "
-                f"from the checkpoint; if you overrode it on the command line, "
-                f"remove the override.)"
-            )
+                f"Checkpoint was trained with model.t_features={ckpt['t_features']}, "
+                f"this run builds {T_FEATURES}: pass model.t_features="
+                f"{ckpt['t_features']} to resume it.")
 
         if LORA:
             lora.load_adapters(model, ckpt["model_state_dict"])
@@ -4211,7 +4185,7 @@ if __name__ == "__main__":
             if "ema_state_dict" in ckpt:
                 ema.load_state_dict(ckpt["ema_state_dict"])
             else:
-                ema = EMAModel(model, decay=cfg.training.ema_decay)
+                ema = EMAModel(model)
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         _restore_rng_state(ckpt.get("rng_state"), data_generator)
@@ -4245,7 +4219,7 @@ if __name__ == "__main__":
             device_ids=[DIST.local_rank] if _on_gpu else None,
             output_device=DIST.local_rank if _on_gpu else None,
             gradient_as_bucket_view=True,
-            find_unused_parameters=bool(getattr(model, "text_cross_layers", None)))
+            find_unused_parameters=bool(getattr(model, "text_in_cross", None)))
         if ema is not None:
             for _t in list(ema.model.parameters()) + list(ema.model.buffers()):
                 dist_broadcast_tensor_(_t.data, DIST)
@@ -4268,22 +4242,39 @@ if __name__ == "__main__":
     print(f"Steps: {cfg.training.num_steps} | "
           f"Effective Batch: {cfg.data.effective_bs}")
     print(f"LR: {cfg.training.lr} | "
-          f"EMA: {'on (decay=' + str(cfg.training.ema_decay) + ')' if cfg.training.use_ema else 'off'} | "
+          f"EMA: {'on (decay=' + str(cfg.training.ema_decay) + ', power=' + str(cfg.training.get('ema_power', 0.0)) + ')' if cfg.training.use_ema else 'off'} | "
           f"AMP: {cfg.training.use_amp}")
     _sch = str(cfg.training.get("lr_schedule", "cosine"))
-    print(f"LR schedule: {_sch} | warmup {cfg.training.warmup_steps} steps, then "
-          + (f"lr * (1 + step / {float(cfg.training.get('lr_inv_gamma', 1.0e6)):g})"
-             f"^-{float(cfg.training.get('lr_power', 0.5)):g} (Stable Audio 3)"
-             if _sch == "inverse_power" else
-             f"constant until {cfg.training.decay_start_frac:g} of the run, then "
-             f"cosine to 0"))
+    _wu = float(cfg.training.get("lr_warmup", 0.0))
+    if _sch == "constant":
+        print("LR schedule: constant, no warmup")
+    else:
+        print(f"LR schedule: {_sch} | "
+              + (f"warmup 1 - {_wu:g}^(step + 1), then "
+                 if _sch == "inverse_power" and _wu > 0
+                 else f"warmup {cfg.training.warmup_steps} steps, then ")
+              + (f"lr * (1 + step / {float(cfg.training.get('lr_inv_gamma', 1.0e6)):g})"
+                 f"^-{float(cfg.training.get('lr_power', 0.5)):g}"
+                 if _sch == "inverse_power" else
+                 f"constant until {cfg.training.decay_start_frac:g} of the run, then "
+                 f"cosine to 0"))
     _g0 = optimizer.param_groups[0]
-    print(f"Optimizer: AdamW | betas={tuple(_g0['betas'])} | eps={_g0['eps']:g} | "
-          f"weight_decay={_g0['weight_decay']:g} "
-          + ("on the weight matrices only" if len(optimizer.param_groups) == 2
-             else "on every parameter")
-          + f" | grad_clip={cfg.training.grad_clip or 'off'}")
-    del _sch, _g0
+    if _g0.get("use_muon"):
+        _g1 = optimizer.param_groups[1]
+        print(f"Optimizer: Muon on ndim >= 2 (lr={scheduler.base_lrs[0]:g}, "
+              f"momentum={_g0['momentum']:g}) + AdamW on ndim < 2 (lr={scheduler.base_lrs[1]:g}, "
+              f"betas={tuple(_g1['betas'])}, eps={_g1['eps']:g}, "
+              f"weight_decay={_g1['weight_decay']:g}) | "
+              f"grad_clip={cfg.training.grad_clip or 'off'}")
+    else:
+        print(f"Optimizer: AdamW | betas={tuple(_g0['betas'])} | eps={_g0['eps']:g} | "
+              f"weight_decay={_g0['weight_decay']:g} "
+              + ("on the weight matrices only" if len(optimizer.param_groups) == 2
+                 else "on every parameter")
+              + f" | grad_clip={cfg.training.grad_clip or 'off'}")
+    OT_COUPLING = bool(cfg.training.get("ot_coupling", False))
+    print(f"Minibatch OT coupling: {'on' if OT_COUPLING else 'off'}")
+    print(f"Guidance type: {guidance_type_of(cfg.sampling)}")
     print(f"Sequence: {n_frames} frame = {n_frames} token of dim {lc.active().latent_dim}")
     print(f"Train: {len(train_dataset)} chunk | Val: {len(val_dataset)} chunk")
     print(f"Audio every {cfg.intervals.audio} step | "
@@ -4311,38 +4302,35 @@ if __name__ == "__main__":
                   if FRAME_REINJECT_EVERY > 0 else "OFF (input concat only)")
     print(f"Frame re-injection (per block): {_reinj_txt}")
     print(f"Self-attention: {ATTENTION}"
-          + (" (DIFF Transformer: two maps per head, lambda, per-head RMSNorm)"
-             if ATTENTION == "differential" else ""))
+          + (" (A(q1,k1) v - A(q2,k2) v)" if ATTENTION == "differential" else ""))
     T_SAMPLER = str(cfg.training.get("t_sampler", "logit_normal"))
-    _t_lo = t_sampler_cdf(T_SAMPLER, 0.1, n_frames)
-    _t_hi = 1.0 - t_sampler_cdf(T_SAMPLER, 0.8, n_frames)
+    _t_lo = t_sampler_cdf(T_SAMPLER, 0.2, n_frames)
+    _t_hi = 1.0 - t_sampler_cdf(T_SAMPLER, 0.9, n_frames)
     print(f"Training t sampler: {T_SAMPLER} "
-          + (f"(Stable Audio 3: logit-normal truncated at {T_TRUNC} and "
+          + (f"(logit-normal truncated at {T_TRUNC} and "
              f"rescaled, shift mu={length_shift_mu(n_frames):.4f} for {n_frames} "
              f"frames, alpha={math.exp(length_shift_mu(n_frames)):.2f})"
              if T_SAMPLER == "truncated_logit" else "(uniform (0, 1))"
              if T_SAMPLER == "uniform" else "(logit-normal (0, 1))")
-          + f" | draws with t < 0.1 (noise end): {100 * _t_lo:.1f}%, "
-            f"t > 0.8 (data end): {100 * _t_hi:.1f}% | the val loss keeps its "
+          + f" | draws with t > 0.9 (noise end): {100 * _t_hi:.1f}%, "
+            f"t < 0.2 (data end): {100 * _t_lo:.1f}% | the val loss keeps its "
             f"fixed logit-normal t, comparable across samplers")
     T_SCHEDULE = t_schedule_of(cfg.sampling)
-    _grid = euler_grid(int(cfg.sampling.euler_steps), float(cfg.sampling.t_min),
-                       float(cfg.sampling.t_max), T_SCHEDULE)
+    _grid = euler_grid(int(cfg.sampling.euler_steps), T_SCHEDULE)
     print(f"Sampling t schedule: {T_SCHEDULE} "
-          + ("(Stable Audio 3: steps equally spaced in log-SNR from -6.2 to "
-             "2.0, from pure noise t=0 to the data t=1)"
+          + ("(steps equally spaced in log-SNR from -6.2 to "
+             "2.0, from pure noise t=1 to the data t=0)"
              if T_SCHEDULE == "logsnr_uniform" else
-             f"(equal steps from t={cfg.sampling.t_min} to {cfg.sampling.t_max})")
+             "(equal steps from t=1 to t=0)")
           + f" | {len(_grid)} Euler steps, "
-            f"{sum(1 for _tv, _ in _grid if _tv < 0.1)} of them at t < 0.1 "
+            f"{sum(1 for _tv, _ in _grid if _tv > 0.9)} of them at t > 0.9 "
             f"(noise end), the last at t={_grid[-1][0]:.3f}")
-    del _grid
     IP_PROBS = inpaint_mask_probs(cfg.training) if INPAINTING else None
     INPAINT_ONLY = INPAINTING and IP_PROBS[0] == 0.0
     IP_THIRDS = inpaint_thirds(n_frames)
     if INPAINTING:
         _fps = lc.active().frames_per_s
-        print(f"Inpainting training (Stable Audio 3): masks full / 1-"
+        print(f"Inpainting training: masks full / 1-"
               f"{INPAINT_MAX_SPANS} spans / continuation / backward continuation "
               f"= {IP_PROBS[0]:g} / {IP_PROBS[1]:g} / {IP_PROBS[2]:g} / "
               f"{IP_PROBS[3]:g} | Train/Loss = "
@@ -4400,8 +4388,6 @@ if __name__ == "__main__":
                     loss = compute_loss(
                         train_model, batch, device,
                         use_amp=cfg.training.use_amp,
-                        t_min=cfg.sampling.t_min,
-                        t_max=cfg.sampling.t_max,
                         global_configs=GLOBAL_CONFIGS,
                         p_drop_all=cfg.conditioning.p_drop_all,
                         p_drop_frame=cfg.conditioning.p_drop_frame,
@@ -4411,6 +4397,7 @@ if __name__ == "__main__":
                         t_sampler=T_SAMPLER,
                         inpaint_probs=IP_PROBS,
                         parts=_lp,
+                        ot_coupling=OT_COUPLING,
                     ) / cfg.data.grad_accum
                     scaler.scale(loss).backward()
                 accum_loss += loss.item()
@@ -4435,7 +4422,8 @@ if __name__ == "__main__":
                     ema_ready = True
                     pbar.write(f"  -> EMA seeded from the live model @ step {step}")
                 else:
-                    ema.update(model)
+                    ema.update(model, ema_decay_at(cfg.training,
+                                                   step - cfg.training.ema_start))
 
             if DIST.enabled and INPAINTING:
                 accum_loss, accum_gen, accum_ctx = [
@@ -4484,8 +4472,6 @@ if __name__ == "__main__":
                                     compute_loss(
                                         _net, vb, device,
                                         use_amp=cfg.training.use_amp,
-                                        t_min=cfg.sampling.t_min,
-                                        t_max=cfg.sampling.t_max,
                                         global_configs=GLOBAL_CONFIGS,
                                         p_drop_all=cfg.conditioning.p_drop_all,
                                         p_drop_frame=cfg.conditioning.p_drop_frame,
@@ -4505,8 +4491,6 @@ if __name__ == "__main__":
                         vl = compute_loss(
                             model, vb, device,
                             use_amp=cfg.training.use_amp,
-                            t_min=cfg.sampling.t_min,
-                            t_max=cfg.sampling.t_max,
                             global_configs=GLOBAL_CONFIGS,
                             p_drop_all=cfg.conditioning.p_drop_all,
                             p_drop_frame=cfg.conditioning.p_drop_frame,
@@ -4523,8 +4507,6 @@ if __name__ == "__main__":
                             evl = compute_loss(
                                 ema.model, vb, device,
                                 use_amp=cfg.training.use_amp,
-                                t_min=cfg.sampling.t_min,
-                                t_max=cfg.sampling.t_max,
                                 global_configs=GLOBAL_CONFIGS,
                                 p_drop_all=cfg.conditioning.p_drop_all,
                                 p_drop_frame=cfg.conditioning.p_drop_frame,

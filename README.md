@@ -6,12 +6,11 @@ classifier-free guidance. Frame-level conditions (f0, chroma, rhythm, energy,
 chord, midi) are concatenated on the feature dimension (JASCO-style) and can optionally be
 **re-injected in depth** (`model.frame_reinject_every`), scaled by a
 per-condition gate that depends on the denoising step; global conditions
-(CLAP-text, CLIP-image) are injected via AdaLN, and the text can
+(CLAP-text, CLIP-image) are injected via AdaLN, and the text can instead or
 additionally be **cross-attended as a token sequence**
-(`model.text_cross_every`, PixArt-alpha order). The self-attention can be the
-DIFF Transformer's **differential attention** (`model.attention`), the
-training timesteps can follow **Stable Audio 3's recipe** (`training.t_sampler`),
-and so can the Euler steps of every generation (`sampling.t_schedule`).
+(`model.text_conditioning`). The self-attention can be **differential**
+(`model.attention`), the optimizer **Muon + AdamW** (`training.optimizer`), and a
+trained model can be fine-tuned with **LoRA / DoRA adapters** (`lora.*`).
 
 The pipeline is: **stream-encode audio → latents (+ conditions) → train → sample/edit**.
 Preprocessing is a streaming encoder that never materialises full WAVs to disk;
@@ -34,9 +33,10 @@ it (there are still no split folders on disk).
 | `audio_dataset_cond.py` | Conditioned dataset + `build_conditioned_datasets` (reads the recorded split). |
 | `network_cond.py` | The `ConditionedAudioDiT` model. |
 | `lora.py` | LoRA and DoRA adapters on a frozen trained model. |
+| `muon.py` | The Muon + AdamW optimizer (`training.optimizer`). |
 | `training_cond.py` | Training loop, cache validation, TensorBoard logging. |
 | `test_cond.py` | Test a checkpoint on the **recorded test set**: the training's metrics step and panels, on the test split (§4). |
-| `sampling_cond.py` | Generate / edit audio from a checkpoint with CFG. |
+| `sampling_cond.py` | Generate / edit audio from a checkpoint with guidance. |
 | `extract_conditions.py` | Standalone tool to add a frame condition to an existing latents dataset. |
 | `metrics.py`, `condition_metrics.py` | FD/KL/FAD + per-condition fidelity (f0/energy correlation, chroma/chord cosine, …). |
 | `probe_conditions.py` | Out-of-the-box probe sets for **every condition** — frame (f0, energy, chroma, rhythm) *and* global (text, image): elementary synthetic stimuli, targets produced by the run's own extractor/encoder, cached behind a fingerprint, plus the comparison plots. One bank + one synthesizer per condition. |
@@ -219,8 +219,8 @@ python preprocess_stream.py <SRC> <OUT_ENCODEC> --device cuda --codec encodec   
   extracted on the codec's frame grid (chroma / energy hop = the codec's hop,
   chord / midi at its frame rate); the training reads the codec from the
   dataset, sizes the model's tokens from it (72 or 128), decodes with it, and
-  writes it into the checkpoint; `test_cond.py`, `sampling_cond.py` and the
-  `compare_*.py` scripts read it from the checkpoint, and `test_cond.py` refuses
+  writes it into the checkpoint; `test_cond.py` and `sampling_cond.py` read it
+  from the checkpoint, and `test_cond.py` refuses
   a test dataset of another codec. A resume or a warm start across codecs is
   refused.
 - **Latent metrics are per codec.** FD and KL are measured in the codec's
@@ -608,9 +608,18 @@ python launch_training_cond.py --num-gpus 2 --config configs/training_cond_defau
 
 Two levers, and only one of them can be changed after the fact.
 
-**`conditioning.guidance_scale`** (sampling time, free to change). The usual CFG
-extrapolation `v_u + w · (v_c − v_u)`. Costs nothing to retry on a trained
-checkpoint; above ~5 it buys adherence with artefacts.
+**`conditioning.guidance_scale`** and **`sampling.guidance_type`** (sampling time,
+free to change). With `d_c = x − t·v_c`, `d_u = x − t·v_u` and `diff = d_c − d_u`,
+the guided prediction is `d_c + (w − 1) · part`:
+
+| `guidance_type` | `part` |
+|---|---|
+| `cfg` | `diff`, the usual `v_u + w · (v_c − v_u)` |
+| `apg` (default) | `diff` minus its projection on `d_c`, over all the frames and channels of the clip |
+| `mix` | half of each |
+
+Costs nothing to retry on a trained checkpoint; above ~5 it buys adherence with
+artefacts.
 
 **`model.frame_reinject_every`** (architecture, must be chosen BEFORE the run).
 With the default `0`, a frame condition is concatenated at the input and never
@@ -633,8 +642,8 @@ h ← h + W_i · ( frame_proj ⊙ g_i )        g_i = W_g,i · SiLU(c)
 Without the gate the term re-added at a given block is a function of the
 conditions alone — the *same tensor at every denoising step* — while every other
 path in the network is free to weigh itself against `t`: each block's own
-`shift`/`scale`/`gate` come out of `adaLN_modulation(c)`, and the global
-conditions ride inside that same `c`. The re-injection was the only contribution
+`scale`/`shift`/`gate` come out of `model.adaLN(c)` and its `adaLN_bias`, and the
+global conditions ride inside that same `c`. The re-injection was the only contribution
 in the model without that freedom.
 
 ```yaml
@@ -655,90 +664,61 @@ model:
 - **Block 0 is never re-injected**: `input_proj` has just delivered the
   conditions to it.
 - **Zero-init** means step 0 is *exactly* the input-only model, so the extra path
-  is learned only if it earns its weight — the same principle as adaLN-Zero and
-  ControlNet's zero-convs. `python test_functions/test_network_cond.py` asserts this, together with
+  is learned only if it earns its weight — the same principle as ControlNet's
+  zero-convs. `python test_functions/test_network_cond.py` asserts this, together with
   the fact that the path then really changes the output and receives gradient.
 - **The gate starts at the identity** (weight 0, **bias 1**), not at zero.
   Zeroing it as well would leave the path dead on arrival: with the gate at 0 the
   projection receives no gradient, and with the projection at 0 the gate receives
   none either, so neither could ever leave the origin. The step-0 guarantee is
   unaffected — it comes from the zero-init *projection*. The order in which the
-  path wakes up is: step 0 the final layer, step 1 the projection, step 2 the
-  gate.
+  path wakes up is: step 0 the projection, step 1 the gate.
 - **Cost:** one `Linear` per selected block, plus a `Linear(hidden → n_conditions)`
   for its gate. With f0 alone (`out_dim` 16) on `XL` that is 27 × 16 × 1152 =
   0.5M params for the projections and 31k for the gates (~0.05% of the model);
   with all four frame conditions (sum 128) the projections are 4.0M. On `S` with
   f0 alone: 40 960 + 2 565 = 0.04M, 0.14% of the model.
-- **It changes the state_dict**, so it is checked on `--resume` exactly like
-  `model.kind`, and a checkpoint trained with one value cannot be resumed with
-  another. Trying it means a **new run**, not a resume. `sampling_cond.py` and
-  `test_cond.py` read the value back from the checkpoint automatically;
-  checkpoints written before this option existed read back as `0`, which is what
-  they were trained as. A checkpoint trained with re-injection *before the gate
-  existed* is refused with an explanation rather than a wall of missing keys
-  (`network_cond.check_ckpt_reinject_gate`): the stride matches, the weights do
-  not.
-- **`frame_reinject_every: 0` is bit-identical to the pre-re-injection code.**
-  Neither the projections nor the gates are built, the parameter count and the
-  initialisation from a given seed are unchanged, and an old checkpoint loads
-  with `strict=True`. That is the value to use for a run meant to be compared
-  with results produced before any of this existed.
+- **It changes the state_dict**, so a checkpoint trained with one value cannot be
+  resumed with another: loading the weights stops. Trying it means a **new run**,
+  not a resume. `sampling_cond.py` and
+  `test_cond.py` read the value back from the checkpoint automatically.
+- With memory tokens the re-injected term skips them: it is left-padded with zeros
+  to the length of the sequence.
 
-### Text cross-attention — `model.text_cross_every`
+### Where the text enters — `model.text_conditioning`
 
-**The problem it solves.** With `text_cross_every: 0` the text reaches the blocks
-as one pooled vector, summed into the AdaLN conditioning vector `c`. From `c`
-come `shift`/`scale`/`gate`, which `modulate` broadcasts over time — so the text
-can apply exactly one affine transform, the same at every one of the ~431
-frames. No word can act on frame 200 differently from frame 10, because the text
-never enters an attention at all. That channel was designed in the official DiT
-to carry a class label, about ten bits.
+| value | the text reaches the blocks as |
+|---|---|
+| `ada` (default) | one pooled vector, in the global conditioning summed to `c` |
+| `cross_att` | a sequence of tokens, through a cross-attention in every block |
+| `all` | both |
 
-**What it adds.** A cross-attention sub-layer in every selected block, between
-the self-attention and the FFN — the order of PixArt-alpha and of the
-LDM/Stable-Diffusion block:
+Through `c` the text can apply one affine transform, the same at every frame. The
+tokens enter an attention, so the conditioning changes along the clip and its
+capacity grows with the length of the text.
 
 ```
-x = x + gate_msa * attn(modulate(norm1(x)))
-x = x + cross_attn(norm_cross(x), text_tokens)     <- new
-x = x + gate_mlp * mlp (modulate(norm2(x)))
+x = x + sigmoid(1 − g_a) · attn(norm1(x) · (1 + s_a) + b_a)
+x = x + cross_attn(norm_cross(x), W(tokens))                  <- cross_att, all
+x = x + left_pad(inpaint_embed(context))                      <- training.inpainting
+x = x + sigmoid(1 − g_f) · mlp(norm2(x) · (1 + s_f) + b_f)
 ```
 
-Q comes from `x`, K and V from the **token states** of the label or text (768-d, CLAP's
-text tower before the projection — not the pooled 512-d vector, which is a
-single key and therefore a learned bias, not an attention). The conditioning
-becomes time-varying and content-dependent, and its capacity grows with the
-length of the text.
-
-No AdaLN modulation on this sub-layer and no RoPE on the context, both as in
-PixArt: RoPE rotates by position in the *audio* sequence, and the text keys are
-not at any audio position.
-
-**The null.** CFG needs an unconditional branch, and here it cannot be "no
-keys": a softmax over an empty key set is NaN. It is a **learned null token**,
-trained by the same CFG dropout that trains the zero vector of the other
-conditions, and the dropout drops it on exactly the same coin as the pooled
-text — one condition, two views.
-
-**Zero-init and warm start.** The output projection starts at zero, so a model
-built with the cross-attention computes *the same function* as one without it
-(verified bit-identical). That is what `paths.init_from` is for: it seeds a NEW
-run from an old checkpoint's weights, allowing only the keys the new
-architecture adds to be missing, and refusing anything else with the list. Use
-it to turn the cross-attention on for a model that is already trained —
-`--resume` cannot, and should not, load one architecture into another.
-
-At step 0 the gradient reaches only `W_o` (the trunk is fully zero-gated by
-adaLN-Zero and the zero final layer); `K`/`V`/`Q` start learning once `W_o` has
-left the origin, and the null token once some sample is dropped.
-
-**What it needs.** `conditioning.text_source` `label` or `text`: the tokens are those
-of the string the model receives. With `audio` the run **refuses to start**: CLAP's
-audio tower returns one vector, so there is no sequence to attend over.
-
-**Cost.** On `L` with a stride of 1: +88M parameters on 467M (+19%), plus the
-optimizer state that goes with them.
+- **The tokens** are the states of CLAP's text tower before its projection (768
+  values each), passed through one `Linear-SiLU-Linear` without bias shared by the
+  blocks. Q comes from `x`, K and V from them; no modulation and no RoPE on this
+  sub-layer, no bias, RMSNorm on `x`, QK-norm as in the self-attention, output
+  projection at zero. With `model.attention=differential` it computes
+  `A(q1, k1) v − A(q2, k2) v` too.
+- **Padding.** No attention mask: the positions after the end of a text hold a
+  learned vector of 768 values.
+- **The null.** A dropped text is all zeros, so its K and V are 0 and the sub-layer
+  adds exactly 0. The dropout is the one of the global conditions.
+- **What it needs.** `cross_att` and `all` want `conditioning.text_source` `label` or
+  `text`, the tokens of the string the model receives. With `audio` the run **refuses
+  to start**: CLAP's audio tower returns one vector, there is no sequence to attend over.
+- **Cost.** `XL` with `cross_att`, EnCodec: 757M parameters with the standard
+  attention, 906M with the differential one, against 606M and 681M without text.
 
 ### What the text slot is fed — `conditioning.text_source`
 
@@ -764,193 +744,203 @@ On material where CREPE returns mostly unvoiced (musique concrète, heavily
 processed sound), the f0 curve is close to noise and no amount of re-injection or
 guidance recovers a control signal that is not in the `.npz` to begin with.
 
+### The network
+
+| `model.kind` | blocks | hidden | heads | parameters (DAC, no conditions, 64 memory tokens) |
+|---|---|---|---|---|
+| `S` | 6 | 512 | 8 | 27.6M |
+| `B` | 12 | 768 | 12 | 118.5M |
+| `G` | 18 | 1024 | 16 | 311.2M |
+| `L` | 24 | 1024 | 16 | 412.0M |
+| `XL` | 28 | 1152 | 18 | 606.3M |
+
+- **Input.** `x + Conv1d(x)`, a 1×1 convolution starting at zero, then a `Linear`
+  without bias; the frame conditions are concatenated to `x` before it.
+- **Memory tokens** — `model.memory_tokens` (64, `0` = off). Learned vectors put
+  before the frames: they take part in every attention, RoPE counts them, and they
+  are dropped at the end.
+- **Time** — `model.t_features`. `t` goes through 128 cosines and 128 sines of
+  `2π f t`, then a `Linear-SiLU-Linear`. `high_freq` (default): `f` exponentially
+  spaced from 0.5 to 10000. `low_freq`: `2π f` exponentially spaced from 1e-4 to 1,
+  so the embedding is a smooth function of `t`.
+- **Global conditions.** Concatenated (sorted by name) into one `Linear-SiLU-Linear`
+  without bias and summed to the time vector: `c`. A null condition adds 0.
+- **Modulation** — `model.adaln`. `shared` (default): `Linear-SiLU-Linear` on `c` gives
+  `6 · hidden` values shared by the blocks; each block adds its own `adaLN_bias` and
+  splits them into `s_a, b_a, g_a, s_f, b_f, g_f`, used as in the block above.
+  `per_block`: every block has its own `SiLU-Linear` from `c` to those 6 vectors, which
+  adds `6 · hidden²` parameters per block.
+- **Block.** RMSNorm with a learned gain (ε = 1e-5, in fp32) before each branch. The
+  gate is `sigmoid(1 − g)` with `shared`, about 0.73 at the start and never negative,
+  and `g` itself with `per_block`, 0 at the start and free in sign. The feed-forward
+  is `h · silu(gate)`, with `h` and `gate` from one `Linear(hidden → 8 · hidden)`, then
+  `Linear(4 · hidden → hidden)`.
+- **Output.** With `shared`: a `Linear` without bias on the frames, then `y + Conv1d(y)`,
+  a 1×1 convolution starting at zero; no norm and no modulation here. With `per_block`:
+  LayerNorm without gain (ε = 1e-6), scale and shift from a `SiLU-Linear` on `c`, then
+  a `Linear` with bias; no convolution.
+- **Initialisation.** PyTorch's default everywhere, except zeros on the last layer of
+  every context and re-injection branch and on the input convolution. With `shared`,
+  also zeros on the last layer of attention, cross-attention and feed-forward and on
+  the output convolution: every block starts as the identity and the output of the
+  model does not start at zero. With `per_block`, zeros on the last layer of every
+  `SiLU-Linear` of the modulation, on the last layer of the cross-attention and on the
+  final `Linear`: every block starts as the identity and the output of the model
+  starts at zero.
+
 ### Self-attention — `model.attention`
 
 | value | every block's self-attention |
 |---|---|
-| `standard` (default) | the RoPE attention of `network.py`: 16 heads × 72 on `XL`. Every run before 6 Oct 2026; bit-identical to the code before the option existed |
-| `differential` | the **DIFF Transformer** of Ye et al. 2024 ([arXiv 2410.05258](https://arxiv.org/abs/2410.05258)), as in its reference code (`microsoft/unilm`, `Diff-Transformer/multihead_diffattn.py`) |
+| `standard` (default) | `A = softmax(q kᵀ / √d)`, `o = A v`; 3 projections |
+| `differential` | two pairs (q1, k1), (q2, k2) over the same values; 5 projections |
 
-**What the differential attention computes.** Half the heads; each has two
-query/key pairs over the same values:
+**What the differential attention computes.** Same number of heads as the
+standard one, with a second query/key pair over the same values:
 
 ```
 A1 = softmax(q1 k1ᵀ / √d)      A2 = softmax(q2 k2ᵀ / √d)
-o  = (A1 − λ·A2) v             λ = exp(λq1·λk1) − exp(λq2·λk2) + λ_init
-o  = RMSNorm(o) · (1 − λ_init)
+o  = A1 v − A2 v
 ```
 
-The weight a position receives is the difference of two maps: what both spread
-alike over the sequence cancels, what `A1` puts above `A2` survives, and the
-rows sum to `1 − λ`, not 1. `λ` is learned, one per block, starting from
-`λ_init = 0.8 − 0.6·exp(−0.3·block)` (0.20 in block 0, 0.80 in the deep blocks of
-`XL`). In the paper's retrieval test the attention given to irrelevant context
-drops from 0.49–0.54 (Transformer) to 0.01–0.02.
+The weight a position receives is the difference of the two maps, so each row of
+weights sums to 0 and a head with two uniform maps outputs 0. On `XL` the extra
+projections add `2 × hidden²` parameters per block (74.3M).
 
-- **The per-head RMSNorm is part of the method.** λ changes with the depth and
-  during training, and the two maps cancel more or less from head to head, so
-  each head's output has a scale of its own; the norm brings them to one, and
-  `(1 − λ_init)` puts it back where a standard head's output sits. Paper,
-  Table 6 (1.4B models, validation loss): 3.062 with it, 3.122 without — worse
-  than the standard Transformer's 3.087. Stable Audio 3 uses a variant without it
-  (λ fixed at 1) in its medium and large models, with no published ablation.
-- **Same parameters and FLOPs.** The qkv / proj matrices keep their shapes and are
-  read differently (on `XL`: 16 query/key maps of width 72, two per head, and 8
-  values of width 144); the extra parameters are the four λ vectors and the norm's gain,
-  `6 × head_dim` per block (12k on `XL`). Same RoPE.
-- **Numbers outside language:** DiT-S/2 on ImageNet 256 (400k steps, batch 256):
-  FID 67.2 → 63.9 ([arXiv 2511.00833](https://arxiv.org/abs/2511.00833)). Nothing
-  published on audio.
-- **It changes the state_dict and what the weights compute**, so it is checked on
-  `--resume` like `model.kind`, and neither `--resume` nor `paths.init_from` can
-  switch it: a different attention is a new run. `sampling_cond.py`,
-  `test_cond.py` and `compare_guidance.py` read it off the checkpoint's
-  **weights** (`network_cond.ckpt_attention`: a block with `attn.lambda_q1` is
-  differential); checkpoints written before the option read back as `standard`.
+**Heads and RoPE.** Every size has heads of 64 values (`XL`: 18 heads). RoPE
+rotates the first `max(d / 2, 32)` values of q and k (32 of 64), with frequencies
+`10000^(−i / 32)`, `i = 0, 2, …, 30`; the others carry no position.
+
+- **It changes the state_dict and what the weights compute**, so neither `--resume`
+  nor `paths.init_from` can switch it: a different attention is a new run.
+  `sampling_cond.py` and
+  `test_cond.py` read it off the checkpoint.
 - `python test_functions/test_network_cond.py` checks the module against an explicit, step-by-step
-  computation of the formula above, and that λ and the norm receive gradient in
-  every block.
+  computation of the formula above.
 
 ### QK-norm — `model.qk_norm`
 
 | value | q and k of every attention |
 |---|---|
-| `true` (default) | per-head RMSNorm with a learned gain (one for q, one for k, shared by the heads, ε = 1e-6), after the projection and before RoPE, as in Stable Audio 3 |
-| `false` | used as they come out of the projection; every run before 9 Oct 2026 |
+| `true` (default) | per-head RMSNorm with a learned gain (one for q, one for k, shared by the heads, ε = 1e-6), after the projection and before RoPE |
+| `false` | used as they come out of the projection |
 
-Stable Audio 3 ([arXiv 2605.17991](https://arxiv.org/abs/2605.17991), Sec. 2.2,
-eq. 2) normalises q and k in every self- and cross-attention "to prevent
-dot-product outputs from growing unconstrained"; both released DiTs have it
-(`small` with standard, `medium` with differential attention). Without it the
+Without it the
 logit q·kᵀ/√d grows with the norms of W_q, W_k and with the AdaLN scale, and
 nothing bounds it. An XL run on SHS (batch 16, lr 1e-4, no weight decay, no
 clipping) trained smoothly for 380k steps, then one isolated grad-norm spike sent
 the train, validation and EMA losses back to their early-training values.
 
-- Applied in `SelfAttention`, in both maps of `DifferentialSelfAttention` (the
-  same norm for q1/q2 and for k1/k2, as in SA3) and in `CrossAttention`.
+- Applied in `SelfAttention`, in both maps of the differential attention (the
+  same norm for q1/q2 and for k1/k2) and in `CrossAttention`.
   `2 × head_dim` parameters per attention layer (4k on `XL`).
-- **It changes the state_dict and what the weights compute**, so it is checked on
-  `--resume` and `paths.init_from` like `model.attention`: a different value is a
-  new run. `sampling_cond.py` and `test_cond.py` read it off the checkpoint's
-  weights (`network_cond.ckpt_qk_norm`: an `attn.q_norm.weight` means on);
-  checkpoints written before the option read back as `false` and load as before.
+- **It changes the state_dict and what the weights compute**, so neither `--resume`
+  nor `paths.init_from` can switch it: a different value is a new run.
+  `sampling_cond.py` and `test_cond.py` read it off the checkpoint.
 - `python test_functions/test_network_cond.py` checks every attention against an
   explicit computation, that q/k weights scaled ×50 leave the output unchanged
   with the norm (and not without), and that the gains receive gradient.
 
-### Learning rate, optimizer, clipping — `training.lr_schedule`, `training.adam_*`, `training.weight_decay*`, `training.grad_clip`
+### Optimizer and learning rate — `training.*`
 
-| key | default | Stable Audio 3 | what it does |
-|---|---|---|---|
-| `lr_schedule` | `inverse_power` | `inverse_power` | after the linear warmup, `lr · (1 + step / lr_inv_gamma)^−lr_power`; `cosine`: constant until `decay_start_frac`, then cosine to 0 (every run before 9 Oct 2026) |
-| `lr_inv_gamma`, `lr_power` | 1e6, 0.5 | 1e6, 0.5 | the lr is ×0.95 at 100k steps, ×0.85 at 380k, ×0.71 at 1M |
-| `adam_betas` | [0.9, 0.999] | [0.9, 0.95] | AdamW betas |
-| `adam_eps` | 1e-8 | — | AdamW eps |
-| `weight_decay` | 0.0 | 0.01 | decoupled weight decay |
-| `weight_decay_matrices_only` | true | — | with `weight_decay > 0`: two AdamW groups, decay on the weight matrices only; biases, norm gains (q/k norms included), the λ vectors and the text null token are not decayed |
-| `grad_clip` | 0.0 (off) | not stated | global-norm clipping after gradient accumulation; with grad norms of 0.1–0.3, 1.0 cuts only spikes |
+| key | default | what it does |
+|---|---|---|
+| `optimizer` | `muon` | `muon`: Muon on the parameters with ndim ≥ 2, AdamW on the others. `adamw`: AdamW on everything |
+| `lr` | 5e-5 | with `muon`, the AdamW part; with `adamw`, every parameter |
+| `muon_lr`, `muon_momentum` | 1e-3, 0.95 | the Muon part |
+| `adam_betas`, `adam_eps` | [0.9, 0.95], 1e-8 | AdamW |
+| `weight_decay` | 0.01 | decoupled, on the AdamW part; none on the Muon part |
+| `weight_decay_matrices_only` | true | `adamw` only: two groups, decay on the weight matrices only |
+| `lr_schedule` | `inverse_power` | `lr · warmup · (1 + step / lr_inv_gamma)^−lr_power`; `cosine`: constant until `decay_start_frac`, then cosine to 0; `constant` |
+| `lr_inv_gamma`, `lr_power` | 1e6, 0.5 | the lr is ×0.95 at 100k steps, ×0.85 at 380k, ×0.71 at 1M |
+| `lr_warmup` | 0.995 | `warmup = 1 − x^(step + 1)`, 99% at about 920 steps; `0`: linear over `warmup_steps` |
+| `grad_clip` | 0.0 (off) | global-norm clipping after gradient accumulation |
+| `ot_coupling` | true | see below |
+| `ema_decay`, `ema_start`, `ema_power` | 0.9995, 0, 0.75 | decay `min(ema_decay, 1 − (1 + n)^−ema_power)` after `n` updates; `ema_power: 0` = constant |
 
-The paper's learning rates (Muon 1e-5, AdamW 1e-6, Sec. 3.5) belong to its
-Muon+AdamW hybrid and the paragraph speaks of generator and discriminator; it
-does not say they hold for pre-training, so `training.lr` keeps its value.
+AdamW alone, at 1e-4 and without weight decay: `training.optimizer=adamw training.lr=1e-4
+'training.adam_betas=[0.9,0.999]' training.weight_decay=0`.
 
-- The startup log prints what is in effect: `LR schedule: ...` and
-  `Optimizer: AdamW | betas=... | eps=... | weight_decay=... | grad_clip=...`.
+**Muon.** The momentum `m = β m + (1 − β) g` and the Nesterov update `(1 − β) g + β m`
+are orthogonalised with 5 Newton-Schulz iterations in bf16 before being applied, so
+every update has the same size whatever the size of the gradient. The `qkv`, `q`, `kv`
+and feed-forward `proj` matrices hold several maps side by side, and are orthogonalised
+one square block at a time. It adds time to every optimizer step: about 1.2 s on `XL`
+measured on a laptop GPU, independent of the batch size. Rounding in the gradients
+changes the orthogonalised update, so a run is not reproducible to the bit across a
+different number of GPUs; the copies on the GPUs stay identical.
+
+**Minibatch OT coupling.** Each micro-batch reassigns the noise to the clips, with 20
+Sinkhorn iterations on the squared distances, then a sequential assignment that gives
+a permutation. The value of `t` and the data do not change.
+
+- The startup log prints what is in effect: `LR schedule: ...`, `Optimizer: ...`,
+  `Minibatch OT coupling: ...`.
 - **Resume:** `grad_clip` and the schedule shape passed on the command line take effect;
-  lr, betas, eps and weight_decay come back with the optimizer state, and the
-  startup log says so when they differ from the config.
+  the optimizer, its learning rates, betas, eps and weight decay come back with its
+  state, and the startup log says so when they differ from the config.
 
 ### Where the training puts its timesteps — `training.t_sampler`
 
-`t = 0` is pure noise, `t = 1` the data.
+`t = 0` is the data, `t = 1` pure noise: `x_t = (1 − t) · data + t · noise`, and the
+model predicts `noise − data`.
 
-| value | how the training draws `t` | below 0.1 | above 0.8 | median |
+| value | how the training draws `t` | above 0.9 | below 0.2 | median |
 |---|---|---|---|---|
-| `logit_normal` (default) | logit-normal (0, 1), SD3's `lognorm(0.00, 1.00)`; every run before 6 Oct 2026 | 1.4% | 8.3% | 0.50 |
-| `truncated_logit` | Stable Audio 3's pre-training recipe ([arXiv 2605.17991](https://arxiv.org/abs/2605.17991)), for 431 frames | 9.9% | 2.3% | 0.34 |
-| `uniform` | uniform on [0, 1]: every `t` equally likely | 10.0% | 20.0% | 0.50 |
+| `truncated_logit` (default) | below, for 431 frames | 9.9% | 2.3% | 0.66 |
+| `logit_normal` | logit-normal (0, 1) | 1.4% | 8.3% | 0.50 |
+| `uniform` | uniform on [0, 1] | 10.0% | 20.0% | 0.50 |
 
-`truncated_logit` is the two steps of their code, mirrored into this repo's convention (SA3
-has `t = 1` = noise): the logit-normal (0, 1) **truncated at 0.075 and rescaled**
-(`truncated_logistic_normal_rescaled`), then **shifted towards the noise** by an
-amount that grows with the sequence length (`DistributionShift`, the one their
-released models ship with): `logit(t') = logit(t) − μ`, `μ` linear from 0.5 at
-256 tokens to 1.15 at 4096 — 0.53 for our 431 frames, `α = e^μ = 1.70`. Checked
-against their code run as is: 4M draws each, largest gap between the two CDFs
-0.0005.
+`truncated_logit`: the logit-normal (0, 1) is **truncated at 0.075 and rescaled** to
+give `u`, and `t = sigmoid(μ − logit(u))`, with `μ` linear from 0.5 at 256 frames to
+1.15 at 4096: 0.53 for 431 frames, 0.54 for 500.
 
 **Why.** Measured on 6 Oct 2026 on XL SHS 200k and XL chord Lakh 50k, from the
-model's own estimate of the final latent along the Euler trajectory,
-`x̂₁ = x_t + (1 − t)·v`: the content of the whole clip — each channel's mean over
-the 431 frames — is 90% fixed by `t = 0.12`, where `logit_normal` puts 2.4% of
-the examples, `truncated_logit` 13% and `uniform` 12%; above `t = 0.7` every time scale is already ≥ 99%
-fixed, and `logit_normal` puts 20% of the examples there, `truncated_logit` 7%, `uniform` 30%. Below
-`t = 0.01` a 200k-step run with batch 16 has seen about 7 examples in all, and
-there the model treats the noise as if it were already content.
+model's own estimate of the final latent along the Euler trajectory: the content of
+the whole clip — each channel's mean over the 431 frames — is 90% fixed by `t = 0.88`,
+where `logit_normal` puts 2.3% of the examples above it, `truncated_logit` 13% and
+`uniform` 12%; below `t = 0.3` every time scale is already ≥ 99% fixed, and
+`logit_normal` puts 20% of the examples there, `truncated_logit` 7%, `uniform` 30%.
 
 - **Training only.** The network does not change and every checkpoint samples
   the same way. It may differ on a resume: pass it on the command line, since the
   checkpoint's stored config is merged over the YAML.
-- **The validation loss is untouched:** it keeps its own fixed `t`, drawn once
-  from the logit-normal (0, 1), so it stays comparable across samplers and with
-  every earlier run.
-- The startup log says where the draws go: `Training t sampler: truncated_logit (...) | draws
-  with t < 0.1 (noise end): 9.9%, t > 0.8 (data end): 2.3%`.
-- Above `t = 0.7` the latent changes by less than 1%, but small latent errors can
+- **The validation loss is untouched:** it keeps its own fixed noise and `t`, drawn
+  once from the logit-normal (0, 1), so it stays comparable across samplers.
+- The startup log says where the draws go: `Training t sampler: truncated_logit (...) |
+  draws with t > 0.9 (noise end): 9.9%, t < 0.2 (data end): 2.3%`.
+- Below `t = 0.3` the latent changes by less than 1%, but small latent errors can
   still be heard after decoding (with DAC they can change the codes the latents
   are re-quantized to; EnCodec decodes them directly): fewer examples there is a
   trade-off to listen for.
 
 ### Where the Euler steps go — `sampling.t_schedule`
 
-`t = 0` is pure noise, `t = 1` the data. The option places the
-`sampling.euler_steps` of **every** generation of the run: the metrics step, the
-panels, the uncond cards.
+The option places the `sampling.euler_steps` of **every** generation of the run: the
+metrics step, the panels, the uncond cards. Every grid goes from `t = 1` to `t = 0`.
 
-| value | where the steps go | steps | evaluated below t = 0.1 | below t = 0.12 | last evaluation |
+| value | where the steps go | steps | evaluated above t = 0.9 | below t = 0.2 | last evaluation |
 |---|---|---|---|---|---|
-| `uniform` (default) | equal steps from `t_min` to `t_max`; every run before 6 Oct 2026 | 100 | 10 | 12 | t = 0.989 |
-| `logsnr_uniform` | Stable Audio 3's inference grid ([arXiv 2605.17991](https://arxiv.org/abs/2605.17991), §4) | 50 | 25 | 26 | t = 0.862 |
-
-`logsnr_uniform` is their `build_schedule` with the `LogSNRShift(rate=0)` their
-`models/diffusion.py` uses when a model config sets no sampling shift (their
-released `-base` configs set none): the step boundaries equally spaced in
-log-SNR, `log(t / (1 − t))`, from −6.2 to 2.0, the first at `t = 0` and the last
-at `t = 1`, the same grid for every length; `t_min` / `t_max` do not apply to
-it. Checked against their code run as is: largest gap 9e-8 (their float32).
-Their base model (flow matching only, like ours) is sampled on it with 50 Euler
-steps (CFG 7 in their paper); their post-trained model uses 8 ping-pong steps,
-which needs their distillation and adversarial post-training.
-
-```bash
-python training_cond.py ... sampling.t_schedule=logsnr_uniform sampling.euler_steps=50
-```
+| `logsnr_uniform` (default) | equally spaced in log-SNR, `log((1 − t) / t)`, from −6.2 to 2.0; the first boundary is `t = 1`, the last `t = 0` | 50 | 25 | 3 | t = 0.138 |
+| `uniform` | equal steps | 50 | 5 | 10 | t = 0.020 |
 
 - **Sampling only.** The weights do not depend on it: any checkpoint can be
   generated either way. On a resume the checkpoint's value is kept unless the
   command line says otherwise.
-- **Who reads it.** `test_cond.py`, `sampling_cond.py` and `compare_guidance.py`
-  take the checkpoint's;
+- **Who reads it.** `test_cond.py` and `sampling_cond.py` take the checkpoint's;
   `sampling.t_schedule=logsnr_uniform` on the test's command line and `--t_schedule logsnr_uniform`
-  for the other two override it. `compare_schedules.py --schedules uniform logsnr_uniform`
-  generates the two from the same noise.
-- **An edit** (`sampling_cond.py edit --strength s`) starts at `t = 1 − s`: the
-  same log-SNR spacing from there to 2.0 (past `t = 0.881`, i.e. `s` below 0.12,
-  equal steps). SA3's own code would put the second step at more noise than the
-  first, which an Euler step cannot do.
+  for the other override it.
+- **An edit** (`sampling_cond.py edit --strength s`) starts from
+  `(1 − s) · latent + s · noise` at `t = s`, on the same grid scaled by `s`.
 - The metric curves of two runs are comparable only with the same
   `euler_steps` and `t_schedule`. The startup log says which:
-  `Sampling t schedule: logsnr_uniform (...) | 50 Euler steps, 25 of them at t < 0.1 (noise end), the last at t=0.862`.
-- **`uniform` generates what it did before, bit for bit**: the same times and
-  step sizes, with the same arithmetic.
+  `Sampling t schedule: logsnr_uniform (...) | 50 Euler steps, 25 of them at t > 0.9 (noise end), the last at t=0.138`.
 
-### Inpainting (Stable Audio 3) — `training.inpainting`, `training.inpaint_masks`
+### Inpainting — `training.inpainting`, `training.inpaint_masks`
 
-The model can learn to regenerate a stretch of a clip given the rest of it, the
-way Stable Audio 3 does ([arXiv 2605.17991](https://arxiv.org/abs/2605.17991),
-§3.2): every example of the batch draws a mask, the frames the mask keeps are
-given to the model as context, and it regenerates the others.
+The model can learn to regenerate a stretch of a clip given the rest of it: every
+example of the batch draws a mask, the frames the mask keeps are given to the model
+as context, and it regenerates the others.
 
 ```yaml
 training:
@@ -962,17 +952,15 @@ training:
 
 - **The masks.** The continuation keeps a prefix of random length and
   regenerates the rest; the backward continuation keeps a suffix of random
-  length and regenerates everything before it. SA3 draws 1-10 spans and has no
-  backward continuation. Three numbers, as in the configs of before, mean a
-  fourth at 0: the same masks as before, with the same random draws.
+  length and regenerates everything before it. Three numbers mean a fourth at 0.
 - **The model.** The context is the mask plus the latent times the mask (73
   channels with DAC, 129 with EnCodec). Every block adds it through its own
   Linear-SiLU-Linear, the last layer zero-initialised, between the
-  cross-attention and the feed-forward: +1.8M parameters on S, +39.6M on XL. The
-  context is the same in the conditioned and the unconditioned branch of the
-  CFG: the guidance never removes it. With `inpainting: false` nothing is built
-  and the run is the one of before, bit for bit.
-- **The loss** is SA3's: the mean over the regenerated frames plus the mean over
+  cross-attention and the feed-forward: +1.8M parameters on S, +39.6M on XL with
+  DAC, +41.4M with EnCodec. It skips the memory tokens. The context is the same in
+  the conditioned and the unconditioned branch of the guidance, which never removes
+  it. With `inpainting: false` nothing is built.
+- **The loss:** the mean over the regenerated frames plus the mean over
   the kept ones, per example, then over the batch (an example without context
   adds 0 to the second). `Train/Loss` = `Train/Loss_generated` +
   `Train/Loss_context`: it is not comparable with a run without inpainting.
@@ -983,7 +971,7 @@ training:
   no target-vs-generation images); the startup log says `Uncond cards: 0
   (inpainting only: nothing is generated from scratch)`.
 - **Checkpoints.** The checkpoint records the flag: a resume keeps it, a resume
-  with the other value stops and says why. `paths.init_from` from a model
+  with the other value stops. `paths.init_from` from a model
   without inpainting works (the new layers start at zero); the other way stops.
 - **Validation, on fixed thirds.** Besides `Validation/Loss` (full mask, as
   before), `Validation/Loss_inpaint_1_start`, `_2_middle`, `_3_end` (+ `_ema`):
@@ -991,8 +979,8 @@ training:
   last third regenerated (0–1.67, 1.67–3.33, 3.33–5.00 s on a 5 s clip).
 - **Metrics step.** Every validation clip of the step is regenerated three
   times, once per third, with the rest of the clip as context, put back as it
-  was before decoding (SA3 decodes the model's output instead): 3 ×
-  `n_metrics_samples` generations more, about 4 times as long.
+  was before decoding: 3 × `n_metrics_samples` generations more, about 4 times as
+  long.
   `Validation/Inpainting/` has one curve per metric and third:
   `Fd_dac_cond_<third>` (`Fd_encodec_` on EnCodec), `Kl_cond/real_gen_<third>`,
   `Kl_cond/gen_real_<third>` — the frames of that third against the same third
@@ -1022,18 +1010,19 @@ and `B` of rank `lora.rank`; `B` starts at zero, so the run starts from the base
 With `dora-rows` every row of `W + B·A` is normalized and multiplied by its own
 trained norm, which starts at the norm of that row of `W`.
 
-| `lora.targets` | Layers of every block | Outside the blocks |
-|---|---|---|
-| `attention` | `attn.qkv`, `attn.proj`, `cross_attn.q/kv/proj` | none |
-| `blocks` | the same + `mlp.w1/w2/w3` | none |
-| `sa3` | the same | `t_embedder.mlp`, `global_encoder`, `input_proj`, `final_layer.linear` |
+| `lora.targets` | Layers |
+|---|---|
+| `all` (default) | every `Linear` and `Conv1d` of the model |
+| `blocks` | `attn.qkv`, `attn.proj`, `cross_attn.q/kv/proj`, `mlp.proj`, `mlp.out` |
+| `attention` | `attn.qkv`, `attn.proj`, `cross_attn.q/kv/proj` |
 
-The per-block `adaLN_modulation`, `frame_encoder`, `frame_reinject*` and
-`inpaint_embed` are never adapted.
+A LoRA run always trains with AdamW at `lora.lr` (1e-4), a constant learning rate
+without warmup and no EMA; betas and weight decay come from `training.adam_betas` and
+`training.weight_decay` (0.9/0.95, 0.01), on every adapter.
 
 ```bash
 python launch_training_cond.py --run_name <name> \
-    model.kind=L model.qk_norm=false \
+    model.kind=L \
     'conditioning.enabled_frame=[energy]' \
     paths.dataset_root=<new dataset>/latents \
     paths.wav_root=<new dataset>/wav \
@@ -1041,26 +1030,22 @@ python launch_training_cond.py --run_name <name> \
     paths.cache_dir=<new cache> \
     paths.init_from=<base checkpoint> \
     paths.normalizer_from=<base cache>/normalizer.pt \
-    lora.adapter=dora-rows lora.rank=16 lora.targets=blocks \
-    training.num_steps=10001 training.warmup_steps=0 \
-    training.weight_decay=0.01 \
-    training.weight_decay_matrices_only=false \
-    'training.adam_betas=[0.9,0.95]' \
+    lora.adapter=dora-rows lora.rank=16 \
+    training.num_steps=10001 \
     intervals.val=500 intervals.audio=1000 \
     intervals.metrics=1000 intervals.ckpt=500
 ```
 
-- **The base.** Only its weights are read (the EMA ones if it has them), so the
-  other fields of its checkpoint are not needed. `model.*` and
-  `conditioning.enabled_*` must be the ones it was trained with and the dataset
-  must have its codec: otherwise the run stops at the start and lists the weights
-  that do not fit. A LoRA cannot add a condition.
+- **The base.** Its weights are read (the EMA ones if it has them) and its
+  `t_features` field, because the frequencies are not stored with the weights.
+  `model.*` and `conditioning.enabled_*` must be the ones it was trained with and
+  the dataset must have its codec: otherwise the run stops at the start and lists
+  the weights that do not fit, or names `model.t_features`. A LoRA cannot add a
+  condition.
 - **The normalizer.** `paths.normalizer_from` is copied into `paths.cache_dir`: the
   base expects latents scaled with it. A cache that holds another normalizer stops
   the run, so a new dataset needs a new `paths.cache_dir`.
-- **Training.** `training.use_ema` is forced to false and the optimizer holds only
-  the adapters. With `inverse_power` the learning rate stays within 0.5% of
-  `training.lr` over 10000 steps.
+- **Training.** The optimizer holds only the adapters; the base never changes.
 - **Checkpoints.** They hold the adapters and the path of the base
   (`paths.init_from`), which must stay where it is. `--resume` works as usual.
 - **Test and generation.** `test_cond.py --ckpt` and `sampling_cond.py` take the
@@ -1270,12 +1255,7 @@ FD / KL / FAD.
 | `text/clap_sim` | CLAP | CLAP's **audio** tower embeds the generation; the stored condition is already a CLAP vector |
 | `image/clip_sim` | CLIP | **Wav2CLIP** embeds the generation into CLIP's space; the stored condition is the CLIP vector of the picture |
 
-Until 2 Oct 2026 the same cosines were also two scalar curves
-(`Validation/Metrics/Audio_text_similarity`, `Audio_image_similarity`) on their
-own `sampling.n_similarity_samples` generations. Both are gone: the number is
-read in the table only. A config that still has `n_similarity_samples` is
-accepted (the key is dropped at startup, with a note); on the command line it
-stops the run, like any key that does not exist. A global with no embedder
+A global with no embedder
 installed still conditions the model; its column reads n/a. Read the absolute
 cosine of an audio-image pair knowing that it is small even when the
 conditioning works (see the probes section).
@@ -1581,16 +1561,6 @@ in its own folder (`<probe dir>/subset_NN`), so runs of different sizes sharing 
 single labels is cycled to the size asked for instead, so every label stays in.
 **More than 16**: all 16, and the startup log says so.
 
-The keys these two replaced, `n_influence_samples_valid` / `_probe` (and
-`n_influence_samples` before them), are gone. Left in a config they are removed
-at startup with a log line that names the new ones; given on the command line
-they stop the run with the same pointer.
-
-> Removed knobs, no longer read at all: `n_probes` (→ `n_probe_panels`),
-> `n_cond_plot` and its alias `n_f0_plot` (every panel is plotted), and the
-> per-condition `n_f0_probe` / `n_energy_probe` / `n_chroma_probe` /
-> `n_rhythm_probe` (already inert before). A leftover in your config does nothing.
-
 All the banks live in ONE module, `probe_conditions.py`: one bank, one
 synthesizer and one plot branch per condition (chord reuses chroma's
 synthesizer), so every condition is set up, built, drawn and scored the same
@@ -1745,9 +1715,9 @@ The command line wins over both: dotlist overrides as for the training (e.g.
 `sampling.n_metrics_samples=all metrics.codec_device=cuda`), plus the shortcuts
 `--metrics_samples N|all`, `--n_samples` (= `n_test_panels`), `--steps`,
 `--guidance`, `--seed`, `--duration_s`. A key that does not exist stops the test.
-The Euler grid is the checkpoint's `sampling.t_schedule`: e.g. `--steps 50 sampling.t_schedule=logsnr_uniform`
-tests it on Stable Audio 3's grid; the JSON records `euler_steps` and
-`t_schedule`.
+The Euler grid is the checkpoint's `sampling.t_schedule`: e.g. `--steps 50 sampling.t_schedule=uniform`
+tests it on equal steps; `sampling.guidance_type=cfg` changes the guidance. The JSON
+records `euler_steps`, `t_schedule` and `guidance_type`.
 
 **What it writes**, at the checkpoint's training step, to `runs/<run>/test_logs/`:
 
@@ -1776,7 +1746,7 @@ training's `audio/` folder (`test/`, `probe/`, `uncond/`, `ground_truth/` for an
 unconditional checkpoint; one generation per tested checkpoint), the numbers to
 `runs/<run>/test_outputs/metrics_<checkpoint>_<N|all>.json`. To keep the panel
 of every checkpoint tested on the slider: `tensorboard --logdir runs/<run>/test_logs --samples_per_plugin text=0`.
-The cost is the generation: hours for a full test split with 100 Euler steps;
+The cost is the generation: hours for a full test split with 50 Euler steps;
 `n_metrics_samples: 0` writes only the panels and the uncond cards. The codec
 decoder (DAC or EnCodec) runs on `metrics.codec_device` from the checkpoint's config unless
 overridden on the command line.
@@ -1846,7 +1816,8 @@ span each one is the source through the codec. A checkpoint trained without
 If a checkpoint requires conditions and you omit them, the script stops unless you
 pass `--allow_null_frame_conditions` / `--allow_null_global_conditions`.
 `--steps` (default 50) and `--t_schedule uniform|logsnr_uniform` (default: the checkpoint's
-`sampling.t_schedule`) set the Euler steps and where they go.
+`sampling.t_schedule`) set the Euler steps and where they go; `--guidance_type
+cfg|apg|mix` (default: the checkpoint's) the guidance.
 
 ---
 

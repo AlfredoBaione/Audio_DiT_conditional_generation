@@ -23,7 +23,6 @@ CODECS = {
     "dac_44khz": CodecSpec("dac_44khz", "DAC", 44100, 512, 72),
     "encodec_32khz": CodecSpec("encodec_32khz", "EnCodec", 32000, 640, 128),
 }
-CODEC_NAMES = tuple(CODECS)
 DEFAULT_CODEC = "dac_44khz"
 
 _ENCODEC_HF_ID = {"encodec_32khz": "facebook/encodec_32khz"}

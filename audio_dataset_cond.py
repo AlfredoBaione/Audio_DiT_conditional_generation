@@ -62,7 +62,6 @@ class ConditionedAudioDataset(Dataset):
         self.normalizer     = normalizer
         self.duration_s     = duration_s
         self.registry       = registry
-        self.preload_latents = preload_latents
         self.strict_conditions = strict_conditions
         self._cond_warned = False
 

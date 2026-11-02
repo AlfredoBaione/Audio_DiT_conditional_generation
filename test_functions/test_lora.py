@@ -18,12 +18,13 @@ from network_cond import ConditionedAudioDiT
 B, N, TOKEN_DIM = 2, 64, 72
 
 
-def build(kind="S", seed=0):
+def build(kind="S", seed=0, adaln="shared"):
     torch.manual_seed(seed)
     model = ConditionedAudioDiT(kind=kind, token_dim=TOKEN_DIM, frame_cond_dims={"energy": 1},
-                                frame_cond_out_dims={"energy": 16}, frame_reinject_every=1)
+                                frame_cond_out_dims={"energy": 16}, frame_reinject_every=1,
+                                adaln=adaln)
     for p in model.parameters():
-        if p.dim() == 2 and p.abs().sum() == 0:
+        if p.dim() >= 2 and p.abs().sum() == 0:
             nn.init.normal_(p, std=0.02)
     return model.eval()
 
@@ -34,12 +35,13 @@ def run(model):
     return model(x, t, frame_conditions={"energy": torch.randn(B, N, 1)})
 
 
-def adapted(tmp, adapter, targets="blocks", rank=4):
-    base = build()
+def adapted(tmp, adapter, targets="blocks", rank=4, adaln="shared"):
+    base = build(adaln=adaln)
     path = str(Path(tmp) / f"base_{adapter}_{targets}.pt")
-    torch.save({"model_state_dict": base.state_dict()}, path)
-    model = build(seed=1)
+    torch.save({"model_state_dict": base.state_dict(), "t_features": "high_freq"}, path)
+    model = build(seed=1, adaln=adaln)
     cfg = OmegaConf.create({"paths": {"init_from": path},
+                            "model": {"t_features": "high_freq"},
                             "lora": {"adapter": adapter, "rank": rank, "targets": targets}})
     lora.attach(model, cfg)
     return base, model, path, cfg
@@ -75,14 +77,56 @@ def test_only_the_adapters_train():
 
 
 def test_targets():
-    per_block = {"attention": 2, "blocks": 5, "sa3": 5}
+    per_block = {"attention": 2, "blocks": 4}
     with tempfile.TemporaryDirectory() as tmp:
         for targets, n in per_block.items():
             _, model, _, _ = adapted(tmp, "lora", targets=targets)
             layers = {k.split(".parametrizations.")[0] for k in lora.adapter_state(model)}
-            outside = 4 if targets == "sa3" else 0
-            assert len(layers) == n * len(model.blocks) + outside, (targets, len(layers))
+            assert len(layers) == n * len(model.blocks), (targets, len(layers))
             assert not [k for k in layers if "adaLN" in k or "frame" in k or "inpaint" in k]
+
+        _, model, _, _ = adapted(tmp, "lora", targets="all")
+        layers = {k.split(".parametrizations.")[0] for k in lora.adapter_state(model)}
+        want = {n for n, m in model.named_modules() if isinstance(m, (nn.Linear, nn.Conv1d))}
+        assert layers == want, sorted(layers ^ want)
+        for name in ("pre_conv", "post_conv", "input_proj", "output_proj", "adaLN.0",
+                     "t_embedder.mlp.0", "blocks.0.mlp.proj"):
+            assert name in layers, name
+
+
+def test_every_linear_and_conv_with_all():
+    with tempfile.TemporaryDirectory() as tmp, torch.no_grad():
+        for adapter in lora.ADAPTERS:
+            base, model, path, _ = adapted(tmp, adapter, targets="all")
+            with torch.enable_grad():
+                train_steps(model)
+            ckpt = {"model_state_dict": lora.adapter_state(model), "step": 3}
+            plain = build(seed=2)
+            plain.load_state_dict(lora.merge_checkpoint(ckpt, path)["model_state_dict"])
+            assert torch.equal(run(plain), run(model))
+            assert not torch.equal(run(plain), run(base))
+            assert model.pre_conv.parametrizations.weight[0].lora_A.shape == (4, model.pre_conv.in_channels)
+
+
+def test_per_block_adaln():
+    with tempfile.TemporaryDirectory() as tmp, torch.no_grad():
+        for targets, n in {"attention": 2, "blocks": 4}.items():
+            _, model, _, _ = adapted(tmp, "lora", targets=targets, adaln="per_block")
+            layers = {k.split(".parametrizations.")[0] for k in lora.adapter_state(model)}
+            assert len(layers) == n * len(model.blocks), (targets, len(layers))
+            assert not [k for k in layers if "adaLN" in k or "final_layer" in k]
+        for adapter in lora.ADAPTERS:
+            base, model, path, _ = adapted(tmp, adapter, targets="all", adaln="per_block")
+            layers = {k.split(".parametrizations.")[0] for k in lora.adapter_state(model)}
+            for name in ("blocks.0.adaLN.1", "final_layer.adaLN.1", "final_layer.linear"):
+                assert name in layers, name
+            with torch.enable_grad():
+                train_steps(model)
+            ckpt = {"model_state_dict": lora.adapter_state(model), "step": 3}
+            plain = build(seed=2, adaln="per_block")
+            plain.load_state_dict(lora.merge_checkpoint(ckpt, path)["model_state_dict"])
+            assert torch.equal(run(plain), run(model))
+            assert not torch.equal(run(plain), run(base))
 
 
 def test_merge_is_the_adapted_model():
@@ -124,6 +168,18 @@ def test_a_base_that_does_not_fit_stops():
             assert "does not fit" in str(e)
         else:
             raise AssertionError("a B model took the weights of an S model")
+
+
+def test_a_base_with_other_time_features_stops():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, _, _, cfg = adapted(tmp, "lora")
+        cfg.model.t_features = "low_freq"
+        try:
+            lora.attach(build(), cfg)
+        except SystemExit as e:
+            assert "t_features" in str(e)
+        else:
+            raise AssertionError("a base with other time features was accepted")
 
 
 def test_normalizer_of_another_dataset_stops():

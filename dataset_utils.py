@@ -10,7 +10,6 @@ from typing import Optional, Tuple, List
 
 import latent_codec as lc
 
-MAX_FRAMES = 4096
 
 SUPPORTED_EXTS   = {".npy"}
 

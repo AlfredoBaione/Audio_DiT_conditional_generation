@@ -11,12 +11,11 @@ import torch.nn.utils.parametrize as parametrize
 
 ADAPTERS = ("lora", "dora-rows")
 _ATTENTION = r"\.attn\.(qkv|proj)$|\.cross_attn\.(q|kv|proj)$"
-_BLOCKS = _ATTENTION + r"|\.mlp\.w[123]$"
+_BLOCKS = _ATTENTION + r"|\.mlp\.(proj|out)$"
 TARGETS = {
     "attention": _ATTENTION,
     "blocks": _BLOCKS,
-    "sa3": _BLOCKS + r"|^t_embedder\.mlp\.[02]$|^global_encoder\.|^input_proj$"
-                     r"|^final_layer\.linear$",
+    "all": r"",
 }
 _ADAPTER_KEY = ".parametrizations.weight.0."
 
@@ -43,24 +42,27 @@ def check_config(cfg):
 
 
 def adapted_weight(weight, lora_A, lora_B, magnitude=None, strength=1.0):
+    rows = weight.reshape(weight.shape[0], -1)
     if magnitude is None:
-        return weight + strength * (lora_B @ lora_A)
+        return (rows + strength * (lora_B @ lora_A)).reshape(weight.shape)
     if strength == 0:
         return weight
-    v = weight + strength * (lora_B @ lora_A)
+    v = rows + strength * (lora_B @ lora_A)
     if strength != 1:
-        base_norm = weight.norm(dim=1)
+        base_norm = rows.norm(dim=1)
         magnitude = base_norm + strength * (magnitude - base_norm)
-    return v / (v.norm(dim=1, keepdim=True) + 1e-12) * magnitude.unsqueeze(1)
+    v = v / (v.norm(dim=1, keepdim=True) + 1e-12) * magnitude.unsqueeze(1)
+    return v.reshape(weight.shape)
 
 
 class Adapter(nn.Module):
     def __init__(self, weight, rank, adapter):
         super().__init__()
-        self.lora_A = nn.Parameter(torch.zeros(rank, weight.shape[1], device=weight.device))
-        self.lora_B = nn.Parameter(torch.zeros(weight.shape[0], rank, device=weight.device))
+        rows = weight.detach().reshape(weight.shape[0], -1)
+        self.lora_A = nn.Parameter(torch.zeros(rank, rows.shape[1], device=weight.device))
+        self.lora_B = nn.Parameter(torch.zeros(rows.shape[0], rank, device=weight.device))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        self.magnitude = (nn.Parameter(weight.detach().norm(dim=1))
+        self.magnitude = (nn.Parameter(rows.norm(dim=1))
                           if adapter == "dora-rows" else None)
 
     def forward(self, weight):
@@ -76,6 +78,13 @@ def base_weights(path):
 
 def attach(model, cfg):
     path = cfg.paths.init_from
+    t_features = cfg.model.get("t_features", "high_freq")
+    base_t_features = torch.load(path, map_location="cpu", weights_only=False,
+                                 mmap=True)["t_features"]
+    if base_t_features != t_features:
+        raise SystemExit(f"[lora] {path} was trained with model.t_features="
+                         f"{base_t_features}, this run builds {t_features}: set "
+                         f"model.t_features={base_t_features}.")
     try:
         model.load_state_dict(base_weights(path))
     except RuntimeError as e:
@@ -85,7 +94,7 @@ def attach(model, cfg):
     model.requires_grad_(False)
     pattern = re.compile(TARGETS[cfg.lora.targets])
     layers = [m for n, m in model.named_modules()
-              if isinstance(m, nn.Linear) and pattern.search(n)]
+              if isinstance(m, (nn.Linear, nn.Conv1d)) and pattern.search(n)]
     for m in layers:
         parametrize.register_parametrization(
             m, "weight", Adapter(m.weight, int(cfg.lora.rank), cfg.lora.adapter),

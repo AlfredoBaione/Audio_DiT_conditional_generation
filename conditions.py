@@ -1094,10 +1094,6 @@ class ConditionRegistry:
         return list(self.frame_extractors.keys())
 
     @property
-    def global_names(self) -> List[str]:
-        return list(self.global_extractors.keys())
-
-    @property
     def frame_cond_dims(self) -> Dict[str, int]:
         return {n: e.dim for n, e in self.frame_extractors.items()}
 
@@ -1144,20 +1140,15 @@ class FrameConditionEncoder(nn.Module):
 class GlobalConditionEncoder(nn.Module):
     def __init__(self, global_configs: Dict[str, dict], hidden_size: int):
         super().__init__()
-        self.encoders = nn.ModuleDict()
-        for name, cfg in global_configs.items():
-            self.encoders[name] = nn.Sequential(
-                nn.Linear(cfg["dim"], hidden_size), nn.SiLU(),
-                nn.Linear(hidden_size, hidden_size),
-            )
-        self.final_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.names = sorted(global_configs)
+        dim = sum(int(global_configs[name]["dim"]) for name in self.names)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_size, bias=False), nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=False),
+        )
 
-    def forward(self, conditions: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
-        embs = [enc(conditions[name]) for name, enc in self.encoders.items()
-                if name in conditions]
-        if not embs:
-            return None
-        return self.final_norm(torch.stack(embs, dim=0).sum(dim=0))
+    def forward(self, conditions: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.mlp(torch.cat([conditions[name] for name in self.names], dim=-1))
 
 
 def make_null_frame_conditions(B: int, n_frames: int,

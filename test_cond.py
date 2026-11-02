@@ -122,6 +122,7 @@ def load_config():
     if args.seed is not None:
         cfg.metrics.seed = int(args.seed)
     tc.t_schedule_of(cfg.sampling)
+    tc.guidance_type_of(cfg.sampling)
 
     if args.run_name is not None:
         run_name = args.run_name
@@ -258,7 +259,7 @@ def main():
     print(f"[test_cond] Frame re-injection:    "
           f"{'every ' + str(frame_reinject_every) + ' block(s)' if frame_reinject_every > 0 else 'OFF'}")
 
-    text_cross_every = ckpt["text_cross_every"]
+    text_conditioning = ckpt["text_conditioning"]
     text_ctx_dim = ckpt_text_ctx_dim(ckpt)
     attention = ckpt["attention"]
     qk_norm = ckpt["qk_norm"]
@@ -271,6 +272,7 @@ def main():
              if inpaint_only else ""))
     print(f"[test_cond] Euler steps:           {cfg.sampling.euler_steps} | "
           f"t schedule: {tc.t_schedule_of(cfg.sampling)}")
+    print(f"[test_cond] Guidance type:         {tc.guidance_type_of(cfg.sampling)}")
 
     model = ConditionedAudioDiT(
         kind=model_kind,
@@ -278,10 +280,13 @@ def main():
         frame_cond_out_dims=frame_cond_out_dims,
         global_cond_configs=global_configs,
         frame_reinject_every=frame_reinject_every,
-        text_cross_every=text_cross_every,
+        text_conditioning=text_conditioning,
         text_ctx_dim=text_ctx_dim,
         attention=attention,
         qk_norm=qk_norm,
+        memory_tokens=ckpt["memory_tokens"],
+        t_features=ckpt["t_features"],
+        adaln=ckpt["adaln"],
         inpainting=inpainting,
         token_dim=CODEC.latent_dim,
     ).to(device)
@@ -544,6 +549,7 @@ def main():
         "n_scored": n_scored, "n_test": total,
         "seed": metrics_seed,
         "guidance": float(cfg.conditioning.guidance_scale),
+        "guidance_type": tc.guidance_type_of(cfg.sampling),
         "euler_steps": int(cfg.sampling.euler_steps),
         "t_schedule": tc.t_schedule_of(cfg.sampling),
         "metrics_enabled": metrics_enabled, "fad_reference": fad_mode,

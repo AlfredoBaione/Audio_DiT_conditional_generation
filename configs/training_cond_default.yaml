@@ -6,9 +6,12 @@ model:
   duration_s: 5.0
   drop: 0.0                  # FFN dropout, 0 = off
   frame_reinject_every: 1    # 0 = off; N = every N blocks
-  text_cross_every: 0        # 0 = off; N = every N blocks
+  text_conditioning: ada     # ada | cross_att | all
   attention: standard        # standard | differential
   qk_norm: true
+  memory_tokens: 64          # 0 = off
+  t_features: high_freq      # high_freq | low_freq
+  adaln: shared              # shared | per_block
 
 data:
   train_batch_size: 8
@@ -21,24 +24,30 @@ data:
 
 training:
   num_steps: 1000001
-  lr: 1.0e-4
-  lr_schedule: inverse_power # inverse_power | cosine
+  optimizer: muon            # muon | adamw
+  lr: 5.0e-5                 # adamw: every parameter; muon: parameters with ndim < 2
+  muon_lr: 1.0e-3            # muon: parameters with ndim >= 2
+  muon_momentum: 0.95
+  lr_schedule: inverse_power # inverse_power | cosine | constant
   lr_inv_gamma: 1.0e6
   lr_power: 0.5
+  lr_warmup: 0.995           # inverse_power: 1 - x^(step + 1); 0 = linear over warmup_steps
   seed: 42
   strict_conditions: true    # false = missing conditions zero-filled (debug only)
-  weight_decay: 0.0
-  weight_decay_matrices_only: true
-  adam_betas: [0.9, 0.999]
+  weight_decay: 0.01
+  weight_decay_matrices_only: true   # adamw only
+  adam_betas: [0.9, 0.95]
   adam_eps: 1.0e-8
   grad_clip:    0.0          # 0 = off
   use_amp:      false
-  t_sampler: logit_normal    # logit_normal | truncated_logit | uniform
+  t_sampler: truncated_logit # logit_normal | truncated_logit | uniform
+  ot_coupling: true
   warmup_steps: 5000
   decay_start_frac: 0.8      # cosine only
   use_ema:    true
-  ema_decay:  0.9999
-  ema_start:  5000
+  ema_decay:  0.9995
+  ema_start:  0
+  ema_power:  0.75           # decay = min(ema_decay, 1 - (1 + n)^-power); 0 = constant
   inpainting: false
   inpaint_masks: [0.8, 0.1, 0.05, 0.05]   # full mask, random spans, continuation, backward continuation
 
@@ -50,10 +59,9 @@ intervals:
   keep_last_n_ckpts: 5
 
 sampling:
-  euler_steps: 100
-  t_min: 0.001
-  t_max: 0.999
-  t_schedule: uniform        # uniform | logsnr_uniform
+  euler_steps: 50
+  t_schedule: logsnr_uniform # uniform | logsnr_uniform
+  guidance_type: apg         # cfg | apg | mix
   n_audio_samples: 4
   n_test_panels: 8
   n_probe_panels: 8
@@ -87,7 +95,8 @@ conditioning:
 lora:
   adapter: null              # null = off | lora | dora-rows; needs paths.init_from, paths.normalizer_from
   rank: 16
-  targets: blocks            # attention | blocks | sa3
+  targets: all               # attention | blocks | all
+  lr: 1.0e-4
 
 paths:
   dataset_root:   "./dataset_ready_cond/latents"

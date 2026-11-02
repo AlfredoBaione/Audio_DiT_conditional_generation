@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import soundfile as sf
 
@@ -33,44 +34,39 @@ from conditions import (
 )
 
 
-T_MIN = 0.001
-T_MAX = 0.999
-
-
 T_SCHEDULES = ("uniform", "logsnr_uniform")
 
-LOGSNR_MIN, LOGSNR_MAX = -6.2, 2.0
+LOGSNR_START, LOGSNR_END = -6.2, 2.0
 
 
-def logsnr_uniform_grid(steps, t_start=None):
+def euler_grid(steps, schedule="uniform", t_start=1.0):
     n = int(steps)
     if n < 1:
-        raise ValueError(f"logsnr_uniform_grid: steps must be >= 1, got {steps}")
-    first = 1.0 / (1.0 + math.exp(-LOGSNR_MIN))
-    last = 1.0 / (1.0 + math.exp(-LOGSNR_MAX))
-    if t_start is None or t_start <= first:
-        lo, start = LOGSNR_MIN, 0.0
-    elif t_start < last:
-        lo, start = math.log(t_start / (1.0 - t_start)), float(t_start)
-    else:
-        dt = (1.0 - t_start) / n
-        return [t_start + i * dt for i in range(n)] + [1.0]
-    hi = LOGSNR_MAX
-    inner = [1.0 / (1.0 + math.exp(-(lo + k * (hi - lo) / n)))
-             for k in range(1, n)]
-    return [start] + inner + [1.0]
-
-
-def euler_grid(steps, t_lo, t_hi, schedule="uniform", t_start=None):
-    if schedule == "uniform":
-        lo = t_lo if t_start is None else t_start
-        dt = (t_hi - lo) / steps
-        return [(lo + i * dt, dt) for i in range(steps)]
+        raise ValueError(f"euler_grid: steps must be >= 1, got {steps}")
+    if schedule not in T_SCHEDULES:
+        raise ValueError(f"t_schedule {schedule!r}: expected one of "
+                         f"{list(T_SCHEDULES)}")
+    g = [t_start * (1.0 - i / n) for i in range(n + 1)]
     if schedule == "logsnr_uniform":
-        g = logsnr_uniform_grid(steps, t_start)
-        return [(g[i], g[i + 1] - g[i]) for i in range(len(g) - 1)]
-    raise ValueError(f"t_schedule {schedule!r}: expected one of "
-                     f"{list(T_SCHEDULES)}")
+        g = ([g[0]]
+             + [1.0 / (1.0 + math.exp(LOGSNR_END - t * (LOGSNR_END - LOGSNR_START)))
+                for t in g[1:-1]]
+             + [0.0])
+    return [(g[i], g[i + 1] - g[i]) for i in range(n)]
+
+
+GUIDANCE_TYPES = {"cfg": 0.0, "mix": 0.5, "apg": 1.0}
+
+
+def guided_velocity(x, t, v_c, v_u, guidance, guidance_type):
+    a = GUIDANCE_TYPES[guidance_type]
+    den_c = x - t * v_c
+    diff = t * (v_u - v_c)
+    if a != 0.0:
+        unit = F.normalize(den_c, dim=(-2, -1))
+        orthogonal = diff - (diff * unit).sum(dim=(-2, -1), keepdim=True) * unit
+        diff = a * orthogonal + (1.0 - a) * diff
+    return (x - (den_c + (guidance - 1.0) * diff)) / t
 
 
 @torch.no_grad()
@@ -79,23 +75,23 @@ def euler_sampling_cfg(
     frame_cond=None, global_cond=None,
     guidance=3.0, steps=50,
     frame_dims=None, global_configs=None,
-    x_start=None, t_start=0.0,
+    x_start=None, t_start=1.0,
     use_amp=True, text_ctx=None, t_schedule="uniform", inpaint=None,
+    guidance_type="apg",
 ):
     model.eval()
-    from_noise = x_start is None or t_start <= 0.0
 
     if x_start is not None:
         x = x_start.to(device)
     else:
         x = torch.randn(1, n_frames, lc.active().latent_dim, device=device)
-        t_start = T_MIN
+        t_start = 1.0
 
     null_fc = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
     null_gc = make_null_global_conditions(1, global_configs or {}, device)
 
     ctx = ctx_mask = None
-    if getattr(model, "text_cross_layers", None) and text_ctx is not None:
+    if getattr(model, "text_in_cross", None) and text_ctx is not None:
         ctx = text_ctx["tokens"].to(device)
         ctx_mask = text_ctx["mask"].to(device)
 
@@ -105,17 +101,15 @@ def euler_sampling_cfg(
         ip_lat = inpaint[1].to(device=device, dtype=torch.float32).view(1, n_frames, -1)
         ip_ctx = torch.cat([ip_m, ip_lat * ip_m], dim=-1)
 
-    actual_start = min(max(t_start, T_MIN), T_MAX)
-    grid = euler_grid(steps, T_MIN, T_MAX, t_schedule,
-                      t_start=None if from_noise else actual_start)
+    has_cond = ((frame_cond is not None) or (global_cond is not None)
+                or (ctx is not None))
+    use_cfg = guidance > 1.0 and has_cond
 
-    for tv, dt in grid:
+    for tv, dt in euler_grid(steps, t_schedule, t_start):
         t = torch.ones(1, device=device) * tv
 
         with torch.amp.autocast('cuda', enabled=use_amp):
-            has_cond = ((frame_cond is not None) or (global_cond is not None)
-                        or (ctx is not None))
-            if guidance > 1.0 and has_cond:
+            if use_cfg:
                 fc = frame_cond if frame_cond else null_fc
                 gc = global_cond if global_cond else null_gc
                 v_c = model(x, t, frame_conditions=fc, global_conditions=gc,
@@ -123,13 +117,14 @@ def euler_sampling_cfg(
                             inpaint_context=ip_ctx)
                 v_u = model(x, t, frame_conditions=null_fc, global_conditions=null_gc,
                             text_context=None, inpaint_context=ip_ctx)
-                v = v_u + guidance * (v_c - v_u)
             else:
                 v = model(x, t,
                           frame_conditions=frame_cond or null_fc,
                           global_conditions=global_cond or null_gc,
                           text_context=ctx, text_context_mask=ctx_mask,
                           inpaint_context=ip_ctx)
+        if use_cfg:
+            v = guided_velocity(x, tv, v_c.float(), v_u.float(), guidance, guidance_type)
         x = x + v.float() * dt
 
     if ip_m is not None:
@@ -163,7 +158,7 @@ def edit_audio(
     frame_cond_builder=None, global_cond=None,
     edit_strength=0.3, guidance=3.0, steps=50,
     frame_dims=None, global_configs=None,
-    use_amp=True, text_ctx=None, t_schedule="uniform",
+    use_amp=True, text_ctx=None, t_schedule="uniform", guidance_type="apg",
 ):
     spec = lc.active()
     x1 = encode_source(normalizer, source_path, device)
@@ -182,17 +177,17 @@ def edit_audio(
               "codec round-trip, no integration.")
         frames = x1.squeeze(0)
     else:
-        t_start = 1.0 - edit_strength
         noise = torch.randn_like(x1)
-        x_corrupted = (1 - t_start) * noise + t_start * x1
+        x_corrupted = (1 - edit_strength) * x1 + edit_strength * noise
 
         frames = euler_sampling_cfg(
             model, n_frames, device,
             frame_cond=frame_cond, global_cond=global_cond,
             guidance=guidance, steps=steps,
             frame_dims=frame_dims, global_configs=global_configs,
-            x_start=x_corrupted, t_start=t_start,
+            x_start=x_corrupted, t_start=edit_strength,
             use_amp=use_amp, text_ctx=text_ctx, t_schedule=t_schedule,
+            guidance_type=guidance_type,
         )
 
     z_out = normalizer.denormalize(frames.T)
@@ -209,7 +204,7 @@ def inpaint_audio(
     frame_cond_builder=None, global_cond=None,
     guidance=3.0, steps=50, n_samples=1,
     frame_dims=None, global_configs=None,
-    use_amp=True, text_ctx=None, t_schedule="uniform",
+    use_amp=True, text_ctx=None, t_schedule="uniform", guidance_type="apg",
 ):
     spec = lc.active()
     x1 = encode_source(normalizer, source_path, device)
@@ -239,7 +234,7 @@ def inpaint_audio(
             guidance=guidance, steps=steps,
             frame_dims=frame_dims, global_configs=global_configs,
             use_amp=use_amp, text_ctx=text_ctx, t_schedule=t_schedule,
-            inpaint=(keep, x1[0]),
+            inpaint=(keep, x1[0]), guidance_type=guidance_type,
         )
         z_out = normalizer.denormalize(frames.T)
         wavs.append(lc.decode(codec_model, z_out.unsqueeze(0).float()).squeeze())
@@ -403,10 +398,15 @@ def main():
     parser.add_argument("--strength", type=float, default=0.3,
                         help="Edit strength 0-1")
     parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--guidance_type", choices=list(GUIDANCE_TYPES), default=None,
+                        help="cfg: the whole difference between the two predictions; "
+                             "apg: only its part orthogonal to the conditioned "
+                             "prediction; mix: half and half. Default: the "
+                             "checkpoint's sampling.guidance_type.")
     parser.add_argument("--t_schedule", choices=list(T_SCHEDULES), default=None,
                         help="Where the Euler steps go along t: 'uniform' "
-                             "(equal steps) or 'logsnr_uniform' (Stable Audio 3's grid, "
-                             "equally spaced in log-SNR, crowded at the noise "
+                             "(equal steps) or 'logsnr_uniform' (equally spaced in "
+                             "log-SNR, crowded at the noise "
                              "end). Default: the one the checkpoint's run "
                              "generated with (its sampling.t_schedule).")
     parser.add_argument("--lora_strength", type=float, default=1.0,
@@ -460,7 +460,7 @@ def main():
     global_configs_ckpt = ckpt["global_configs"]
 
     frame_reinject_every = ckpt["frame_reinject_every"]
-    text_cross_every = ckpt["text_cross_every"]
+    text_conditioning = ckpt["text_conditioning"]
     text_ctx_dim = ckpt_text_ctx_dim(ckpt)
     attention = ckpt["attention"]
     qk_norm = ckpt["qk_norm"]
@@ -472,10 +472,13 @@ def main():
         frame_cond_out_dims=frame_cond_out_dims,
         global_cond_configs=global_configs_ckpt,
         frame_reinject_every=frame_reinject_every,
-        text_cross_every=text_cross_every,
+        text_conditioning=text_conditioning,
         text_ctx_dim=text_ctx_dim,
         attention=attention,
         qk_norm=qk_norm,
+        memory_tokens=ckpt["memory_tokens"],
+        t_features=ckpt["t_features"],
+        adaln=ckpt["adaln"],
         inpainting=inpainting,
         token_dim=CODEC.latent_dim,
     ).to(device)
@@ -495,8 +498,12 @@ def main():
     normalizer.load(norm_path)
 
     t_schedule = args.t_schedule or ckpt["config"]["sampling"]["t_schedule"]
+    guidance_type = (args.guidance_type
+                     or ckpt["config"]["sampling"].get("guidance_type", "apg"))
     print(f"Euler steps: {args.steps} | t schedule: {t_schedule}"
           + (" (the checkpoint's)" if args.t_schedule is None else ""))
+    print(f"Guidance type: {guidance_type}"
+          + (" (the checkpoint's)" if args.guidance_type is None else ""))
 
     text_ctx_out = {}
     gc = build_global_cond(
@@ -574,7 +581,7 @@ def main():
                 global_cond=gc if gc else None,
                 guidance=args.guidance, steps=args.steps,
                 frame_dims=frame_dims, global_configs=global_configs,
-                text_ctx=prompt_ctx, t_schedule=t_schedule,
+                text_ctx=prompt_ctx, t_schedule=t_schedule, guidance_type=guidance_type,
             )
             with torch.no_grad():
                 z = normalizer.denormalize(gen.T)
@@ -602,7 +609,7 @@ def main():
             edit_strength=args.strength, guidance=args.guidance,
             steps=args.steps,
             frame_dims=frame_dims, global_configs=global_configs,
-            text_ctx=prompt_ctx, t_schedule=t_schedule,
+            text_ctx=prompt_ctx, t_schedule=t_schedule, guidance_type=guidance_type,
         )
         tag = _out_tag("edited")
         p = os.path.join(args.output, f"edit_{tag}.wav")
@@ -635,7 +642,7 @@ def main():
             guidance=args.guidance, steps=args.steps,
             n_samples=args.n_samples,
             frame_dims=frame_dims, global_configs=global_configs,
-            text_ctx=prompt_ctx, t_schedule=t_schedule,
+            text_ctx=prompt_ctx, t_schedule=t_schedule, guidance_type=guidance_type,
         )
         tag = _out_tag("inpainted")
         for i, wav in enumerate(wavs):

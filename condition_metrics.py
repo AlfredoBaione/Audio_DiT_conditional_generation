@@ -487,7 +487,7 @@ def format_influence_matrix(entries: list, step: int, prefix: str = "EMA",
 
     for label, infl, cov in entries:
         lines.append("")
-        lines.append(f"---")
+        lines.append("---")
         lines.append(f"**{label}**")
         lines.append("")
         body = format_influence_panel(infl, step, prefix=prefix,
@@ -781,7 +781,6 @@ class ConditionFidelityEvaluator:
             if callable(getattr(extractor, "prepare", None)):
                 extractor.prepare()
 
-        self.family = family
         self.fidelity_fns, self.families = {}, {}
         for name in self.extractors:
             self.fidelity_fns[name], self.families[name] = fidelity_fn(
@@ -791,7 +790,6 @@ class ConditionFidelityEvaluator:
         self.reset()
 
     def reset(self):
-        self._sums = defaultdict(float)
         self._counts = defaultdict(int)
         self._attempted = defaultdict(int)
         self._non_finite = defaultdict(int)
@@ -843,7 +841,6 @@ class ConditionFidelityEvaluator:
                 key = f"{name}/{k}"
                 self._attempted[key] += 1
                 if np.isfinite(v):
-                    self._sums[key] += float(v)
                     self._counts[key] += 1
                     self._per_sample[key][sid] = float(v)
                 else:
@@ -851,7 +848,6 @@ class ConditionFidelityEvaluator:
 
     def export_state(self) -> dict:
         return {
-            "sums": dict(self._sums),
             "counts": dict(self._counts),
             "attempted": dict(self._attempted),
             "non_finite": dict(self._non_finite),
@@ -861,7 +857,7 @@ class ConditionFidelityEvaluator:
         }
 
     def merge_state(self, state: dict):
-        for name in ("sums", "counts", "attempted", "non_finite",
+        for name in ("counts", "attempted", "non_finite",
                      "extract_errors", "cond_attempted"):
             mine = getattr(self, "_" + name)
             for k, v in (state.get(name) or {}).items():
@@ -892,10 +888,3 @@ class ConditionFidelityEvaluator:
 
     def per_sample(self) -> dict:
         return {k: dict(v) for k, v in self._per_sample.items()}
-
-    def results(self) -> dict:
-        return {
-            k: self._sums[k] / self._counts[k]
-            for k in self._sums
-            if self._counts[k] > 0
-        }

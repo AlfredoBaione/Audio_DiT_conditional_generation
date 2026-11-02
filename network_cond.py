@@ -7,20 +7,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataset_utils import  MAX_FRAMES
 from conditions import FrameConditionEncoder, GlobalConditionEncoder
 
 
 
 ATTENTION_KINDS = ("standard", "differential")
+TEXT_CONDITIONING_KINDS = ("ada", "cross_att", "all")
+ADALN_KINDS = ("shared", "per_block")
+T_FEATURE_CYCLES = {
+    "high_freq": (0.5, 10000.0),
+    "low_freq": (1e-4 / (2 * math.pi), 1.0 / (2 * math.pi)),
+}
 QK_NORM_EPS = 1e-6
 
 
-def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+def left_pad(x: torch.Tensor, length: int) -> torch.Tensor:
+    return F.pad(x, (0, 0, length - x.shape[1], 0))
 
 
-def qk_rms_norm(norm: Optional[nn.Module], x: torch.Tensor) -> torch.Tensor:
+def fp32_norm(norm: Optional[nn.Module], x: torch.Tensor) -> torch.Tensor:
     if norm is None:
         return x
     with torch.autocast(device_type=x.device.type, enabled=False):
@@ -40,230 +45,162 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    r = cos.shape[-1]
+    rotated, rest = x[..., :r], x[..., r:]
+    return torch.cat((rotated * cos + rotate_half(rotated) * sin, rest), dim=-1)
 
 
-def compute_default_rope_parameters(head_dim: int, theta: float = 10000.0) -> torch.Tensor:
-    return 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float() / head_dim))
+def rope_dim(head_dim: int) -> int:
+    return max(head_dim // 2, 32)
+
+
+def rope_inv_freq(rot_dim: int, theta: float = 10000.0) -> torch.Tensor:
+    return 1.0 / (theta ** (torch.arange(0, rot_dim, 2, dtype=torch.int64).float() / rot_dim))
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(self, hidden_size, t_features="high_freq", n_features=256):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.Linear(n_features, hidden_size, bias=True),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
+        ramp = torch.linspace(0, 1, n_features // 2)
+        log_min, log_max = map(math.log, T_FEATURE_CYCLES[t_features])
+        self.register_buffer("freqs", torch.exp(ramp * (log_max - log_min) + log_min),
+                             persistent=False)
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
+        args = t[:, None] * self.freqs * 2 * math.pi
+        return self.mlp(torch.cat([torch.cos(args), torch.sin(args)], dim=-1))
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, n_heads: int, max_seq_len: int = 4096,
+    def __init__(self, hidden_size: int, n_heads: int, differential: bool = False,
                  theta: float = 10000.0, qk_norm: bool = False):
         super().__init__()
         assert hidden_size % n_heads == 0
         self.n_heads  = n_heads
         self.head_dim = hidden_size // n_heads
+        self.n_proj   = 5 if differential else 3
 
-        self.qkv  = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
+        self.qkv  = nn.Linear(hidden_size, self.n_proj * hidden_size, bias=False)
         self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.q_norm, self.k_norm = make_qk_norms(self.head_dim, qk_norm)
 
-        inv_freq = compute_default_rope_parameters(self.head_dim, theta=theta)
+        inv_freq = rope_inv_freq(rope_dim(self.head_dim), theta=theta)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _cos_sin(self, S: int, device, dtype):
         t = torch.arange(S, device=device, dtype=torch.float32)
         freqs = torch.outer(t, self.inv_freq.to(device=device, dtype=torch.float32))
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype)[None], emb.sin().to(dtype)[None]
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
+    def _attend(self, q, k, v, cos, sin):
+        q = apply_rotary_pos_emb(fp32_norm(self.q_norm, q), cos, sin)
+        k = apply_rotary_pos_emb(fp32_norm(self.k_norm, k), cos, sin)
+        return F.scaled_dot_product_attention(q, k, v)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, _ = x.shape
-        qkv = self.qkv(x).reshape(B, S, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        q, k = qk_rms_norm(self.q_norm, q), qk_rms_norm(self.k_norm, k)
-
+        parts = (self.qkv(x).reshape(B, S, self.n_proj, self.n_heads, self.head_dim)
+                 .permute(2, 0, 3, 1, 4).unbind(0))
+        v = parts[2]
         cos, sin = self._cos_sin(S, x.device, x.dtype)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = x.transpose(1, 2).reshape(B, S, -1)
-        return self.proj(x)
-
-
-def diff_lambda_init(layer_idx: int) -> float:
-    return 0.8 - 0.6 * math.exp(-0.3 * layer_idx)
-
-
-class DifferentialSelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, n_heads: int, layer_idx: int,
-                 max_seq_len: int = 4096, theta: float = 10000.0,
-                 qk_norm: bool = False):
-        super().__init__()
-        assert hidden_size % n_heads == 0
-        if n_heads % 2 != 0:
-            raise ValueError(
-                f"the differential attention pairs the heads two by two: "
-                f"n_heads must be even, got {n_heads}")
-        self.n_heads   = n_heads
-        self.n_diff    = n_heads // 2
-        self.head_dim  = hidden_size // n_heads
-        self.layer_idx = int(layer_idx)
-        self.lambda_init = diff_lambda_init(self.layer_idx)
-
-        self.qkv  = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
-        self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.q_norm, self.k_norm = make_qk_norms(self.head_dim, qk_norm)
-
-        inv_freq = compute_default_rope_parameters(self.head_dim, theta=theta)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        d = self.head_dim
-        self.lambda_q1 = nn.Parameter(torch.zeros(d).normal_(mean=0.0, std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(d).normal_(mean=0.0, std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(d).normal_(mean=0.0, std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(d).normal_(mean=0.0, std=0.1))
-        self.subln = nn.RMSNorm(2 * d, eps=1e-5, elementwise_affine=True)
-
-    def _cos_sin(self, S: int, device, dtype):
-        t = torch.arange(S, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq.to(device=device, dtype=torch.float32))
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype)[None], emb.sin().to(dtype)[None]
-
-    def lambda_full(self) -> torch.Tensor:
-        l1 = torch.exp(torch.sum(self.lambda_q1.float() * self.lambda_k1.float()))
-        l2 = torch.exp(torch.sum(self.lambda_q2.float() * self.lambda_k2.float()))
-        return l1 - l2 + self.lambda_init
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, C = x.shape
-        d, h = self.head_dim, self.n_diff
-        q, k, v = self.qkv(x).split(C, dim=-1)
-        q = q.reshape(B, S, 2 * h, d).transpose(1, 2)
-        k = k.reshape(B, S, 2 * h, d).transpose(1, 2)
-        v = v.reshape(B, S, h, 2 * d).transpose(1, 2)
-        q, k = qk_rms_norm(self.q_norm, q), qk_rms_norm(self.k_norm, k)
-
-        cos, sin = self._cos_sin(S, x.device, x.dtype)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        o1 = F.scaled_dot_product_attention(q[:, 0::2], k[:, 0::2], v)
-        o2 = F.scaled_dot_product_attention(q[:, 1::2], k[:, 1::2], v)
-        o = o1 - self.lambda_full().to(o1.dtype) * o2
-        with torch.autocast(device_type=o.device.type, enabled=False):
-            o = self.subln(o.float())
-        o = o.to(o1.dtype) * (1.0 - self.lambda_init)
-        o = o.transpose(1, 2).reshape(B, S, C)
-        return self.proj(o)
+        out = self._attend(parts[0], parts[1], v, cos, sin)
+        if self.n_proj == 5:
+            out = out - self._attend(parts[3], parts[4], v, cos, sin)
+        return self.proj(out.transpose(1, 2).reshape(B, S, -1))
 
 
 class FFN(nn.Module):
-    def __init__(self, hidden_size: int, mlp_ratio: float = 4.0,
-                 multiple_of: int = 256, dropout: float = 0.0):
+    def __init__(self, hidden_size: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
-        inner = int(2 * (mlp_ratio * hidden_size) / 3)
-        inner = multiple_of * ((inner + multiple_of - 1) // multiple_of)
-        self.w1 = nn.Linear(hidden_size, inner, bias=False)
-        self.w3 = nn.Linear(hidden_size, inner, bias=False)
-        self.w2 = nn.Linear(inner, hidden_size, bias=False)
+        inner = int(hidden_size * mlp_ratio)
+        self.proj = nn.Linear(hidden_size, 2 * inner)
+        self.out = nn.Linear(inner, hidden_size)
         self.drop1 = nn.Dropout(dropout)
         self.drop2 = nn.Dropout(dropout)
 
     def forward(self, x):
-        h = F.silu(self.w1(x)) * self.w3(x)
-        h = self.drop1(h)
-        h = self.w2(h)
-        h = self.drop2(h)
-        return h
+        h, gate = self.proj(x).chunk(2, dim=-1)
+        h = self.drop1(h * F.silu(gate))
+        return self.drop2(self.out(h))
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, hidden_size: int, n_heads: int, ctx_dim: int,
+    def __init__(self, hidden_size: int, n_heads: int, differential: bool = False,
                  qk_norm: bool = False):
         super().__init__()
-        if hidden_size % n_heads != 0:
-            raise ValueError(
-                f"hidden_size {hidden_size} is not divisible by n_heads {n_heads}")
+        assert hidden_size % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = hidden_size // n_heads
-        self.q = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.kv = nn.Linear(ctx_dim, 2 * hidden_size, bias=True)
-        self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.differential = differential
+        self.q = nn.Linear(hidden_size, (2 if differential else 1) * hidden_size, bias=False)
+        self.kv = nn.Linear(hidden_size, (3 if differential else 2) * hidden_size, bias=False)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.q_norm, self.k_norm = make_qk_norms(self.head_dim, qk_norm)
 
-    def forward(self, x: torch.Tensor, ctx: torch.Tensor,
-                ctx_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _split(self, p: torch.Tensor, n: int):
+        B, S, _ = p.shape
+        return p.reshape(B, S, n, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
+
+    def _attend(self, q, k, v):
+        return F.scaled_dot_product_attention(
+            fp32_norm(self.q_norm, q), fp32_norm(self.k_norm, k), v)
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        L = ctx.shape[1]
-        q = self.q(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        kv = self.kv(ctx.to(x.dtype)).view(B, L, 2, self.n_heads, self.head_dim)
-        k = kv[:, :, 0].transpose(1, 2)
-        v = kv[:, :, 1].transpose(1, 2)
-        q, k = qk_rms_norm(self.q_norm, q), qk_rms_norm(self.k_norm, k)
-        attn_mask = None
-        if ctx_mask is not None:
-            attn_mask = ctx_mask.view(B, 1, 1, L)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        out = out.transpose(1, 2).reshape(B, T, C)
-        return self.proj(out)
+        if self.differential:
+            q1, q2 = self._split(self.q(x), 2)
+            k1, k2, v = self._split(self.kv(ctx), 3)
+            out = self._attend(q1, k1, v) - self._attend(q2, k2, v)
+        else:
+            q, = self._split(self.q(x), 1)
+            k, v = self._split(self.kv(ctx), 2)
+            out = self._attend(q, k, v)
+        return self.proj(out.transpose(1, 2).reshape(B, T, C))
+
+
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size, token_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, token_dim)
+        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
+
+    def forward(self, x, c):
+        scale, shift = self.adaLN(c).unsqueeze(1).chunk(2, dim=-1)
+        return self.linear(fp32_norm(self.norm, x) * (1 + scale) + shift)
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, max_seq_len=4096,
-                 mlp_ratio=4.0, drop=0.0, cross_attn_ctx_dim=0,
-                 attention="standard", layer_idx=0, qk_norm=False,
-                 inpaint_ctx_dim=0):
+    def __init__(self, hidden_size, num_heads,
+                 mlp_ratio=4.0, drop=0.0, cross_attention=False,
+                 attention="standard", qk_norm=False,
+                 inpaint_ctx_dim=0, adaln="shared"):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        if attention == "standard":
-            self.attn  = SelfAttention(hidden_size, num_heads, max_seq_len=max_seq_len,
-                                       qk_norm=qk_norm)
-        elif attention == "differential":
-            self.attn  = DifferentialSelfAttention(hidden_size, num_heads,
-                                                   layer_idx=layer_idx,
-                                                   max_seq_len=max_seq_len,
-                                                   qk_norm=qk_norm)
-        else:
-            raise ValueError(
-                f"attention must be one of {ATTENTION_KINDS}, got {attention!r}")
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = nn.RMSNorm(hidden_size, eps=1e-5)
+        self.attn  = SelfAttention(hidden_size, num_heads,
+                                   differential=attention == "differential",
+                                   qk_norm=qk_norm)
+        self.norm2 = nn.RMSNorm(hidden_size, eps=1e-5)
         self.mlp   = FFN(hidden_size, mlp_ratio=mlp_ratio, dropout=drop)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
+        self.adaLN = None
+        self.adaLN_bias = None
+        if adaln == "per_block":
+            self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
+        else:
+            self.adaLN_bias = nn.Parameter(torch.randn(6 * hidden_size) / hidden_size ** 0.5)
         self.norm_cross = None
         self.cross_attn = None
-        if int(cross_attn_ctx_dim or 0) > 0:
-            self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False,
-                                           eps=1e-6)
+        if cross_attention:
+            self.norm_cross = nn.RMSNorm(hidden_size, eps=1e-5)
             self.cross_attn = CrossAttention(hidden_size, num_heads,
-                                             int(cross_attn_ctx_dim),
+                                             differential=attention == "differential",
                                              qk_norm=qk_norm)
         self.inpaint_embed = None
         if int(inpaint_ctx_dim or 0) > 0:
@@ -273,41 +210,20 @@ class DiTBlock(nn.Module):
                 nn.Linear(hidden_size, hidden_size, bias=True),
             )
 
-    def forward(self, x, c, ctx=None, ctx_mask=None, inpaint=None):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+    def forward(self, x, mod, ctx=None, inpaint=None):
+        if self.adaLN is None:
+            scale_a, shift_a, gate_a, scale_f, shift_f, gate_f = (
+                self.adaLN_bias + mod).unsqueeze(1).chunk(6, dim=-1)
+            gate_a, gate_f = torch.sigmoid(1 - gate_a), torch.sigmoid(1 - gate_f)
+        else:
+            scale_a, shift_a, gate_a, scale_f, shift_f, gate_f = (
+                self.adaLN(mod)).unsqueeze(1).chunk(6, dim=-1)
+        x = x + gate_a * self.attn(fp32_norm(self.norm1, x) * (1 + scale_a) + shift_a)
         if self.cross_attn is not None:
-            if ctx is None:
-                raise ValueError(
-                    "this DiTBlock has a cross-attention but no text context "
-                    "reached it; ConditionedAudioDiT.forward must pass one "
-                    "(its learned null token when there is no text)")
-            x = x + self.cross_attn(self.norm_cross(x), ctx, ctx_mask)
+            x = x + self.cross_attn(fp32_norm(self.norm_cross, x), ctx)
         if self.inpaint_embed is not None:
-            if inpaint is None:
-                raise ValueError(
-                    "this DiTBlock has an inpainting context layer but no "
-                    "context reached it; ConditionedAudioDiT.forward must pass "
-                    "one (all zeros when nothing is kept)")
-            x = x + self.inpaint_embed(inpaint)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
-
-
-class FinalLayer(nn.Module):
-    def __init__(self, hidden_size: int, out_channels: int):
-        super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear     = nn.Linear(hidden_size, out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
-        )
-
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
+            x = x + left_pad(self.inpaint_embed(inpaint), x.shape[1])
+        x = x + gate_f * self.mlp(fp32_norm(self.norm2, x) * (1 + scale_f) + shift_f)
         return x
 
 
@@ -317,13 +233,12 @@ class ConditionedAudioDiT(nn.Module):
         'B':  dict(n_layers=12, hidden_size=768,  n_heads=12),
         'G':  dict(n_layers=18, hidden_size=1024, n_heads=16),
         'L':  dict(n_layers=24, hidden_size=1024, n_heads=16),
-        'XL': dict(n_layers=28, hidden_size=1152, n_heads=16),
+        'XL': dict(n_layers=28, hidden_size=1152, n_heads=18),
     }
 
     def __init__(
         self,
         token_dim:           int,
-        max_seq_len:         int   = MAX_FRAMES + 16,
         kind:                str   = 'L',
         mlp_ratio:           float = 4.0,
         drop:                float = 0.0,
@@ -331,23 +246,30 @@ class ConditionedAudioDiT(nn.Module):
         frame_cond_out_dims: Optional[Dict[str, int]]  = None,
         global_cond_configs: Optional[Dict[str, dict]] = None,
         frame_reinject_every: int = 0,
-        text_cross_every:     int = 0,
+        text_conditioning:    str = "ada",
         text_ctx_dim:         int = 0,
         attention:            str = "standard",
         qk_norm:              bool = False,
         inpainting:           bool = False,
+        memory_tokens:        int  = 0,
+        t_features:           str  = "high_freq",
+        adaln:                str  = "shared",
     ):
         super().__init__()
         cfg = self.CONFIGS[kind]
         self.kind        = kind
         self.token_dim   = token_dim
-        self.max_seq_len = max_seq_len
         hidden_size      = cfg['hidden_size']
         n_layers         = cfg['n_layers']
         n_heads          = cfg['n_heads']
         if attention not in ATTENTION_KINDS:
             raise ValueError(
                 f"attention must be one of {ATTENTION_KINDS}, got {attention!r}")
+        if t_features not in T_FEATURE_CYCLES:
+            raise ValueError(
+                f"t_features must be one of {tuple(T_FEATURE_CYCLES)}, got {t_features!r}")
+        if adaln not in ADALN_KINDS:
+            raise ValueError(f"adaln must be one of {ADALN_KINDS}, got {adaln!r}")
         self.attention   = attention
         self.qk_norm     = bool(qk_norm)
         self.inpainting  = bool(inpainting)
@@ -355,7 +277,14 @@ class ConditionedAudioDiT(nn.Module):
 
         self.frame_cond_dims     = dict(frame_cond_dims)     if frame_cond_dims     else {}
         self.frame_cond_out_dims = dict(frame_cond_out_dims) if frame_cond_out_dims else {}
-        self.global_cond_configs = dict(global_cond_configs) if global_cond_configs else {}
+        if text_conditioning not in TEXT_CONDITIONING_KINDS:
+            raise ValueError(f"text_conditioning must be one of "
+                             f"{TEXT_CONDITIONING_KINDS}, got {text_conditioning!r}")
+        configs = dict(global_cond_configs) if global_cond_configs else {}
+        self.text_conditioning = text_conditioning
+        self.text_in_cross = "text" in configs and text_conditioning != "ada"
+        self.global_cond_configs = {k: v for k, v in configs.items()
+                                    if k != "text" or text_conditioning != "cross_att"}
         self.has_frame  = len(self.frame_cond_dims)     > 0
         self.has_global = len(self.global_cond_configs) > 0
 
@@ -374,45 +303,48 @@ class ConditionedAudioDiT(nn.Module):
             )
             frame_extra = self.frame_encoder.total_out_dim
 
-        self.input_proj = nn.Linear(token_dim + frame_extra, hidden_size, bias=True)
+        self.pre_conv = nn.Conv1d(token_dim + frame_extra, token_dim + frame_extra, 1, bias=False)
+        self.input_proj = nn.Linear(token_dim + frame_extra, hidden_size, bias=False)
 
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.n_memory = int(memory_tokens)
+        self.memory_tokens = (nn.Parameter(torch.randn(self.n_memory, hidden_size))
+                              if self.n_memory > 0 else None)
+
+        self.t_embedder = TimestepEmbedder(hidden_size, t_features)
+        self.adaLN = None
+        if adaln == "shared":
+            self.adaLN = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, 6 * hidden_size),
+            )
 
         if self.has_global:
             self.global_encoder = GlobalConditionEncoder(
                 self.global_cond_configs, hidden_size,
             )
 
-        self.text_cross_every = int(text_cross_every or 0)
-        if self.text_cross_every < 0:
-            raise ValueError(
-                f"text_cross_every must be >= 0 (0 = off), got {text_cross_every}.")
         self.text_ctx_dim = int(text_ctx_dim or 0)
-        self.text_cross_layers = []
-        if self.text_cross_every > 0 and "text" in self.global_cond_configs:
+        if self.text_in_cross:
             if self.text_ctx_dim <= 0:
-                raise ValueError(
-                    "text_cross_every > 0 needs text_ctx_dim: the width of ONE "
-                    "token state of the text encoder (768 for CLAP "
-                    "clap-htsat-unfused). It is not the pooled dim (512) -- see "
-                    "CLAPTextCondition.encode_tokens.")
-            self.text_cross_layers = [
-                i for i in range(n_layers) if i % self.text_cross_every == 0
-            ]
+                raise ValueError(f"text_conditioning={text_conditioning!r} needs "
+                                 f"text_ctx_dim, the width of one text token")
+            self.text_proj = nn.Sequential(
+                nn.Linear(self.text_ctx_dim, hidden_size, bias=False),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size, bias=False),
+            )
+            self.text_pad = nn.Parameter(torch.randn(self.text_ctx_dim) * 0.02)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, n_heads, max_seq_len=max_seq_len,
+            DiTBlock(hidden_size, n_heads,
                      mlp_ratio=mlp_ratio, drop=drop,
-                     cross_attn_ctx_dim=(self.text_ctx_dim
-                                         if i in self.text_cross_layers else 0),
-                     attention=attention, layer_idx=i, qk_norm=self.qk_norm,
-                     inpaint_ctx_dim=self.inpaint_ctx_dim)
+                     cross_attention=self.text_in_cross,
+                     attention=attention, qk_norm=self.qk_norm,
+                     inpaint_ctx_dim=self.inpaint_ctx_dim,
+                     adaln=adaln)
             for i in range(n_layers)
         ])
-
-        self.text_null = None
-        if self.text_cross_layers:
-            self.text_null = nn.Parameter(torch.randn(1, 1, self.text_ctx_dim) * 0.02)
 
         self.frame_reinject_every = int(frame_reinject_every or 0)
         if self.frame_reinject_every < 0:
@@ -450,7 +382,12 @@ class ConditionedAudioDiT(nn.Module):
                 persistent=False,
             )
 
-        self.final_layer = FinalLayer(hidden_size, token_dim)
+        self.final_layer = None
+        if adaln == "per_block":
+            self.final_layer = FinalLayer(hidden_size, token_dim)
+        else:
+            self.output_proj = nn.Linear(hidden_size, token_dim, bias=False)
+            self.post_conv = nn.Conv1d(token_dim, token_dim, 1, bias=False)
 
         self.initialize_weights()
 
@@ -483,39 +420,32 @@ class ConditionedAudioDiT(nn.Module):
                   f"{self.frame_reinject_every}) but INACTIVE -- the stride "
                   f"exceeds the {n_layers - 1} eligible blocks (1..{n_layers-1}).")
         else:
-            print(f"  Frame re-injection: OFF (input concat only, plain JASCO)")
+            print("  Frame re-injection: OFF (input concat only)")
 
-        if self.text_cross_layers:
-            n_x = len(self.text_cross_layers)
-            x_params = n_x * ((hidden_size * hidden_size + hidden_size)
-                              + (self.text_ctx_dim * 2 * hidden_size + 2 * hidden_size)
-                              + (hidden_size * hidden_size + hidden_size))
-            print(f"  Text cross-attention: every {self.text_cross_every} "
-                  f"block(s) -> {n_x} of {n_layers} blocks | "
-                  f"ctx_dim={self.text_ctx_dim} | W_o zero-init | "
-                  f"learned null token | +{x_params/1e6:.2f}M params")
-        elif self.text_cross_every > 0 and "text" not in self.global_cond_configs:
-            print(f"  Text cross-attention: REQUESTED (every "
-                  f"{self.text_cross_every}) but INACTIVE -- this model has no "
-                  f"'text' global condition to attend to.")
-        else:
-            print(f"  Text cross-attention: OFF (the text reaches the blocks "
-                  f"only as a pooled vector through AdaLN)")
+        if "text" in configs:
+            print(f"  Text conditioning: {text_conditioning}"
+                  + (f" | tokens of {self.text_ctx_dim} values -> Linear-SiLU-Linear, "
+                     f"cross-attention in every block" if self.text_in_cross else ""))
 
         _d = hidden_size // n_heads
-        if attention == "differential":
-            print(f"  Self-attention: DIFFERENTIAL (Ye et al. 2024) | "
-                  f"{n_heads // 2} heads, q/k {_d} x 2 maps, v {2 * _d} | "
-                  f"lambda_init {diff_lambda_init(0):.2f} (block 0) -> "
-                  f"{diff_lambda_init(n_layers - 1):.2f} (block {n_layers - 1}) | "
-                  f"per-head RMSNorm | +{n_layers * 6 * _d} params")
-        else:
-            print(f"  Self-attention: standard ({n_heads} heads x {_d})")
+        print(f"  Self-attention: {attention} ({n_heads} heads x {_d})"
+              + (f" | out = A(q1,k1) v - A(q2,k2) v | +"
+                 f"{n_layers * 2 * hidden_size ** 2 / 1e6:.2f}M params"
+                 if attention == "differential" else "")
+              + f" | RoPE on {rope_dim(_d)} of {_d} values per head")
+        print(f"  Memory tokens: {self.n_memory}" if self.n_memory else "  Memory tokens: OFF")
+        print(f"  Time features: {t_features} | cos and sin of 2 pi f t, f from "
+              f"{T_FEATURE_CYCLES[t_features][0]:.3g} to {T_FEATURE_CYCLES[t_features][1]:.3g}")
+        print(f"  AdaLN: {adaln} | "
+              + ("SiLU-Linear on c in every block, gate g; final layer with LayerNorm, "
+                 "scale, shift and a Linear with bias" if adaln == "per_block" else
+                 "one Linear-SiLU-Linear on c + a bias per block, gate sigmoid(1 - g); "
+                 "no modulation at the output"))
 
         if self.qk_norm:
-            n_att = n_layers + len(self.text_cross_layers)
+            n_att = n_layers * (2 if self.text_in_cross else 1)
             print(f"  QK-norm: per-head RMSNorm on q and k before RoPE "
-                  f"(eps {QK_NORM_EPS:g}, Stable Audio 3) in {n_att} attention "
+                  f"(eps {QK_NORM_EPS:g}) in {n_att} attention "
                   f"layer(s) | +{n_att * 2 * _d} params")
         else:
             print("  QK-norm: OFF")
@@ -525,30 +455,29 @@ class ConditionedAudioDiT(nn.Module):
                                     + (hidden_size + 1) * hidden_size)
             print(f"  Inpainting context: mask + masked latent "
                   f"({self.inpaint_ctx_dim} values per frame) -> Linear-SiLU-"
-                  f"Linear added before the FFN of every block (Stable Audio "
-                  f"3) | last layer zero-init | +{ip_params/1e6:.2f}M params")
+                  f"Linear added before the FFN of every block | "
+                  f"last layer zero-init | +{ip_params/1e6:.2f}M params")
         else:
             print("  Inpainting context: OFF")
 
     def initialize_weights(self):
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
-
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
         for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            if block.adaLN is None:
+                nn.init.zeros_(block.attn.proj.weight)
+                nn.init.zeros_(block.mlp.out.weight)
+                nn.init.zeros_(block.mlp.out.bias)
+            else:
+                nn.init.zeros_(block.adaLN[-1].weight)
+                nn.init.zeros_(block.adaLN[-1].bias)
 
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        nn.init.zeros_(self.pre_conv.weight)
+        if self.final_layer is None:
+            nn.init.zeros_(self.post_conv.weight)
+        else:
+            nn.init.zeros_(self.final_layer.adaLN[-1].weight)
+            nn.init.zeros_(self.final_layer.adaLN[-1].bias)
+            nn.init.zeros_(self.final_layer.linear.weight)
+            nn.init.zeros_(self.final_layer.linear.bias)
 
         if self.reinject_layers:
             for lin in self.frame_reinject.values():
@@ -560,8 +489,7 @@ class ConditionedAudioDiT(nn.Module):
 
         for block in self.blocks:
             if block.cross_attn is not None:
-                nn.init.constant_(block.cross_attn.proj.weight, 0)
-                nn.init.constant_(block.cross_attn.proj.bias, 0)
+                nn.init.zeros_(block.cross_attn.proj.weight)
             if block.inpaint_embed is not None:
                 nn.init.constant_(block.inpaint_embed[-1].weight, 0)
                 nn.init.constant_(block.inpaint_embed[-1].bias, 0)
@@ -599,37 +527,20 @@ class ConditionedAudioDiT(nn.Module):
         return out
 
     def _gather_text_context(self, ctx, mask, B, device):
-        null = self.text_null.to(device=device, dtype=torch.float32)
         if ctx is None:
-            return (null.expand(B, 1, -1),
-                    torch.ones(B, 1, dtype=torch.bool, device=device))
+            return torch.zeros(B, 1, self.text_ctx_dim, device=device, dtype=torch.float32)
         ctx = ctx.to(device=device, dtype=torch.float32)
-        if ctx.dim() != 3 or ctx.shape[0] != B:
+        if ctx.dim() != 3 or ctx.shape[0] != B or ctx.shape[2] != self.text_ctx_dim:
             raise ValueError(
                 f"text_context must be (B, L, {self.text_ctx_dim}) with B={B}, "
                 f"got {tuple(ctx.shape)}")
-        if ctx.shape[2] != self.text_ctx_dim:
+        mask = mask.to(device=device).bool()
+        if mask.shape != ctx.shape[:2]:
             raise ValueError(
-                f"text_context has width {ctx.shape[2]}, this model was built "
-                f"for {self.text_ctx_dim}. The context is the TOKEN-level state "
-                f"of the text encoder (768 for CLAP), not the pooled embedding "
-                f"(512) that goes into the AdaLN slot.")
-        if mask is None:
-            mask = torch.ones(ctx.shape[:2], dtype=torch.bool, device=device)
-        else:
-            mask = mask.to(device=device).bool()
-            if mask.shape != ctx.shape[:2]:
-                raise ValueError(
-                    f"text_context_mask {tuple(mask.shape)} does not match the "
-                    f"context {tuple(ctx.shape[:2])}")
-        empty = ~mask.any(dim=1)
-        if bool(empty.any()):
-            ctx, mask = ctx.clone(), mask.clone()
-            ctx[empty] = 0.0
-            ctx[empty, 0] = null[0, 0]
-            mask[empty] = False
-            mask[empty, 0] = True
-        return ctx, mask
+                f"text_context_mask {tuple(mask.shape)} does not match the "
+                f"context {tuple(ctx.shape[:2])}")
+        ctx = torch.where(mask.unsqueeze(-1), ctx, self.text_pad)
+        return ctx.masked_fill(~mask.any(dim=1).view(B, 1, 1), 0.0)
 
     def _gather_inpaint_context(self, inpaint_context, B, T, device):
         if inpaint_context is None:
@@ -670,20 +581,22 @@ class ConditionedAudioDiT(nn.Module):
             frame_proj = self.frame_encoder(fc)
             x = torch.cat([x, frame_proj], dim=-1)
 
+        x = x + self.pre_conv(x.transpose(1, 2)).transpose(1, 2)
         x = self.input_proj(x)
+        if self.n_memory:
+            x = torch.cat((self.memory_tokens.expand(B, -1, -1), x), dim=1)
 
         c = self.t_embedder(t)
         if self.has_global:
             gc = self._gather_global_conditions(global_conditions, B,
                                                 x.device, torch.float32)
-            g = self.global_encoder(gc)
-            if g is not None:
-                c = c + g
+            c = c + self.global_encoder(gc)
+        mod = c if self.adaLN is None else self.adaLN(c)
 
-        ctx = ctx_mask = None
-        if self.text_cross_layers:
-            ctx, ctx_mask = self._gather_text_context(
-                text_context, text_context_mask, B, x.device)
+        ctx = None
+        if self.text_in_cross:
+            ctx = self.text_proj(self._gather_text_context(
+                text_context, text_context_mask, B, x.device))
 
         reinject = self.frame_reinject if (self.reinject_layers and
                                            frame_proj is not None) else None
@@ -692,15 +605,18 @@ class ConditionedAudioDiT(nn.Module):
                 gate = self.frame_reinject_gate[str(i)](c)
                 gate = torch.repeat_interleave(
                     gate, self.frame_slot_repeats, dim=-1).unsqueeze(1)
-                x = x + reinject[str(i)](frame_proj * gate)
-            x = block(x, c, ctx, ctx_mask, inpaint)
+                x = x + left_pad(reinject[str(i)](frame_proj * gate), x.shape[1])
+            x = block(x, mod, ctx, inpaint)
 
-        x = self.final_layer(x, c)
-        return x
+        x = x[:, self.n_memory:]
+        if self.final_layer is not None:
+            return self.final_layer(x, c)
+        x = self.output_proj(x)
+        return x + self.post_conv(x.transpose(1, 2)).transpose(1, 2)
 
 
 def ckpt_text_ctx_dim(ckpt: dict) -> int:
     for k, v in ckpt["model_state_dict"].items():
-        if k.endswith("cross_attn.kv.weight"):
+        if k.endswith("text_proj.0.weight"):
             return int(v.shape[1])
     return 0

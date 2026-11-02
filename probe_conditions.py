@@ -632,7 +632,6 @@ class ConditionProbeSet:
         self.specs = list(specs) if specs is not None else []
         self.tokens = tokens
         self.tok_len = tok_len
-        self.is_global = is_global_probe(condition)
 
     def __len__(self):
         return len(self.targets)
@@ -875,7 +874,7 @@ def build_condition_probe_set(condition, probe_dir, n_frames, extractor,
             except Exception as e:
                 print(f"{tag} token sequences NOT built "
                       f"({type(e).__name__}: {e}); a cross-attention run "
-                      f"will drive this probe with the null token.")
+                      f"gets zero tokens on this probe, so no contribution.")
                 tok = tlen = None
         extra = ({} if tok is None else {"tok": tok, "tok_len": tlen})
         np.savez(npz_path, **{f"probe_{i:02d}": t
