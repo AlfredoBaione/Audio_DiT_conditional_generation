@@ -225,7 +225,8 @@ def test_lora_recipe_in_the_config():
         Path(base).touch()
         Path(norm).touch()
         cfg = _load_config(["lora.adapter=dora-rows", f"paths.init_from={base}",
-                            f"paths.normalizer_from={norm}"])
+                            f"paths.normalizer_from={norm}",
+                            "training.adam_betas=[0.9,0.95]", "training.weight_decay=0.01"])
     assert cfg.training.optimizer == "adamw" and cfg.training.use_ema is False
     assert cfg.training.lr == 1.0e-4 and cfg.training.lr_schedule == "constant"
     assert tc.optimizer_layout(cfg.training) == "single"
@@ -371,24 +372,24 @@ def test_config_keys_new_run_and_resume():
     assert cfg.model.qk_norm is True
     assert cfg.training.lr_schedule == "inverse_power"
     assert cfg.training.lr_inv_gamma == 1.0e6 and cfg.training.lr_power == 0.5
-    assert cfg.training.optimizer == "muon"
-    assert cfg.training.lr == 5.0e-5 and cfg.training.muon_lr == 1.0e-3
-    assert cfg.training.lr_warmup == 0.995 and cfg.training.ot_coupling is True
-    assert cfg.training.ema_decay == 0.9995 and cfg.training.ema_power == 0.75
-    assert list(cfg.training.adam_betas) == [0.9, 0.95]
-    assert cfg.training.weight_decay == 0.01 and cfg.training.grad_clip == 0.0
-    print("  new run: Muon + AdamW, inverse_power schedule, exponential warmup, "
-          "OT coupling, EMA 0.9995 with power 0.75")
+    assert cfg.training.optimizer == "adamw"
+    assert cfg.training.lr == 1.0e-4 and cfg.training.muon_lr == 1.0e-3
+    assert cfg.training.lr_warmup == 0.995 and cfg.training.ot_coupling is False
+    assert cfg.training.ema_decay == 0.9999 and cfg.training.ema_power == 0
+    assert list(cfg.training.adam_betas) == [0.9, 0.999]
+    assert cfg.training.weight_decay == 0.0 and cfg.training.grad_clip == 0.0
+    print("  new run: AdamW, inverse_power schedule, exponential warmup, "
+          "no OT coupling, constant EMA 0.9999")
 
     new = OmegaConf.to_container(OmegaConf.load(CFG_PATH))
-    new["training"]["adam_betas"] = [0.9, 0.999]
+    new["training"]["adam_betas"] = [0.9, 0.95]
     with tempfile.TemporaryDirectory() as d:
         p_new = str(Path(d) / "new.pt")
         torch.save({"config": new}, p_new)
         cfg = _load_config(["--resume", p_new])
         assert cfg.model.qk_norm is True
         assert cfg.training.lr_schedule == "inverse_power"
-        assert list(cfg.training.adam_betas) == [0.9, 0.999]
+        assert list(cfg.training.adam_betas) == [0.9, 0.95]
         print("  resume: the checkpoint's own values")
 
     for bad in (["training.lr_schedule=linear"], ["training.adam_betas=[0.9]"],

@@ -9,9 +9,9 @@ model:
   text_conditioning: ada     # ada | cross_att | all
   attention: standard        # standard | differential
   qk_norm: true
-  memory_tokens: 64          # 0 = off
-  t_features: high_freq      # high_freq | low_freq
-  adaln: shared              # shared | per_block
+  memory_tokens: 0          # 0 = off
+  t_features: low_freq      # high_freq | low_freq
+  adaln: per_block              # shared | per_block
 
 data:
   train_batch_size: 8
@@ -24,8 +24,8 @@ data:
 
 training:
   num_steps: 1000001
-  optimizer: muon            # muon | adamw
-  lr: 5.0e-5                 # adamw: every parameter; muon: parameters with ndim < 2
+  optimizer: adamw            # muon | adamw
+  lr: 1.0e-4                 # adamw: every parameter; muon: parameters with ndim < 2
   muon_lr: 1.0e-3            # muon: parameters with ndim >= 2
   muon_momentum: 0.95
   lr_schedule: inverse_power # inverse_power | cosine | constant
@@ -34,20 +34,20 @@ training:
   lr_warmup: 0.995           # inverse_power: 1 - x^(step + 1); 0 = linear over warmup_steps
   seed: 42
   strict_conditions: true    # false = missing conditions zero-filled (debug only)
-  weight_decay: 0.01
+  weight_decay: 0.0
   weight_decay_matrices_only: true   # adamw only
-  adam_betas: [0.9, 0.95]
+  adam_betas: [0.9, 0.999]
   adam_eps: 1.0e-8
   grad_clip:    0.0          # 0 = off
   use_amp:      false
-  t_sampler: truncated_logit # logit_normal | truncated_logit | uniform
-  ot_coupling: true
+  t_sampler: uniform # logit_normal | truncated_logit | uniform
+  ot_coupling: false
   warmup_steps: 5000
   decay_start_frac: 0.8      # cosine only
   use_ema:    true
-  ema_decay:  0.9995
+  ema_decay:  0.9999
   ema_start:  0
-  ema_power:  0.75           # decay = min(ema_decay, 1 - (1 + n)^-power); 0 = constant
+  ema_power:  0           # decay = min(ema_decay, 1 - (1 + n)^-power); 0 = constant
   inpainting: false
   inpaint_masks: [0.8, 0.1, 0.05, 0.05]   # full mask, random spans, continuation, backward continuation
 
@@ -59,9 +59,9 @@ intervals:
   keep_last_n_ckpts: 5
 
 sampling:
-  euler_steps: 50
-  t_schedule: logsnr_uniform # uniform | logsnr_uniform
-  guidance_type: apg         # cfg | apg | mix
+  euler_steps: 100
+  t_schedule: uniform # uniform | logsnr_uniform
+  guidance_type: cfg         # cfg | apg | mix
   n_audio_samples: 4
   n_test_panels: 8
   n_probe_panels: 8

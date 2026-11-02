@@ -575,6 +575,12 @@ python launch_training_cond.py --num-gpus 2 --config configs/training_cond_defau
   rescaled: with N the batch changes, and the LR is yours to adapt. With
   `grad_accum` > 1 the gradients are averaged over the GPUs once per optimizer
   step.
+- **Memory per GPU** with `XL`, EnCodec, 10 s, inpainting, `per_block` and AdamW (864.0M
+  parameters; estimated from a laptop GPU): weights, EMA, gradients and Adam state take
+  16.1 GiB, a step adds about 2.2 GiB per sample of `train_batch_size`, and the codec and
+  VGGish 0.5 GiB once loaded. On a 24 GB GPU batch 4 needs 25.6 GiB and stops at the second
+  optimizer step, batch 3 needs 23.3 GiB, batch 2 needs 21.1 GiB. With 3 GPUs,
+  `train_batch_size=2` and `grad_accum=8` give the same 48 samples per step as 4 and 4.
 - **Split over the GPUs:** the training batches (each GPU its own share of
   every epoch); the validation loss (batch b on GPU b mod N, the sums added
   up); the metrics step — generation j of the `n_metrics_samples` is
@@ -614,15 +620,15 @@ the guided prediction is `d_c + (w − 1) · part`:
 
 | `guidance_type` | `part` |
 |---|---|
-| `cfg` | `diff`, the usual `v_u + w · (v_c − v_u)` |
-| `apg` (default) | `diff` minus its projection on `d_c`, over all the frames and channels of the clip |
+| `cfg` (default) | `diff`, the usual `v_u + w · (v_c − v_u)` |
+| `apg` | `diff` minus its projection on `d_c`, over all the frames and channels of the clip |
 | `mix` | half of each |
 
 Costs nothing to retry on a trained checkpoint; above ~5 it buys adherence with
 artefacts.
 
 **`model.frame_reinject_every`** (architecture, must be chosen BEFORE the run).
-With the default `0`, a frame condition is concatenated at the input and never
+With `0`, a frame condition is concatenated at the input and never
 presented again: it touches exactly **one** matrix (`input_proj`) and then has to
 survive the whole depth inside the residual stream. A *global* condition, by
 contrast, modulates **every** block and the final layer through AdaLN — 6 points
@@ -746,29 +752,29 @@ guidance recovers a control signal that is not in the `.npz` to begin with.
 
 ### The network
 
-| `model.kind` | blocks | hidden | heads | parameters (DAC, no conditions, 64 memory tokens) |
-|---|---|---|---|---|
-| `S` | 6 | 512 | 8 | 27.6M |
-| `B` | 12 | 768 | 12 | 118.5M |
-| `G` | 18 | 1024 | 16 | 311.2M |
-| `L` | 24 | 1024 | 16 | 412.0M |
-| `XL` | 28 | 1152 | 18 | 606.3M |
+| `model.kind` | blocks | hidden | heads | parameters (DAC, no conditions), `per_block` | `shared` |
+|---|---|---|---|---|---|
+| `S` | 6 | 512 | 8 | 35.7M | 27.5M |
+| `B` | 12 | 768 | 12 | 158.0M | 118.5M |
+| `G` | 18 | 1024 | 16 | 419.1M | 311.1M |
+| `L` | 24 | 1024 | 16 | 557.6M | 411.9M |
+| `XL` | 28 | 1152 | 18 | 822.5M | 606.2M |
 
 - **Input.** `x + Conv1d(x)`, a 1×1 convolution starting at zero, then a `Linear`
   without bias; the frame conditions are concatenated to `x` before it.
-- **Memory tokens** — `model.memory_tokens` (64, `0` = off). Learned vectors put
+- **Memory tokens** — `model.memory_tokens` (`0` = off, the default). Learned vectors put
   before the frames: they take part in every attention, RoPE counts them, and they
   are dropped at the end.
 - **Time** — `model.t_features`. `t` goes through 128 cosines and 128 sines of
-  `2π f t`, then a `Linear-SiLU-Linear`. `high_freq` (default): `f` exponentially
-  spaced from 0.5 to 10000. `low_freq`: `2π f` exponentially spaced from 1e-4 to 1,
+  `2π f t`, then a `Linear-SiLU-Linear`. `high_freq`: `f` exponentially
+  spaced from 0.5 to 10000. `low_freq` (default): `2π f` exponentially spaced from 1e-4 to 1,
   so the embedding is a smooth function of `t`.
 - **Global conditions.** Concatenated (sorted by name) into one `Linear-SiLU-Linear`
   without bias and summed to the time vector: `c`. A null condition adds 0.
-- **Modulation** — `model.adaln`. `shared` (default): `Linear-SiLU-Linear` on `c` gives
+- **Modulation** — `model.adaln`. `shared`: `Linear-SiLU-Linear` on `c` gives
   `6 · hidden` values shared by the blocks; each block adds its own `adaLN_bias` and
   splits them into `s_a, b_a, g_a, s_f, b_f, g_f`, used as in the block above.
-  `per_block`: every block has its own `SiLU-Linear` from `c` to those 6 vectors, which
+  `per_block` (default): every block has its own `SiLU-Linear` from `c` to those 6 vectors, which
   adds `6 · hidden²` parameters per block.
 - **Block.** RMSNorm with a learned gain (ε = 1e-5, in fp32) before each branch. The
   gate is `sigmoid(1 − g)` with `shared`, about 0.73 at the start and never negative,
@@ -845,21 +851,21 @@ the train, validation and EMA losses back to their early-training values.
 
 | key | default | what it does |
 |---|---|---|
-| `optimizer` | `muon` | `muon`: Muon on the parameters with ndim ≥ 2, AdamW on the others. `adamw`: AdamW on everything |
-| `lr` | 5e-5 | with `muon`, the AdamW part; with `adamw`, every parameter |
+| `optimizer` | `adamw` | `muon`: Muon on the parameters with ndim ≥ 2, AdamW on the others. `adamw`: AdamW on everything |
+| `lr` | 1e-4 | with `muon`, the AdamW part; with `adamw`, every parameter |
 | `muon_lr`, `muon_momentum` | 1e-3, 0.95 | the Muon part |
-| `adam_betas`, `adam_eps` | [0.9, 0.95], 1e-8 | AdamW |
-| `weight_decay` | 0.01 | decoupled, on the AdamW part; none on the Muon part |
+| `adam_betas`, `adam_eps` | [0.9, 0.999], 1e-8 | AdamW |
+| `weight_decay` | 0.0 | decoupled, on the AdamW part; none on the Muon part |
 | `weight_decay_matrices_only` | true | `adamw` only: two groups, decay on the weight matrices only |
 | `lr_schedule` | `inverse_power` | `lr · warmup · (1 + step / lr_inv_gamma)^−lr_power`; `cosine`: constant until `decay_start_frac`, then cosine to 0; `constant` |
 | `lr_inv_gamma`, `lr_power` | 1e6, 0.5 | the lr is ×0.95 at 100k steps, ×0.85 at 380k, ×0.71 at 1M |
 | `lr_warmup` | 0.995 | `warmup = 1 − x^(step + 1)`, 99% at about 920 steps; `0`: linear over `warmup_steps` |
 | `grad_clip` | 0.0 (off) | global-norm clipping after gradient accumulation |
-| `ot_coupling` | true | see below |
-| `ema_decay`, `ema_start`, `ema_power` | 0.9995, 0, 0.75 | decay `min(ema_decay, 1 − (1 + n)^−ema_power)` after `n` updates; `ema_power: 0` = constant |
+| `ot_coupling` | false | see below |
+| `ema_decay`, `ema_start`, `ema_power` | 0.9999, 0, 0 | decay `min(ema_decay, 1 − (1 + n)^−ema_power)` after `n` updates; `ema_power: 0` = constant |
 
-AdamW alone, at 1e-4 and without weight decay: `training.optimizer=adamw training.lr=1e-4
-'training.adam_betas=[0.9,0.999]' training.weight_decay=0`.
+Muon + AdamW: `training.optimizer=muon training.lr=5e-5
+'training.adam_betas=[0.9,0.95]' training.weight_decay=0.01`.
 
 **Muon.** The momentum `m = β m + (1 − β) g` and the Nesterov update `(1 − β) g + β m`
 are orthogonalised with 5 Newton-Schulz iterations in bf16 before being applied, so
@@ -887,9 +893,9 @@ model predicts `noise − data`.
 
 | value | how the training draws `t` | above 0.9 | below 0.2 | median |
 |---|---|---|---|---|
-| `truncated_logit` (default) | below, for 431 frames | 9.9% | 2.3% | 0.66 |
+| `truncated_logit` | below, for 431 frames | 9.9% | 2.3% | 0.66 |
 | `logit_normal` | logit-normal (0, 1) | 1.4% | 8.3% | 0.50 |
-| `uniform` | uniform on [0, 1] | 10.0% | 20.0% | 0.50 |
+| `uniform` (default) | uniform on [0, 1] | 10.0% | 20.0% | 0.50 |
 
 `truncated_logit`: the logit-normal (0, 1) is **truncated at 0.075 and rescaled** to
 give `u`, and `t = sigmoid(μ − logit(u))`, with `μ` linear from 0.5 at 256 frames to
@@ -916,13 +922,13 @@ where `logit_normal` puts 2.3% of the examples above it, `truncated_logit` 13% a
 
 ### Where the Euler steps go — `sampling.t_schedule`
 
-The option places the `sampling.euler_steps` of **every** generation of the run: the
+The option places the `sampling.euler_steps` (100 by default) of **every** generation of the run: the
 metrics step, the panels, the uncond cards. Every grid goes from `t = 1` to `t = 0`.
 
 | value | where the steps go | steps | evaluated above t = 0.9 | below t = 0.2 | last evaluation |
 |---|---|---|---|---|---|
-| `logsnr_uniform` (default) | equally spaced in log-SNR, `log((1 − t) / t)`, from −6.2 to 2.0; the first boundary is `t = 1`, the last `t = 0` | 50 | 25 | 3 | t = 0.138 |
-| `uniform` | equal steps | 50 | 5 | 10 | t = 0.020 |
+| `logsnr_uniform` | equally spaced in log-SNR, `log((1 − t) / t)`, from −6.2 to 2.0; the first boundary is `t = 1`, the last `t = 0` | 50 | 25 | 3 | t = 0.138 |
+| `uniform` (default) | equal steps | 50 | 5 | 10 | t = 0.020 |
 
 - **Sampling only.** The weights do not depend on it: any checkpoint can be
   generated either way. On a resume the checkpoint's value is kept unless the
@@ -934,7 +940,7 @@ metrics step, the panels, the uncond cards. Every grid goes from `t = 1` to `t =
   `(1 − s) · latent + s · noise` at `t = s`, on the same grid scaled by `s`.
 - The metric curves of two runs are comparable only with the same
   `euler_steps` and `t_schedule`. The startup log says which:
-  `Sampling t schedule: logsnr_uniform (...) | 50 Euler steps, 25 of them at t > 0.9 (noise end), the last at t=0.138`.
+  `Sampling t schedule: uniform (equal steps from t=1 to t=0) | 100 Euler steps, 10 of them at t > 0.9 (noise end), the last at t=0.010`.
 
 ### Inpainting — `training.inpainting`, `training.inpaint_masks`
 
@@ -1018,7 +1024,9 @@ trained norm, which starts at the norm of that row of `W`.
 
 A LoRA run always trains with AdamW at `lora.lr` (1e-4), a constant learning rate
 without warmup and no EMA; betas and weight decay come from `training.adam_betas` and
-`training.weight_decay` (0.9/0.95, 0.01), on every adapter.
+`training.weight_decay`, on every adapter. The command below sets 0.9/0.95 and 0.01, the
+values of Stable Audio 3's `train_lora.py`; without them the run takes the YAML's 0.9/0.999
+and 0.
 
 ```bash
 python launch_training_cond.py --run_name <name> \
@@ -1031,6 +1039,7 @@ python launch_training_cond.py --run_name <name> \
     paths.init_from=<base checkpoint> \
     paths.normalizer_from=<base cache>/normalizer.pt \
     lora.adapter=dora-rows lora.rank=16 \
+    'training.adam_betas=[0.9,0.95]' training.weight_decay=0.01 \
     training.num_steps=10001 \
     intervals.val=500 intervals.audio=1000 \
     intervals.metrics=1000 intervals.ckpt=500
