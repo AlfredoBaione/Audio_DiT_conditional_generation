@@ -4413,7 +4413,7 @@ if __name__ == "__main__":
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=not DIST.enabled)
             scheduler.step()
 
             if cfg.training.use_ema and step >= cfg.training.ema_start:
