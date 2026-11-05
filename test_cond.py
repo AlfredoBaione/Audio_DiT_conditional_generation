@@ -398,7 +398,7 @@ def main():
 
     metrics_seed = (metrics_cfg.get("seed", None)
                     if metrics_cfg is not None else None)
-    use_amp = bool(cfg.training.get("use_amp", False))
+    use_amp = cfg.training.get("use_amp", False)
     image_root = cfg.paths.get("image_root", None)
     n_frames = test_dataset.n_frames
     conditioned = bool(frame_cond_dims) or bool(global_configs)

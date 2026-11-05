@@ -478,6 +478,7 @@ def load_config():
 LR_SCHEDULES = ("inverse_power", "cosine", "constant")
 OPTIMIZERS = ("adamw", "muon")
 MUON_FUSED_LAYERS = ("*.attn.qkv.*", "*.cross_attn.q.*", "*.cross_attn.kv.*", "*.mlp.proj.*")
+AMP_DTYPES = {False: None, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
 def make_lr_lambda(num_steps: int, warmup_steps: int, decay_start_frac: float,
@@ -851,14 +852,14 @@ def compute_loss(model, batch, device, use_amp,
     if keep is None and inpaint_probs is not None:
         keep = random_inpaint_keep(B, x1.shape[1], inpaint_probs)
     if keep is None:
-        with torch.amp.autocast('cuda', enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=bool(use_amp), dtype=AMP_DTYPES[use_amp]):
             pred = model(xt, t, frame_conditions=fc, global_conditions=gc,
                          text_context=ctx, text_context_mask=ctx_mask)
             loss = F.mse_loss(pred, target)
         return loss
 
     m = keep.to(device=device, dtype=x1.dtype).unsqueeze(-1)
-    with torch.amp.autocast('cuda', enabled=use_amp):
+    with torch.amp.autocast('cuda', enabled=bool(use_amp), dtype=AMP_DTYPES[use_amp]):
         pred = model(xt, t, frame_conditions=fc, global_conditions=gc,
                      text_context=ctx, text_context_mask=ctx_mask,
                      inpaint_context=torch.cat([m, x1 * m], dim=-1))
@@ -927,7 +928,7 @@ def euler_sample_cfg(model, n_frames, device, sampling_cfg, use_amp,
     guidance_type = guidance_type_of(sampling_cfg)
     for tv, dt in euler_grid(sampling_cfg.euler_steps, t_schedule_of(sampling_cfg)):
         t = torch.ones(1, device=device) * tv
-        with torch.amp.autocast('cuda', enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=bool(use_amp), dtype=AMP_DTYPES[use_amp]):
             if use_cfg:
                 fc = frame_cond if frame_cond else null_fc
                 gc = global_cond if global_cond else null_gc
@@ -1014,7 +1015,7 @@ def euler_sample_cfg_paired(model, n_frames, device, sampling_cfg, use_amp,
     for tv, dt in euler_grid(sampling_cfg.euler_steps, t_schedule_of(sampling_cfg)):
         t = torch.ones(3 * B, device=device) * tv
         xb = torch.cat([x_cond, x_cond, x_unc], dim=0)
-        with torch.amp.autocast('cuda', enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=bool(use_amp), dtype=AMP_DTYPES[use_amp]):
             vb = model(xb, t, frame_conditions=frame_batch,
                        global_conditions=global_batch,
                        text_context=ctx_batch,
@@ -4071,7 +4072,7 @@ if __name__ == "__main__":
     optimizer = build_optimizer(model, cfg.training, optimizer_layout(cfg.training))
     lr_lambda = lr_lambda_from_cfg(cfg.training)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler    = torch.amp.GradScaler('cuda', enabled=cfg.training.use_amp)
+    scaler    = torch.amp.GradScaler('cuda', enabled=cfg.training.use_amp == "fp16")
 
     writer = SummaryWriter(run_dir) if DIST.is_main else NullWriter(fixed_dir=run_dir)
 

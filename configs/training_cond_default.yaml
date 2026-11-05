@@ -39,7 +39,7 @@ training:
   adam_betas: [0.9, 0.999]
   adam_eps: 1.0e-8
   grad_clip:    0.0          # 0 = off
-  use_amp:      false
+  use_amp:      false        # false | fp16 | bf16
   t_sampler: uniform # logit_normal | truncated_logit | uniform
   ot_coupling: false
   warmup_steps: 5000
