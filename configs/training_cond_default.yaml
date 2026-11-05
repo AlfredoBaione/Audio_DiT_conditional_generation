@@ -106,7 +106,6 @@ paths:
   image_root:     "./Museart_2_reduced/Images"
   runs_dir:       "./runs"
   cache_dir:      "./cache"
-  f0_probe_dir:   null
   run_name:       null
   resume_from:    null
   init_from:      null       # warm start; not with resume_from; with lora: the base model

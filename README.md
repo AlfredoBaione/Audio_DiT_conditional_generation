@@ -1602,13 +1602,13 @@ generation; its title carries that sample's first metric. Plus the audio block
 Build any probe set standalone to look at it before training:
 
 ```bash
-python probe_conditions.py f0     ./cache/f0_probe     --n_frames 431
+python probe_conditions.py f0     ./cache/probe_f0     --n_frames 431
 python probe_conditions.py energy ./cache/probe_energy --n_frames 431
 python probe_conditions.py chroma ./cache/probe_chroma --n_frames 431
 python probe_conditions.py rhythm ./cache/probe_rhythm --n_frames 431
 python probe_conditions.py chord  ./cache/probe_chord  --n_frames 431
 # an EnCodec dataset: its codec and its frame count (250 for 5 s)
-python probe_conditions.py f0     ./cache/f0_probe_enc --n_frames 250 --codec encodec
+python probe_conditions.py f0     ./cache/probe_f0_enc --n_frames 250 --codec encodec
 # the global banks: --n_frames does not apply (one embedding, no chunk geometry)
 python probe_conditions.py text   ./cache/probe_text    # always the descriptions
 python probe_conditions.py image  ./cache/probe_image

@@ -3193,12 +3193,7 @@ def _build_probe_set(cfg, registry, fidelity_evaluator, dataset,
     try:
         from probe_conditions import (build_condition_probe_set,
                                       text_probe_bank)
-        if _cond == "f0":
-            _probe_root = (cfg.paths.get("f0_probe_dir", None)
-                           or os.path.join(cfg.paths.cache_dir, "f0_probe"))
-        else:
-            _probe_root = os.path.join(cfg.paths.cache_dir,
-                                       f"probe_{_cond}")
+        _probe_root = os.path.join(cfg.paths.cache_dir, f"probe_{_cond}")
         if _cond in global_configs:
             _probe_extractor = registry.global_extractors[_cond]
         else:
