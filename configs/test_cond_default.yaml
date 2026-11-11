@@ -6,3 +6,7 @@ sampling:
   n_test_panels: 8           # 0 = none
   n_probe_panels: 8          # 0 = none
   n_audio_samples: 4
+  metrics_samples_per_forward: 32  # 0 = serial sampler; N = N samples per forward
+
+metrics:
+  decode_batch: 8            # clips decoded (and CLAP-embedded) together

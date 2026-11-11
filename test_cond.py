@@ -228,6 +228,7 @@ def main():
               else tc.NullWriter(fixed_dir=str(log_dir)))
 
     tc.set_codec_device(cfg.metrics.get("codec_device", "cpu"))
+    tc.set_decode_batch(cfg.metrics.get("decode_batch", 1))
 
     print("\n[test_cond] Loading checkpoint...")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False,
@@ -492,10 +493,9 @@ def main():
             _codec = tc.get_codec()
 
             def _real_clips(idxs):
-                for i in idxs:
-                    yield (tc.decode_frames_to_wav(test_dataset[i][0], normalizer,
-                                                   _codec).view(1, 1, -1),
-                           lc.active().sample_rate)
+                for wav in tc.iter_decoded((test_dataset[i][0] for i in idxs),
+                                           normalizer, _codec):
+                    yield wav.view(1, 1, -1), lc.active().sample_rate
             if DIST.enabled:
                 _own = range(DIST.rank, total, DIST.world)
                 fad_ref_stats = split_audio_reference(

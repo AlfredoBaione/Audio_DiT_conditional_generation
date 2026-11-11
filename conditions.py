@@ -919,6 +919,9 @@ class Wav2ClipAudioEmbedder:
         n = float(np.linalg.norm(emb))
         return emb / n if n > 0 else emb
 
+    def embed_batch(self, wavs, sr: int) -> List[np.ndarray]:
+        return [self.embed(w, sr) for w in wavs]
+
     def unload(self):
         if self._model is not None:
             del self._model

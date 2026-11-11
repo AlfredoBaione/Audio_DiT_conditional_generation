@@ -18,6 +18,7 @@ if os.path.isdir(_IRCAM_LOCAL):
 import copy
 import sys
 import math
+import itertools
 import json
 import random
 import argparse
@@ -145,6 +146,51 @@ def run_in_fitting_groups(label, n, size, fn):
         out.extend(part)
         lo = hi
     return out
+
+
+_DECODE_BATCH = 1
+
+
+def set_decode_batch(n):
+    global _DECODE_BATCH
+    _DECODE_BATCH = max(1, int(n or 1))
+
+
+def decode_frames_to_wavs(frames_of, normalizer, codec_model):
+    keys = list(frames_of)
+    dev = next(codec_model.parameters()).device
+
+    def _part(a, b):
+        z = torch.stack([normalizer.denormalize(frames_of[k].T) for k in keys[a:b]])
+        return list(lc.decode(codec_model, z.float().to(dev)).detach().cpu()[:, 0])
+    return dict(zip(keys, run_in_fitting_groups("decode", len(keys), _DECODE_BATCH,
+                                                _part)))
+
+
+def iter_decoded(frames_iter, normalizer, codec_model):
+    it = iter(frames_iter)
+    while True:
+        grp = dict(enumerate(itertools.islice(it, _DECODE_BATCH)))
+        if not grp:
+            return
+        yield from decode_frames_to_wavs(grp, normalizer, codec_model).values()
+
+
+def add_similarity(gsims, embedders, c, todo, sr, where):
+    todo = [x for x in todo if x[2] is not None and np.any(x[2])]
+    if not todo:
+        return
+    try:
+        embs = run_in_fitting_groups(
+            f"{c} similarity", len(todo), len(todo),
+            lambda a, b: embedders[c].embed_batch([x[1] for x in todo[a:b]], sr))
+    except Exception as _e:
+        if not gsims[c]:
+            print(f"    [{where}] {c} similarity unavailable: "
+                  f"{type(_e).__name__}: {_e}")
+        return
+    for (k, _, t), emb in zip(todo, embs):
+        gsims[c][k] = float(np.dot(emb, np.asarray(t).reshape(-1)))
 
 
 def _load_dataset_meta(latent_root):
@@ -905,12 +951,16 @@ def inpaint_context_of(keep, latent, device):
 def euler_sample_cfg(model, n_frames, device, sampling_cfg, use_amp,
                       frame_cond, global_cond, guidance,
                       frame_dims, global_configs, gen_rng=None,
-                      text_ctx=None, inpaint=None):
+                      text_ctx=None, x0=None, inpaint=None):
     model.eval()
-    x = torch.randn(1, n_frames, lc.active().latent_dim, device=device, generator=gen_rng)
+    if x0 is None:
+        x0 = torch.randn(1, n_frames, lc.active().latent_dim, device=device,
+                         generator=gen_rng)
+    x = x0.to(device)
+    B = int(x.shape[0])
 
-    null_fc = make_null_frame_conditions(1, n_frames, frame_dims or {}, device)
-    null_gc = make_null_global_conditions(1, global_configs or {}, device)
+    null_fc = make_null_frame_conditions(B, n_frames, frame_dims or {}, device)
+    null_gc = make_null_global_conditions(B, global_configs or {}, device)
 
     ctx = ctx_mask = None
     if getattr(model, "text_in_cross", None) and text_ctx is not None:
@@ -920,14 +970,14 @@ def euler_sample_cfg(model, n_frames, device, sampling_cfg, use_amp,
     ip_m = ip_lat = ip_ctx = None
     if inpaint is not None:
         ip_m, ip_lat, ip_ctx = inpaint_context_of(
-            inpaint[0].view(1, n_frames), inpaint[1].view(1, n_frames, -1), device)
+            inpaint[0].view(B, n_frames), inpaint[1].view(B, n_frames, -1), device)
 
     has_cond = bool(frame_cond) or bool(global_cond) or (ctx is not None)
     use_cfg = (guidance > 1.0) and has_cond
 
     guidance_type = guidance_type_of(sampling_cfg)
     for tv, dt in euler_grid(sampling_cfg.euler_steps, t_schedule_of(sampling_cfg)):
-        t = torch.ones(1, device=device) * tv
+        t = torch.ones(B, device=device) * tv
         with torch.amp.autocast('cuda', enabled=bool(use_amp), dtype=AMP_DTYPES[use_amp]):
             if use_cfg:
                 fc = frame_cond if frame_cond else null_fc
@@ -949,7 +999,7 @@ def euler_sample_cfg(model, n_frames, device, sampling_cfg, use_amp,
 
     if ip_m is not None:
         x = ip_m * ip_lat + (1 - ip_m) * x
-    return x[0].cpu()
+    return [x[b].cpu() for b in range(B)]
 
 
 @torch.no_grad()
@@ -1222,25 +1272,33 @@ def generate_and_log_uncond_cards(
     if metrics_seed is not None:
         gen_rng = torch.Generator(device=device)
         gen_rng.manual_seed(int(metrics_seed))
+    spf = max(1, int(sampling_cfg.get("metrics_samples_per_forward", 1) or 1))
+    noise = {}
     for k in range(n_cards):
         if mine is not None and not mine(k):
             if gen_rng is not None:
                 torch.randn(1, n_frames, lc.active().latent_dim, device=device,
                             generator=gen_rng)
             continue
-        gen = euler_sample_cfg(
+        noise[k] = torch.randn(1, n_frames, lc.active().latent_dim, device=device,
+                               generator=gen_rng)
+    own = list(noise)
+    gens = dict(zip(own, run_in_fitting_groups(
+        "generation", len(own), spf,
+        lambda a, b: euler_sample_cfg(
             model, n_frames, device,
             sampling_cfg=sampling_cfg,
             use_amp=use_amp,
             frame_cond=None, global_cond=None, guidance=1.0,
             frame_dims=frame_dims, global_configs=global_configs,
-            gen_rng=gen_rng,
-        )
-        if not torch.isfinite(gen).all():
+            gen_rng=gen_rng, x0=torch.cat([noise[k] for k in own[a:b]]),
+        ))))
+    for k in own:
+        if not torch.isfinite(gens[k]).all():
             print(f"    [uncond] {uncond_card_tag(k)}: non-finite generation, "
                   f"not logged")
-            continue
-        wav = decode_frames_to_wav(gen, normalizer, codec_model)
+            del gens[k]
+    for k, wav in decode_frames_to_wavs(gens, normalizer, codec_model).items():
         writer.add_audio(uncond_card_tag(k), norm_wav(wav), global_step=step,
                          sample_rate=lc.active().sample_rate)
         sf.write(os.path.join(_panel_dir(output_dir, "uncond", k),
@@ -1442,36 +1500,40 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                                  else (ip[0][lo:hi], ip[1][lo:hi])),
                     )[0])))
         else:
+            noise = {}
             for i in range(n_plot):
-                if i not in own_set:
-                    if gen_rng is not None:
-                        torch.randn(1, n_frames, lc.active().latent_dim,
-                                    device=device, generator=gen_rng)
-                    continue
-                out[i] = euler_sample_cfg(
+                if i in own_set:
+                    noise[i] = torch.randn(1, n_frames, lc.active().latent_dim,
+                                           device=device, generator=gen_rng)
+                elif gen_rng is not None:
+                    torch.randn(1, n_frames, lc.active().latent_dim,
+                                device=device, generator=gen_rng)
+            out.update(zip(own, run_in_fitting_groups(
+                "generation", len(own), spf,
+                lambda a, b: euler_sample_cfg(
                     model, n_frames, device,
                     sampling_cfg=sampling_cfg,
                     use_amp=use_amp,
-                    frame_cond=_frame_cond([i]), global_cond=_global_cond([i]),
+                    frame_cond=_frame_cond(own[a:b]),
+                    global_cond=_global_cond(own[a:b]),
                     guidance=guidance,
                     frame_dims=frame_dims, global_configs=global_configs,
-                    gen_rng=gen_rng, text_ctx=_text_ctx([i]),
-                    inpaint=_ip([i]),
-                )
+                    gen_rng=gen_rng, text_ctx=_text_ctx(own[a:b]),
+                    x0=torch.cat([noise[i] for i in own[a:b]]),
+                    inpaint=_ip(own[a:b]),
+                ))))
         return out
 
     cond_lat = {} if inpaint_only else _generate()
 
     fidelity_evaluator.reset()
     fidelity_evaluator.keep_contours_for(own)
-    wavs = {}
-    for i, lat in cond_lat.items():
-        wav = decode_frames_to_wav(lat, normalizer, codec_model)
+    wavs = decode_frames_to_wavs(cond_lat, normalizer, codec_model)
+    for i, wav in wavs.items():
         if names:
             fidelity_evaluator.add_sample(
                 wav.numpy(), lc.active().sample_rate, n_frames,
                 {c: targets[c][i] for c in names}, sample_id=i)
-        wavs[i] = wav
     ps_cond = (fidelity_evaluator.per_sample()
                if names and not inpaint_only else {})
     cont_cond = ({c: fidelity_evaluator.contours(c) for c in names}
@@ -1484,8 +1546,8 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
             contexts[i], ctx_wavs[i] = probe_inpaint_context(
                 probe_sets, names, i, n_frames, normalizer, codec_model)
         for w, window in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
-            ip_wavs[w] = {i: decode_frames_to_wav(z, normalizer, codec_model)
-                          for i, z in _generate(contexts, window).items()}
+            ip_wavs[w] = decode_frames_to_wavs(_generate(contexts, window),
+                                               normalizer, codec_model)
 
     for i in own:
         _suffix = (f" [{probe_sets['text'].text(i)[:48]}]"
@@ -1729,22 +1791,27 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                                  else (ip[0][lo:hi], ip[1][lo:hi])),
                     )[0])))
         else:
+            noise = {}
             for j in range(n):
-                if j not in own_set:
-                    if gen_rng is not None:
-                        torch.randn(1, n_frames, lc.active().latent_dim,
-                                    device=device, generator=gen_rng)
-                    continue
-                out[j] = euler_sample_cfg(
+                if j in own_set:
+                    noise[j] = torch.randn(1, n_frames, lc.active().latent_dim,
+                                           device=device, generator=gen_rng)
+                elif gen_rng is not None:
+                    torch.randn(1, n_frames, lc.active().latent_dim,
+                                device=device, generator=gen_rng)
+            out.update(zip(own, run_in_fitting_groups(
+                "generation", len(own), max(1, spf),
+                lambda a, b: euler_sample_cfg(
                     model, n_frames, device,
                     sampling_cfg=sampling_cfg,
                     use_amp=use_amp,
-                    frame_cond=_fc([j], subset), global_cond=_gc([j]),
+                    frame_cond=_fc(own[a:b], subset), global_cond=_gc(own[a:b]),
                     guidance=guidance,
                     frame_dims=frame_dims, global_configs=global_configs,
-                    gen_rng=gen_rng, text_ctx=_ctx([j]),
-                    inpaint=_ip([j], window),
-                )
+                    gen_rng=gen_rng, text_ctx=_ctx(own[a:b]),
+                    x0=torch.cat([noise[j] for j in own[a:b]]),
+                    inpaint=_ip(own[a:b], window),
+                ))))
         return out
 
     lat = {} if inpaint_only else _generate()
@@ -1755,15 +1822,13 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
     if use_ev:
         fidelity_evaluator.reset()
         fidelity_evaluator.keep_contours_for(own)
-    wavs = {}
-    for j, z in lat.items():
-        wav = decode_frames_to_wav(z, normalizer, codec_model)
+    wavs = decode_frames_to_wavs(lat, normalizer, codec_model)
+    for j, wav in wavs.items():
         if use_ev:
             fidelity_evaluator.add_sample(
                 wav.numpy(), lc.active().sample_rate, n_frames,
                 {k: v.cpu().numpy() for k, v in items[j][1].items()},
                 sample_id=j)
-        wavs[j] = wav
     ps = fidelity_evaluator.per_sample() if use_ev else {}
     cont = fidelity_evaluator.contours() if use_ev else {}
 
@@ -1772,15 +1837,17 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
     for _lab, _names in (subset_specs or ()):
         if tuple(_names) == _full:
             continue
-        ladder[_lab] = {j: decode_frames_to_wav(z, normalizer, codec_model)
-                        for j, z in _generate(subset=set(_names)).items()}
+        ladder[_lab] = decode_frames_to_wavs(_generate(subset=set(_names)),
+                                             normalizer, codec_model)
 
     ip_wavs = {}
     if inpainting:
         for w, window in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
-            ip_wavs[w] = {j: decode_frames_to_wav(z, normalizer, codec_model)
-                          for j, z in _generate(window=window).items()}
+            ip_wavs[w] = decode_frames_to_wavs(_generate(window=window),
+                                               normalizer, codec_model)
 
+    reals = decode_frames_to_wavs({k: items[k][0] for k in own}, normalizer,
+                                  codec_model)
     img_failed, img_shown = None, 0
     for k in own:
         blk = f"test_{k:02d}{sfx.get(k, '')}"
@@ -1831,7 +1898,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
             if fixed_card_pending(writer, tags["conditions"][cname]):
                 writer.add_audio(tags["conditions"][cname], norm_wav(son),
                                  global_step=0, sample_rate=lc.active().sample_rate)
-        real = decode_frames_to_wav(items[k][0], normalizer, codec_model)
+        real = reals[k]
         if fixed_card_pending(writer, tags["real"]):
             writer.add_audio(tags["real"], norm_wav(real),
                              global_step=0, sample_rate=lc.active().sample_rate)
@@ -1908,33 +1975,40 @@ def run_uncond_inpaint_panels(test_dataset, ds_indices, model, normalizer,
     own_set = set(own)
     sr = lc.active().sample_rate
     frames = {j: test_dataset[ds_indices[j]][0] for j in own}
+    spf = max(1, int(sampling_cfg.get("metrics_samples_per_forward", 1) or 1))
 
     ip_wavs = {}
     for w, (lo, hi) in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
-        keep = inpaint_keep_window(1, n_frames, lo, hi)
         gen_rng = None
         if metrics_seed is not None:
             gen_rng = torch.Generator(device=device)
             gen_rng.manual_seed(int(metrics_seed))
-        ip_wavs[w] = {}
+        noise = {}
         for j in range(n):
-            if j not in own_set:
-                if gen_rng is not None:
-                    torch.randn(1, n_frames, lc.active().latent_dim,
-                                device=device, generator=gen_rng)
-                continue
-            z = euler_sample_cfg(
+            if j in own_set:
+                noise[j] = torch.randn(1, n_frames, lc.active().latent_dim,
+                                       device=device, generator=gen_rng)
+            elif gen_rng is not None:
+                torch.randn(1, n_frames, lc.active().latent_dim,
+                            device=device, generator=gen_rng)
+        z = run_in_fitting_groups(
+            "generation", len(own), spf,
+            lambda a, b: euler_sample_cfg(
                 model, n_frames, device,
                 sampling_cfg=sampling_cfg,
                 use_amp=use_amp,
                 frame_cond=None, global_cond=None, guidance=1.0,
                 frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng, inpaint=(keep, frames[j]))
-            ip_wavs[w][j] = decode_frames_to_wav(z, normalizer, codec_model)
+                gen_rng=gen_rng, x0=torch.cat([noise[j] for j in own[a:b]]),
+                inpaint=(inpaint_keep_window(b - a, n_frames, lo, hi),
+                         torch.stack([frames[j] for j in own[a:b]]))))
+        ip_wavs[w] = decode_frames_to_wavs(dict(zip(own, z)), normalizer,
+                                           codec_model)
 
+    reals = decode_frames_to_wavs(frames, normalizer, codec_model)
     for k in own:
         tags = audio_panel_tags("test", k, conditioned=True, generation=False)
-        real = decode_frames_to_wav(frames[k], normalizer, codec_model)
+        real = reals[k]
         if fixed_card_pending(writer, tags["real"]):
             writer.add_audio(tags["real"], norm_wav(real), global_step=0,
                              sample_rate=sr)
@@ -2089,19 +2163,22 @@ INPAINT_LEGEND = (
 _INPAINT_REF_CACHE = {}
 
 
-def _inpaint_real_wav(val_dataset, idx, normalizer, codec_model, fad_reference,
-                      wav_root, n_frames):
+def _inpaint_real_wavs(val_dataset, idxs, normalizer, codec_model, fad_reference,
+                       wav_root, n_frames):
     if fad_reference == "wav" and wav_root:
-        npy_path, _cp, start, _lab, _cls = val_dataset.samples[idx]
-        p = (Path(wav_root) / Path(npy_path).relative_to(val_dataset.latent_root)
-             .with_suffix(".wav"))
-        data, sr = sf.read(str(p), dtype="float32", always_2d=True)
-        per_frame = lc.active().hop_length * sr / lc.active().sample_rate
-        a = int(round(int(start) * per_frame))
-        b = int(round((int(start) + n_frames) * per_frame))
-        return torch.from_numpy(data[a:b].mean(axis=1).copy()), sr, per_frame
-    return (decode_frames_to_wav(val_dataset[idx][0], normalizer, codec_model),
-            lc.active().sample_rate, float(lc.active().hop_length))
+        for idx in idxs:
+            npy_path, _cp, start, _lab, _cls = val_dataset.samples[idx]
+            p = (Path(wav_root) / Path(npy_path).relative_to(val_dataset.latent_root)
+                 .with_suffix(".wav"))
+            data, sr = sf.read(str(p), dtype="float32", always_2d=True)
+            per_frame = lc.active().hop_length * sr / lc.active().sample_rate
+            a = int(round(int(start) * per_frame))
+            b = int(round((int(start) + n_frames) * per_frame))
+            yield torch.from_numpy(data[a:b].mean(axis=1).copy()), sr, per_frame
+        return
+    for wav in iter_decoded((val_dataset[i][0] for i in idxs), normalizer,
+                            codec_model):
+        yield wav, lc.active().sample_rate, float(lc.active().hop_length)
 
 
 def _fad_add(acc, e):
@@ -2197,10 +2274,10 @@ def evaluate_inpainting(
         if fad_on:
             acc_full = {"sx": None, "sxx": None, "n": 0}
             acc_seg = [{"sx": None, "sxx": None, "n": 0} for _ in thirds]
-            for j in sorted(p for p in fad_pos if p in items):
-                wav, wsr, per_frame = _inpaint_real_wav(
-                    val_dataset, indices[j], normalizer, codec_model,
-                    fad_reference, wav_root, n_frames)
+            for wav, wsr, per_frame in _inpaint_real_wavs(
+                    val_dataset, [indices[j] for j in sorted(p for p in fad_pos
+                                                             if p in items)],
+                    normalizer, codec_model, fad_reference, wav_root, n_frames):
                 _fad_add(acc_full, fad_embedder.embed(wav.view(1, 1, -1), wsr))
                 for w, (lo, hi) in enumerate(thirds):
                     seg = wav[int(round(lo * per_frame)):int(round(hi * per_frame))]
@@ -2271,22 +2348,32 @@ def evaluate_inpainting(
                         "generation", len(grp), len(grp), _part)):
                     out_c[j], out_u[j] = c, u
             return out_c, out_u
+        cond = conditioned and any_cond
+        grp, noise = [], []
         for j in range(n):
             if j not in items:
                 if gen_rng is not None:
                     torch.randn(1, n_frames, D, device=device, generator=gen_rng)
                 continue
-            cond = conditioned and any_cond
-            out_c[j] = euler_sample_cfg(
-                model, n_frames, device,
-                sampling_cfg=sampling_cfg,
-                use_amp=use_amp,
-                frame_cond=_fc([j], subset) if cond else None,
-                global_cond=_gc([j]) if cond else None,
-                guidance=guidance if cond else 1.0,
-                frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng, text_ctx=_tctx([j]) if cond else None,
-                inpaint=(keep_1, items[j][0]))
+            grp.append(j)
+            noise.append(torch.randn(1, n_frames, D, device=device, generator=gen_rng))
+            if len(grp) < max(1, spf) and j != own[-1]:
+                continue
+            x0, keep = torch.cat(noise), keep_1.expand(len(grp), -1)
+            lat = torch.stack([items[i][0] for i in grp])
+            out_c.update(zip(grp, run_in_fitting_groups(
+                "generation", len(grp), len(grp),
+                lambda a, b: euler_sample_cfg(
+                    model, n_frames, device,
+                    sampling_cfg=sampling_cfg,
+                    use_amp=use_amp,
+                    frame_cond=_fc(grp[a:b], subset) if cond else None,
+                    global_cond=_gc(grp[a:b]) if cond else None,
+                    guidance=guidance if cond else 1.0,
+                    frame_dims=frame_dims, global_configs=global_configs,
+                    gen_rng=gen_rng, text_ctx=_tctx(grp[a:b]) if cond else None,
+                    x0=x0[a:b], inpaint=(keep[a:b], lat[a:b])))))
+            grp, noise = [], []
         return out_c, None
 
     def _measure(lat_of, lo, hi, measure, fad, desc):
@@ -2296,11 +2383,13 @@ def evaluate_inpainting(
         gsims = {c: {} for c in gsim_names} if measure else {}
         f_full = {"sx": None, "sxx": None, "n": 0}
         f_seg = {"sx": None, "sxx": None, "n": 0}
-        for j in tqdm(sorted(lat_of), desc=desc, leave=False, disable=not is_main):
+        order = [j for j in sorted(lat_of) if measure or (fad and j in fad_pos)]
+        pend = {c: [] for c in gsim_names}
+        for j, wav in tqdm(zip(order, iter_decoded((lat_of[j] for j in order),
+                                                   normalizer, codec_model)),
+                           total=len(order), desc=desc, leave=False,
+                           disable=not is_main):
             need_fad = fad and j in fad_pos
-            if not (measure or need_fad):
-                continue
-            wav = decode_frames_to_wav(lat_of[j], normalizer, codec_model)
             seg = wav[lo * hop:hi * hop]
             if measure:
                 if frame_active:
@@ -2310,15 +2399,11 @@ def evaluate_inpainting(
                         sample_id=j, frames=(lo, hi))
                 for c in gsim_names:
                     t = items[j][2] if c == "text" else items[j][3]
-                    if not t.any():
-                        continue
-                    try:
-                        emb = global_embedders[c].embed(seg.numpy(), sr)
-                        gsims[c][j] = float(np.dot(emb, np.asarray(t.cpu()).reshape(-1)))
-                    except Exception as _e:
-                        if not gsims[c]:
-                            print(f"    [inpaint] {c} similarity unavailable: "
-                                  f"{type(_e).__name__}: {_e}")
+                    pend[c].append((j, seg.numpy(), t.cpu().numpy()))
+                    if len(pend[c]) == _DECODE_BATCH or j == order[-1]:
+                        add_similarity(gsims, global_embedders, c, pend[c], sr,
+                                       "inpaint")
+                        pend[c] = []
             if need_fad:
                 _fad_add(f_full, fad_embedder.embed(wav.view(1, 1, -1), sr))
                 _fad_add(f_seg, fad_embedder.embed(seg.reshape(1, 1, -1), sr))
@@ -2575,6 +2660,9 @@ def evaluate_and_log_metrics(
         return {"tokens": torch.stack([c["tokens"] for c in items]),
                 "mask":   torch.stack([c["mask"]   for c in items])}
 
+    def _cat(ds):
+        return None if ds[0] is None else {k: torch.cat([d[k] for d in ds]) for k in ds[0]}
+
     def _generate(conditioned, subset=None):
         lat_list = []
         targets = []
@@ -2583,6 +2671,8 @@ def evaluate_and_log_metrics(
         if metrics_seed is not None:
             gen_rng = torch.Generator(device=device)
             gen_rng.manual_seed(int(metrics_seed))
+        own = [j for j in range(len(indices)) if _mine(j)]
+        grp = []
         for j, idx in enumerate(indices):
             if not _mine(j):
                 if gen_rng is not None:
@@ -2615,15 +2705,24 @@ def evaluate_and_log_metrics(
                 tctx = _stack_ctx([text_ctx])
             else:
                 fc, gc, g, tctx = None, None, 1.0, None
-            gen = euler_sample_cfg(
-                model, n_frames, device,
-                sampling_cfg=sampling_cfg,
-                use_amp=use_amp,
-                frame_cond=fc, global_cond=gc, guidance=g,
-                frame_dims=frame_dims, global_configs=global_configs,
-                gen_rng=gen_rng, text_ctx=tctx,
-            )
-            lat_list.append(gen)
+            lat_list.append(None)
+            grp.append((j, fc, gc, tctx, torch.randn(
+                1, n_frames, lc.active().latent_dim, device=device, generator=gen_rng)))
+            if len(grp) < max(1, spf) and j != own[-1]:
+                continue
+            for (i, *_), z in zip(grp, run_in_fitting_groups(
+                    "generation", len(grp), len(grp),
+                    lambda lo, hi: euler_sample_cfg(
+                        model, n_frames, device,
+                        sampling_cfg=sampling_cfg,
+                        use_amp=use_amp,
+                        frame_cond=_cat([s[1] for s in grp[lo:hi]]),
+                        global_cond=_cat([s[2] for s in grp[lo:hi]]), guidance=g,
+                        frame_dims=frame_dims, global_configs=global_configs,
+                        gen_rng=gen_rng, text_ctx=_cat([s[3] for s in grp[lo:hi]]),
+                        x0=torch.cat([s[4] for s in grp[lo:hi]])))):
+                lat_list[i] = z
+            grp = []
         return lat_list, targets, global_targets
 
     def _generate_paired(spf):
@@ -2766,9 +2865,12 @@ def evaluate_and_log_metrics(
             fidelity_evaluator.keep_contours_for(())
         gsims = {c: {} for c in gsim_names} if measure else {}
         fst = {"sx": None, "sxx": None, "n": 0}
-        for i in tqdm(sorted(need), desc=desc, leave=False,
-                      disable=not is_main):
-            wav = decode_frames_to_wav(lat_list[i], normalizer, codec_model)
+        order = sorted(need)
+        pend = {c: [] for c in gsim_names}
+        for i, wav in tqdm(zip(order, iter_decoded((lat_list[i] for i in order),
+                                                   normalizer, codec_model)),
+                           total=len(order), desc=desc, leave=False,
+                           disable=not is_main):
             if measure:
                 wn = wav.numpy()
                 if frame_active:
@@ -2777,15 +2879,11 @@ def evaluate_and_log_metrics(
                         sample_id=i)
                 for c in gsim_names:
                     t = cond_globals[i].get(c) if i < len(cond_globals) else None
-                    if t is None or not np.any(t):
-                        continue
-                    try:
-                        emb = global_embedders[c].embed(wn, lc.active().sample_rate)
-                        gsims[c][i] = float(np.dot(emb, np.asarray(t).reshape(-1)))
-                    except Exception as _e:
-                        if not gsims[c]:
-                            print(f"    [metrics] {c} similarity unavailable: "
-                                  f"{type(_e).__name__}: {_e}")
+                    pend[c].append((i, wn, t))
+                    if len(pend[c]) == _DECODE_BATCH or i == order[-1]:
+                        add_similarity(gsims, global_embedders, c, pend[c],
+                                       lc.active().sample_rate, "metrics")
+                        pend[c] = []
             if fad and i in fad_pos:
                 e = fad_embedder.embed(wav.view(1, 1, -1), lc.active().sample_rate).to(
                     device=fad_device, dtype=torch.float64)
@@ -3598,6 +3696,7 @@ if __name__ == "__main__":
     print(f"[RUN NAME] {run_name}")
 
     set_codec_device(cfg.metrics.get("codec_device", "cpu"))
+    set_decode_batch(cfg.metrics.get("decode_batch", 1))
 
     CODEC = lc.activate(lc.dataset_codec(cfg.paths.dataset_root))
     print(f"[codec] {CODEC.name} (from the dataset): {CODEC.sample_rate} Hz, "
@@ -3936,10 +4035,9 @@ if __name__ == "__main__":
             _codec = get_codec()
 
             def _real_clips(idxs):
-                for i in idxs:
-                    frames = val_dataset[i][0]
-                    yield (decode_frames_to_wav(frames, normalizer, _codec)
-                           .view(1, 1, -1), lc.active().sample_rate)
+                for wav in iter_decoded((val_dataset[i][0] for i in idxs),
+                                        normalizer, _codec):
+                    yield wav.view(1, 1, -1), lc.active().sample_rate
 
             if _split:
                 _own = range(DIST.rank, len(val_dataset), DIST.world)

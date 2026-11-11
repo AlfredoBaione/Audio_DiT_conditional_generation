@@ -69,7 +69,7 @@ sampling:
   validation_text_source: null  # null = text_source | audio | label | text
   influence_subsets: []      # [] = off | ["all", "loo", "singletons"] | [["f0"], ["f0", "energy"]]
   metrics_uncond: false
-  metrics_samples_per_forward: 1   # 0 = serial sampler; N = N samples per forward
+  metrics_samples_per_forward: 32  # 0 = serial sampler; N = N samples per forward
   n_fad_samples: 512
 
 metrics:
@@ -79,6 +79,7 @@ metrics:
   influence_family: "influence_metrics"   # influence_metrics | mir_influence_metrics
   mir_threshold: 0.5
   codec_device: "cpu"        # cpu | cuda
+  decode_batch: 8            # clips decoded (and CLAP-embedded) together
   fad_device: "cuda"
   fad_reference: "wav"       # wav | decoded
 

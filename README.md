@@ -1092,6 +1092,9 @@ metrics:
                                   # codec decoder (DAC or EnCodec) lives. See
                                   # below: this is the one device knob that is
                                   # not free.
+  decode_batch: 8                 # clips decoded per call at the metrics step
+                                  # (the CLAP of the text influence takes the
+                                  # same groups). 1 = one at a time. See below.
 ```
 
 #### `influence_family` — our influence metrics or mir_eval's
@@ -1195,6 +1198,17 @@ dataset):
 DAC decoder device: cuda  (~0.2 s per 5 s clip; ~1 GB peak at the metrics step)
 [DAC] Model loaded once (CUDA:0) and cached for the whole run.
 ```
+
+#### `decode_batch` — clips decoded per call
+
+Every decode of the metrics step (the measured generations, the inpainting, the
+panels, the `decoded` FAD references) takes `metrics.decode_batch` clips per call,
+and the CLAP embeddings of the text influence are computed on the same groups.
+Measured on the RTX 5050 laptop: EnCodec, 10-second clips, 82.6 ms per clip one at
+a time, 31.6 ms at 8, for +2.75 GiB (about 0.34 GiB per clip); DAC, 5-second
+clips, 126 → 115 ms at 8, for +2.7 GB; CLAP 100 → 41 ms per clip at 8. A group that
+does not fit in GPU memory is halved by itself, and the log says so. VGGish and
+the re-extraction stay one clip at a time: grouping them gave nothing.
 
 Listing a metric is an explicit request: an unsupported name is a **hard error at
 startup**, not a silent skip. `fd_codec` and `kl_codec` share the generated
@@ -1665,15 +1679,17 @@ paired sampler**: each sample needs 3 rows per Euler step (`conditioned`,
 
 ```yaml
 sampling:
-  metrics_samples_per_forward: 1   # 0 = serial reference (lowest VRAM, slowest)
-                                   # 1 = batch 3  (default)
-                                   # 2 = batch 6, N = batch 3N (faster, higher peak)
+  metrics_samples_per_forward: 32  # 0 = serial reference (lowest VRAM, slowest)
+                                   # 1 = batch 3, 2 = batch 6, N = batch 3N
+                                   # (faster, higher peak); default 32
 ```
 
 It maps directly onto the activation peak, so **if the metrics step OOMs, lower it**
 (0 restores the reference sampler — same numbers, no code change); raise it only
 after checking `nvidia-smi` at a metrics step. Fusing needs a CFG to fuse, so the
-serial path runs anyway when guidance ≤ 1 or no condition is active.
+serial path runs when guidance ≤ 1 or no condition is active, and for
+`influence_subsets`; it also takes N samples per forward (batch N). The panels
+(test, probe, uncond and inpainting cards) follow the same rule.
 
 "Same numbers" includes the Condition_influence table, which is computed on the
 conditioned generations alone. The fused sampler also gets the generations
@@ -1718,6 +1734,10 @@ sampling:
   n_test_panels: 8         # test samples shown as panels
   n_probe_panels: 8        # probe stimuli shown as panels
   n_audio_samples: 4       # uncond generations
+  metrics_samples_per_forward: 32  # samples per forward (see the fused sampler)
+
+metrics:
+  decode_batch: 8          # clips decoded per call (see decode_batch)
 ```
 
 The command line wins over both: dotlist overrides as for the training (e.g.
