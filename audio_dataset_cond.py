@@ -576,6 +576,7 @@ def collate_conditioned(batch):
 
 def build_conditioned_datasets(
     latent_root:     str,
+    normalize_latents: bool,
     condition_root:  Optional[str] = None,
     duration_s:      float = 5.0,
     normalizer_path: Optional[str] = None,
@@ -595,7 +596,9 @@ def build_conditioned_datasets(
     label_to_idx = {c: i for i, c in enumerate(classes)}
 
     normalizer = LatentNormalizer()
-    if normalizer_path and Path(normalizer_path).exists():
+    if not normalize_latents:
+        normalizer = LatentNormalizer.identity()
+    elif normalizer_path and Path(normalizer_path).exists():
         normalizer.load(normalizer_path)
     else:
         _over = (f", over {normalizer_shard[1]} GPUs"

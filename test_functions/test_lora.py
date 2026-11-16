@@ -38,10 +38,12 @@ def run(model):
 def adapted(tmp, adapter, targets="blocks", rank=4, adaln="shared"):
     base = build(adaln=adaln)
     path = str(Path(tmp) / f"base_{adapter}_{targets}.pt")
-    torch.save({"model_state_dict": base.state_dict(), "t_features": "high_freq"}, path)
+    torch.save({"model_state_dict": base.state_dict(), "t_features": "high_freq",
+                "normalize_latents": True}, path)
     model = build(seed=1, adaln=adaln)
     cfg = OmegaConf.create({"paths": {"init_from": path},
                             "model": {"t_features": "high_freq"},
+                            "data": {"normalize_latents": True},
                             "lora": {"adapter": adapter, "rank": rank, "targets": targets}})
     lora.attach(model, cfg)
     return base, model, path, cfg

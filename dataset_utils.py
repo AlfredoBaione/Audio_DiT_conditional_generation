@@ -46,6 +46,14 @@ class LatentNormalizer:
         self.mean: Optional[torch.Tensor] = None
         self.std:  Optional[torch.Tensor] = None
 
+    @classmethod
+    def identity(cls):
+        normalizer = cls()
+        normalizer.mean = torch.zeros(lc.active().latent_dim, 1)
+        normalizer.std = torch.ones(lc.active().latent_dim, 1)
+        print("[Normalizer] off (data.normalize_latents: false)")
+        return normalizer
+
     def fit_from_chunks(
         self,
         chunks: List[Tuple[Path, int]],

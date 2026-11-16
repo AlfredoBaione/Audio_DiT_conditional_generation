@@ -306,25 +306,28 @@ def main():
             print("[test_cond] EMA not available - using main model weights")
     model.eval()
 
-    cache_dir = Path(cfg.paths.cache_dir)
-    normalizer_candidates = [
-        cache_dir / "normalizer.pt",
-        run_dir / "checkpoints" / "normalizer.pt",
-    ]
-    normalizer_path = None
-    for p in normalizer_candidates:
-        if p.exists():
-            normalizer_path = p
-            break
-    if normalizer_path is None:
-        raise FileNotFoundError(
-            f"normalizer.pt not found in any of: "
-            f"{[str(p) for p in normalizer_candidates]}"
-        )
+    if ckpt["normalize_latents"]:
+        cache_dir = Path(cfg.paths.cache_dir)
+        normalizer_candidates = [
+            cache_dir / "normalizer.pt",
+            run_dir / "checkpoints" / "normalizer.pt",
+        ]
+        normalizer_path = None
+        for p in normalizer_candidates:
+            if p.exists():
+                normalizer_path = p
+                break
+        if normalizer_path is None:
+            raise FileNotFoundError(
+                f"normalizer.pt not found in any of: "
+                f"{[str(p) for p in normalizer_candidates]}"
+            )
 
-    normalizer = LatentNormalizer()
-    normalizer.load(str(normalizer_path))
-    print(f"[test_cond] Normalizer: {normalizer_path}")
+        normalizer = LatentNormalizer()
+        normalizer.load(str(normalizer_path))
+        print(f"[test_cond] Normalizer: {normalizer_path}")
+    else:
+        normalizer = LatentNormalizer.identity()
 
     label_map = ckpt.get("label_map", {})
     del ckpt

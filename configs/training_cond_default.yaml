@@ -21,6 +21,7 @@ data:
   validation_shuffle: true
   validation_seed: 12345
   num_workers: 4             # 0 on Windows
+  normalize_latents: true    # false = raw codec latents
 
 training:
   num_steps: 1000001
@@ -94,7 +95,7 @@ conditioning:
   enabled_global: []         # text, image
 
 lora:
-  adapter: null              # null = off | lora | dora-rows; needs paths.init_from, paths.normalizer_from
+  adapter: null              # null = off | lora | dora-rows; needs paths.init_from, paths.normalizer_from if data.normalize_latents
   rank: 16
   targets: all               # attention | blocks | all
   lr: 1.0e-4

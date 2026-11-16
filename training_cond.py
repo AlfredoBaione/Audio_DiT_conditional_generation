@@ -3409,6 +3409,7 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
         "t_features":           str(cfg.model.get("t_features", "high_freq")),
         "adaln":                str(cfg.model.get("adaln", "shared")),
         "inpainting":           bool(cfg.training.get("inpainting", False)),
+        "normalize_latents":    bool(cfg.data.normalize_latents),
         "codec":                lc.active().name,
         "config":               OmegaConf.to_container(cfg, resolve=True),
         "label_map":            label_map,
@@ -3716,7 +3717,9 @@ if __name__ == "__main__":
                           errors="backslashreplace")
 
     normalizer_path     = os.path.join(cache_dir, "normalizer.pt")
-    fd_codec_cache_path = os.path.join(cache_dir, "fd_codec_ref_stats.pt")
+    fd_codec_cache_path = os.path.join(cache_dir, "fd_codec_ref_stats.pt"
+                                       if cfg.data.normalize_latents
+                                       else "fd_codec_ref_stats_raw.pt")
     _fad_ref_mode = str((cfg.get("metrics", None) or {}).get("fad_reference", "wav"))
     fad_cache_path = os.path.join(cache_dir, f"fad_vggish_ref_{_fad_ref_mode}.pt")
 
@@ -3725,7 +3728,7 @@ if __name__ == "__main__":
     if DIST.enabled and not DIST.is_main:
         dist_barrier(DIST)
     _validate_cache(cache_dir, _fingerprint)
-    if DIST.is_main and lora.adapter_of(cfg):
+    if DIST.is_main and lora.adapter_of(cfg) and cfg.data.normalize_latents:
         lora.install_normalizer(cfg.paths.normalizer_from, normalizer_path)
     if DIST.enabled and DIST.is_main:
         dist_barrier(DIST)
@@ -3855,6 +3858,7 @@ if __name__ == "__main__":
     train_dataset, val_dataset, test_dataset, normalizer, label_map, split_info = \
         build_conditioned_datasets(
             latent_root=cfg.paths.dataset_root,
+            normalize_latents=cfg.data.normalize_latents,
             condition_root=cond_root,
             duration_s=cfg.model.duration_s,
             normalizer_path=(normalizer_path
@@ -3881,7 +3885,7 @@ if __name__ == "__main__":
     if split_info["manifest_path"]:
         print(f"[split] read from: {split_info['manifest_path']}")
 
-    if DIST.is_main and not os.path.exists(normalizer_path):
+    if DIST.is_main and cfg.data.normalize_latents and not os.path.exists(normalizer_path):
         normalizer.save(normalizer_path)
 
     n_workers = int(cfg.data.get("num_workers", 4))

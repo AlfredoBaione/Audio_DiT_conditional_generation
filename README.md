@@ -547,9 +547,15 @@ python training_cond.py --config configs/training_cond_default.yaml \
   are nested under `model.n_params_*` (and printed at startup). They are
   deliberately NOT logged as scalars: a constant is a flat point at step 0 that
   only clutters the Scalars dashboard.
+- `data.normalize_latents: true` scales every latent channel to mean 0 and std 1 with
+  that normalizer (`normalizer.pt` in `paths.cache_dir`); `false` trains on the raw codec
+  latents and makes no normalizer. `test_cond.py` and `sampling_cond.py` read the choice
+  from the checkpoint.
 - **Cache safety:** the normalizer and the FD reference (in the latent space of
   the dataset's codec, DAC or EnCodec) are tied to the dataset via
   `cache_dir/cache_meta.json`. A stale or unverifiable cache **hard-fails**.
+  With `data.normalize_latents: false` the FD reference is `fd_codec_ref_stats_raw.pt`,
+  so the same cache serves both settings.
 - CLI overrides use dotlist syntax (e.g. `model.kind=B training.lr=5e-5`).
 - Resume: `--resume runs/<prev>/checkpoints/checkpoint_step50000.pt`.
 
@@ -1053,7 +1059,9 @@ python launch_training_cond.py --run_name <name> \
   condition.
 - **The normalizer.** `paths.normalizer_from` is copied into `paths.cache_dir`: the
   base expects latents scaled with it. A cache that holds another normalizer stops
-  the run, so a new dataset needs a new `paths.cache_dir`.
+  the run, so a new dataset needs a new `paths.cache_dir`. Only with
+  `data.normalize_latents: true`; the run must use the base's value, otherwise it stops
+  at the start.
 - **Training.** The optimizer holds only the adapters; the base never changes.
 - **Checkpoints.** They hold the adapters and the path of the base
   (`paths.init_from`), which must stay where it is. `--resume` works as usual.

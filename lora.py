@@ -34,7 +34,8 @@ def check_config(cfg):
     if int(cfg.lora.rank) < 1:
         raise SystemExit(f"[config] lora.rank = {cfg.lora.rank}, must be >= 1. "
                          f"Nothing was run.")
-    for key in ("init_from", "normalizer_from"):
+    keys = ("init_from", "normalizer_from") if cfg.data.normalize_latents else ("init_from",)
+    for key in keys:
         path = cfg.paths.get(key, None)
         if not path or not os.path.exists(path):
             raise SystemExit(f"[config] lora.adapter needs paths.{key}, got "
@@ -79,12 +80,15 @@ def base_weights(path):
 def attach(model, cfg):
     path = cfg.paths.init_from
     t_features = cfg.model.get("t_features", "high_freq")
-    base_t_features = torch.load(path, map_location="cpu", weights_only=False,
-                                 mmap=True)["t_features"]
+    base = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    base_t_features = base["t_features"]
     if base_t_features != t_features:
         raise SystemExit(f"[lora] {path} was trained with model.t_features="
                          f"{base_t_features}, this run builds {t_features}: set "
                          f"model.t_features={base_t_features}.")
+    if base["normalize_latents"] != cfg.data.normalize_latents:
+        raise SystemExit(f"[lora] {path} was trained with data.normalize_latents="
+                         f"{base['normalize_latents']}: set the same value in this run.")
     try:
         model.load_state_dict(base_weights(path))
     except RuntimeError as e:

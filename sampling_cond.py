@@ -492,10 +492,13 @@ def main():
             print("  -> EMA present but NOT trained yet (checkpoint predates "
                   "training.ema_start): using the live model weights")
 
-    normalizer = LatentNormalizer()
-    norm_path = resolve_normalizer_path(ckpt, args.checkpoint, cli_path=args.normalizer)
-    print(f"Normalizer: {norm_path}")
-    normalizer.load(norm_path)
+    if ckpt["normalize_latents"]:
+        normalizer = LatentNormalizer()
+        norm_path = resolve_normalizer_path(ckpt, args.checkpoint, cli_path=args.normalizer)
+        print(f"Normalizer: {norm_path}")
+        normalizer.load(norm_path)
+    else:
+        normalizer = LatentNormalizer.identity()
 
     t_schedule = args.t_schedule or ckpt["config"]["sampling"]["t_schedule"]
     guidance_type = (args.guidance_type
