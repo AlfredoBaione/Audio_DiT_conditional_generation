@@ -72,6 +72,10 @@ sampling:
   metrics_uncond: false
   metrics_samples_per_forward: 32  # 0 = serial sampler; N = N samples per forward
   n_fad_samples: 512
+  inpaint_windows:           # per window, the [start, end] spans regenerated, in fractions of the clip
+    - [[0.0, 0.6667]]
+    - [[0.0, 0.3333], [0.6667, 1.0]]
+    - [[0.3333, 1.0]]
 
 metrics:
   enabled: ["fd_codec", "kl_codec", "fad_vggish"]

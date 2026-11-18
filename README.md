@@ -948,7 +948,7 @@ metrics step, the panels, the uncond cards. Every grid goes from `t = 1` to `t =
   `euler_steps` and `t_schedule`. The startup log says which:
   `Sampling t schedule: uniform (equal steps from t=1 to t=0) | 100 Euler steps, 10 of them at t > 0.9 (noise end), the last at t=0.010`.
 
-### Inpainting — `training.inpainting`, `training.inpaint_masks`
+### Inpainting — `training.inpainting`, `training.inpaint_masks`, `sampling.inpaint_windows`
 
 The model can learn to regenerate a stretch of a clip given the rest of it: every
 example of the batch draws a mask, the frames the mask keeps are given to the model
@@ -960,6 +960,11 @@ training:
   inpaint_masks: [0.8, 0.1, 0.05, 0.05]  # probability of: full mask (generate from scratch),
                                          # 1-5 random spans, continuation (a prefix kept),
                                          # backward continuation (a suffix kept)
+sampling:
+  inpaint_windows:                       # the validation windows: per window, the
+    - [[0.0, 0.6667]]                    # [start, end] spans regenerated, in fractions
+    - [[0.0, 0.3333], [0.6667, 1.0]]     # of the clip
+    - [[0.3333, 1.0]]
 ```
 
 - **The masks.** The continuation keeps a prefix of random length and
@@ -985,31 +990,36 @@ training:
 - **Checkpoints.** The checkpoint records the flag: a resume keeps it, a resume
   with the other value stops. `paths.init_from` from a model
   without inpainting works (the new layers start at zero); the other way stops.
-- **Validation, on fixed thirds.** Besides `Validation/Loss` (full mask, as
-  before), `Validation/Loss_inpaint_1_start`, `_2_middle`, `_3_end` (+ `_ema`):
-  the same validation batches, noise and `t`, with the first, the middle or the
-  last third regenerated (0–1.67, 1.67–3.33, 3.33–5.00 s on a 5 s clip).
-- **Metrics step.** Every validation clip of the step is regenerated three
-  times, once per third, with the rest of the clip as context, put back as it
-  was before decoding: 3 × `n_metrics_samples` generations more, about 4 times as
-  long.
-  `Validation/Inpainting/` has one curve per metric and third:
-  `Fd_dac_cond_<third>` (`Fd_encodec_` on EnCodec), `Kl_cond/real_gen_<third>`,
-  `Kl_cond/gen_real_<third>` — the frames of that third against the same third
-  of the real clips —, `Fad_vggish_full_cond_<third>` (the whole clip with that
-  third regenerated, against the same real clips) and
-  `Fad_vggish_inpaint_cond_<third>` (that third alone, against the same third);
-  the same with `_uncond` when `sampling.metrics_uncond` is on, and with
-  `mir_influence_metrics` the mir curves of every condition per third. A run
-  without conditions logs `Fd_dac_<third>`, `Kl_real_gen_<third>`, ... A third of
-  a 5 s clip is 1.7 s, one VGGish window: `Fad_vggish_inpaint` rests on one
-  embedding per clip.
-- **The Text table** gets one block per third — with-cond, null, Δ — measured on
-  the frames of that third; null is the same context without conditions. The
-  legend says so, and `sampling.influence_subsets` applies to the blocks too.
-- **Listening:** three cards per panel, the probes' context, a group per test
-  clip in a run without conditions — see the Audio window in *Unconditional
-  training with the same code* below.
+- **Validation, on fixed windows.** Besides `Validation/Loss` (full mask, as
+  before), one `Validation/Loss_inpaint_<window>` (+ `_ema`) per window of
+  `sampling.inpaint_windows`: the same validation batches, noise and `t`, with the
+  spans of that window regenerated. The name is the window's number and its spans:
+  `1_0-0.6667` (the first two thirds), `2_0-0.3333+0.6667-1` (the first and the
+  last third), `3_0.3333-1` (the last two thirds), that is 0–6.66, 0–3.34 +
+  6.66–10.00 and 3.34–10.00 s on a 10 s clip. An empty window, or a span outside
+  [0, 1], with start >= end or overlapping another, stops the run at startup.
+- **Metrics step.** Every validation clip of the step is regenerated once per
+  window, with the rest of the clip as context, put back as it was before
+  decoding: with three windows, 3 × `n_metrics_samples` generations more, about 4
+  times as long.
+  `Validation/Inpainting/` has one curve per metric and window:
+  `Fd_dac_cond_<window>` (`Fd_encodec_` on EnCodec), `Kl_cond/real_gen_<window>`,
+  `Kl_cond/gen_real_<window>` — the frames of its spans against the same frames
+  of the real clips —, `Fad_vggish_full_cond_<window>` (the whole clip with those
+  spans regenerated, against the same real clips) and
+  `Fad_vggish_inpaint_cond_<window>` (the spans alone, each embedded on its own,
+  against the same spans); the same with `_uncond` when `sampling.metrics_uncond`
+  is on, and with `mir_influence_metrics` the mir curves of every condition per
+  window. A run without conditions logs `Fd_dac_<window>`, `Kl_real_gen_<window>`,
+  ... VGGish gives one embedding per 0.96 s: a third of a 5 s clip, 1.7 s, gives
+  one per clip.
+- **The Text table** gets one block per window — with-cond, null, Δ — measured on
+  the frames of its spans put end to end (the text and image similarities on
+  their audio); null is the same context without conditions. The legend says so,
+  and `sampling.influence_subsets` applies to the blocks too.
+- **Listening:** one card per window in every panel, the probes' context, a
+  group per test clip in a run without conditions — see the Audio window in
+  *Unconditional training with the same code* below.
 - `test_cond.py` does the same on the test split (`Test/Inpainting/`, the blocks
   of `Test/Condition_influence`), and `sampling_cond.py inpaint` regenerates a
   stretch of any audio file (§4).
@@ -1256,8 +1266,8 @@ sample was given:
 - With `sampling.influence_subsets` on, the panel becomes the Δ matrix (one row
   per subset of conditions, one column per metric) with the detailed table of
   every subset underneath.
-- With `training.inpainting` the panel has one more block per third of the
-  clip, measured on that third (see *Inpainting* above).
+- With `training.inpainting` the panel has one more block per window of
+  `sampling.inpaint_windows`, measured on its spans (see *Inpainting* above).
 - The null generations cost no extra sampling under CFG (the unconditional
   velocity is computed anyway), but they are decoded and measured like the
   conditioned ones: the audio part of the panel takes twice as long.
@@ -1395,13 +1405,13 @@ test_XX/1_real                  the recording the conditions come from
 test_XX/2_f0                    the sonified f0 target
 test_XX/3..N_<cond>             energy, chroma, ...
 test_XX/N+1_generation          the generation they produced
-test_XX/N+2_inpaint_<third>     (inpainting) that third regenerated, the rest the recording
+test_XX/N+2_inpaint_<window>    (inpainting) the spans of that window regenerated, the rest the recording
 probe_XX/1_f0 , /2_chroma , /3_generation
-probe_XX/3_inpaint_context , /4_generation , /5_inpaint_<third>   (inpainting)
+probe_XX/3_inpaint_context , /4_generation , /5_inpaint_<window>  (inpainting)
 
 uncond generation/NN            generations without conditions
 ground truth/real_test_XX       (unconditional run only) real TEST recordings
-test_XX/1_real , /2_inpaint_<third>   (unconditional run with inpainting, instead)
+test_XX/1_real , /2_inpaint_<window>  (unconditional run with inpainting, instead)
 ```
 
 A card name does not repeat what the text before the `/` already says: the
@@ -1409,9 +1419,9 @@ dashboard writes the whole tag above every card, so `probe_00/1_f0` is the f0
 card of probe 00 even on its own. `ground truth/` keeps `real_test_XX`, since
 there the number is not before the `/`.
 
-With `training.inpainting` every test and probe panel gets three cards after
-the generation, `<n>_inpaint_1_start`, `_2_middle` and `_3_end`: the same clip
-with that third regenerated, from the noise draw of the panel's generation,
+With `training.inpainting` every test and probe panel gets one card per window
+after the generation, `<n>_inpaint_<window>`: the same clip with the spans of
+that window regenerated, from the noise draw of the panel's generation,
 written by the metrics step. The rest of the clip is the context. For a test
 panel it is the recording. A probe has no recording, so its context is the sum
 of its stimuli: each frame condition's sonification divided by its RMS, summed,
@@ -1419,7 +1429,7 @@ then brought to peak 0.25, the level of one stimulus, and encoded once per run
 with the run's codec. It is the card `<n>_inpaint_context`, right after the
 stimuli. A probe of globals only (text, image) has no waveform to give as
 context, and no inpainting cards. In a run without conditions the inpainting has
-a group per test clip, `test_XX/1_real` and `test_XX/2_inpaint_<third>`, in
+a group per test clip, `test_XX/1_real` and `test_XX/2_inpaint_<window>`, in
 place of `ground truth/`. With
 inpainting only (`inpaint_masks: [0, …]`) the inpainting cards take the slot of
 the generation, and nothing generated from scratch is shown.
@@ -1459,9 +1469,9 @@ audio/
 │   ├── conditions.npz           every array / vector the model received
 │   ├── text.txt                 the sentence the model received (text runs)
 │   ├── image.<ext>              the picture the model received (image runs)
-│   ├── info.json                which test sample, guidance, noise draw (+ the thirds, with inpainting)
+│   ├── info.json                which test sample, guidance, noise draw (+ the windows in seconds, with inpainting)
 │   ├── step_0050000_EMA.wav …   its generation at every metrics step
-│   └── step_0050000_EMA_inpaint_1_start.wav …   (inpainting) the three regenerated thirds
+│   └── step_0050000_EMA_inpaint_1_0-0.6667.wav …   (inpainting) one per window
 ├── probe/probe_00/              a probe panel: the same, without real.wav
 │                                (+ inpaint_context.wav, the context, with inpainting)
 ├── uncond/uncond_00/            step_0025000_EMA.wav … only
@@ -1761,7 +1771,7 @@ records `euler_steps`, `t_schedule` and `guidance_type`.
 | window | content |
 |---|---|
 | Time series | `Test/Metrics/*`: FD (`Fd_dac_*` or `Fd_encodec_*`, by the checkpoint's codec), KL (both directions), FAD-VGGish if in `metrics.enabled`, on `n_metrics_samples` test samples spread over the split, against the real test data; `Test/Inpainting/*` for a checkpoint trained with inpainting (the curves of *Inpainting* in §3, without the mir ones) |
-| Text | `Test/Condition_influence`: the training's panel on those same generations, at the checkpoint's step -- a row per metric of every condition (`<cond>_test`, text / image included), columns with-cond / null / Δ / valid/used, and with inpainting one block per third; its legend; the config |
+| Text | `Test/Condition_influence`: the training's panel on those same generations, at the checkpoint's step -- a row per metric of every condition (`<cond>_test`, text / image included), columns with-cond / null / Δ / valid/used, and with inpainting one block per window; its legend; the config |
 | Images | `test_XX/` and `probe_XX/`: target vs re-extracted condition |
 | Audio | `test_XX/` (recording, sonified conditions, generation), `probe_XX/` (stimuli, generation), `uncond generation/NN`; with inpainting, the inpainting cards and the probes' context |
 

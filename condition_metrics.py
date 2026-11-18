@@ -831,8 +831,9 @@ class ConditionFidelityEvaluator:
                 print(f"  [fidelity] re-extraction failed for '{name}': {e}")
                 continue
             if frames is not None:
-                target = target[frames[0]:frames[1]]
-                generated = np.asarray(generated)[frames[0]:frames[1]]
+                target = np.concatenate([target[lo:hi] for lo, hi in frames])
+                generated = np.concatenate([np.asarray(generated)[lo:hi]
+                                            for lo, hi in frames])
             if sid in self._keep_ids:
                 self._contours[name][sid] = (target.copy(),
                                              np.asarray(generated).copy())

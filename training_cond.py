@@ -781,19 +781,33 @@ def apply_cfg_dropout(frame_cond, global_cond, device, global_configs, B,
 
 
 
-INPAINT_WINDOWS = ("1_start", "2_middle", "3_end")
 INPAINT_MAX_SPANS = 5
 
 
-def inpaint_thirds(n_frames):
-    b = [int(round(k * n_frames / 3)) for k in range(4)]
-    return [(b[k], b[k + 1]) for k in range(3)]
+def inpaint_windows(sampling_cfg, n_frames):
+    out = {}
+    for k, w in enumerate(sampling_cfg.inpaint_windows):
+        ends = [float(x) for s in w for x in s]
+        if (not w or any(a >= b for a, b in w) or ends != sorted(ends)
+                or ends[0] < 0.0 or ends[-1] > 1.0):
+            raise SystemExit(
+                f"[config] sampling.inpaint_windows: window {k + 1} = {w}, must be "
+                f"[start, end] spans in fractions of the clip, 0 <= start < end <= 1, "
+                f"in increasing order and not overlapping.")
+        out[f"{k + 1}_" + "+".join(f"{a:g}-{b:g}" for a, b in w)] = [
+            (int(round(a * n_frames)), int(round(b * n_frames))) for a, b in w]
+    return out
 
 
-def inpaint_keep_window(B, n_frames, lo, hi):
+def inpaint_keep_window(B, n_frames, spans):
     keep = torch.ones(B, n_frames)
-    keep[:, lo:hi] = 0.0
+    for lo, hi in spans:
+        keep[:, lo:hi] = 0.0
     return keep
+
+
+def inpaint_frames(x, spans):
+    return torch.cat([x[lo:hi] for lo, hi in spans])
 
 
 def random_inpaint_keep(B, n_frames, probs):
@@ -1100,7 +1114,8 @@ def uncond_card_tag(k):
 
 
 def audio_panel_tags(family, idx, active_conditions=(), suffix="",
-                     conditioned=None, generation=True, context=False):
+                     conditioned=None, generation=True, context=False,
+                     windows=()):
     active = sorted(active_conditions)
     lead = "f0" if "f0" in active else (active[0] if active else None)
     if conditioned is None:
@@ -1127,7 +1142,7 @@ def audio_panel_tags(family, idx, active_conditions=(), suffix="",
         "generation": f"{block}/{gen_slot}_generation",
         "real": real,
         "inpaint": {w: f"{block}/{ip_slot}_inpaint_{w}"
-                    for w in INPAINT_WINDOWS},
+                    for w in windows},
     }
 
 
@@ -1250,12 +1265,13 @@ def real_test_indices(n_test, n_samples):
     return torch.linspace(0, total - 1, n).long().tolist() if n else []
 
 
-def inpaint_panel_info(n_frames, context):
+def inpaint_panel_info(sampling_cfg, n_frames, context):
     fps = lc.active().frames_per_s
     return {"context": context,
-            "regenerated_s": {w: [round(lo / fps, 3), round(hi / fps, 3)]
-                              for w, (lo, hi) in zip(INPAINT_WINDOWS,
-                                                     inpaint_thirds(n_frames))}}
+            "regenerated_s": {w: [[round(lo / fps, 3), round(hi / fps, 3)]
+                                  for lo, hi in spans]
+                              for w, spans in inpaint_windows(sampling_cfg,
+                                                              n_frames).items()}}
 
 
 @torch.no_grad()
@@ -1472,7 +1488,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         def _ip(idxs):
             if window is None:
                 return None
-            return (inpaint_keep_window(len(idxs), n_frames, *window),
+            return (inpaint_keep_window(len(idxs), n_frames, window),
                     torch.stack([contexts[i] for i in idxs]))
 
         out = {}
@@ -1545,7 +1561,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         for i in own:
             contexts[i], ctx_wavs[i] = probe_inpaint_context(
                 probe_sets, names, i, n_frames, normalizer, codec_model)
-        for w, window in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
+        for w, window in inpaint_windows(sampling_cfg, n_frames).items():
             ip_wavs[w] = decode_frames_to_wavs(_generate(contexts, window),
                                                normalizer, codec_model)
 
@@ -1584,7 +1600,7 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
         tags = audio_panel_tags("probe", i, names, suffix=_suffix,
                                 conditioned=bool(names or gnames),
                                 generation=not inpaint_only,
-                                context=bool(ip_wavs))
+                                context=bool(ip_wavs), windows=ip_wavs)
 
         for c in names:
             if not fixed_card_pending(writer, tags["conditions"][c]):
@@ -1620,9 +1636,10 @@ def run_joint_probe(probe_sets, model, normalizer, n_frames,
                 "noise": {"metrics_seed": metrics_seed, "draw": i}}
         if ip_wavs:
             info["inpainting"] = inpaint_panel_info(
-                n_frames, f"inpaint_context.wav: the sum of the sonifications "
-                          f"of {', '.join(names)}, each at the same RMS, then "
-                          f"peak {PROBE_CONTEXT_PEAK}")
+                sampling_cfg, n_frames,
+                f"inpaint_context.wav: the sum of the sonifications "
+                f"of {', '.join(names)}, each at the same RMS, then "
+                f"peak {PROBE_CONTEXT_PEAK}")
         pdir = _panel_dir(output_dir, "probe", i)
         write_panel_conditions(
             pdir, info, arrays,
@@ -1758,7 +1775,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
     def _ip(grp, window):
         if window is None:
             return None
-        return (inpaint_keep_window(len(grp), n_frames, *window),
+        return (inpaint_keep_window(len(grp), n_frames, window),
                 torch.stack([items[j][0] for j in grp]))
 
     def _generate(subset=None, window=None):
@@ -1842,7 +1859,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
 
     ip_wavs = {}
     if inpainting:
-        for w, window in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
+        for w, window in inpaint_windows(sampling_cfg, n_frames).items():
             ip_wavs[w] = decode_frames_to_wavs(_generate(window=window),
                                                normalizer, codec_model)
 
@@ -1886,7 +1903,8 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                     img_failed = f"{ref[0]}/{ref[1]}: {type(e).__name__}: {e}"
 
         tags = audio_panel_tags("test", k, names, suffix=sfx.get(k, ""),
-                                conditioned=True, generation=not inpaint_only)
+                                conditioned=True, generation=not inpaint_only,
+                                windows=ip_wavs)
         sons = {}
         for cname, carr in sorted(items[k][1].items()):
             if cname not in tags["conditions"]:
@@ -1944,7 +1962,7 @@ def run_test_panels(test_dataset, ds_indices, model, normalizer, n_frames,
                         if lab in ladder}})
         if ip_wavs:
             info["inpainting"] = inpaint_panel_info(
-                n_frames, "real.wav: the real audio of this chunk")
+                sampling_cfg, n_frames, "real.wav: the real audio of this chunk")
         pdir = _panel_dir(output_dir, "test", k)
         write_panel_conditions(pdir, info, arrays, sons, real_wav=real.numpy(),
                                text_lines=text_lines, image_file=img_file)
@@ -1978,7 +1996,7 @@ def run_uncond_inpaint_panels(test_dataset, ds_indices, model, normalizer,
     spf = max(1, int(sampling_cfg.get("metrics_samples_per_forward", 1) or 1))
 
     ip_wavs = {}
-    for w, (lo, hi) in zip(INPAINT_WINDOWS, inpaint_thirds(n_frames)):
+    for w, window in inpaint_windows(sampling_cfg, n_frames).items():
         gen_rng = None
         if metrics_seed is not None:
             gen_rng = torch.Generator(device=device)
@@ -2000,14 +2018,15 @@ def run_uncond_inpaint_panels(test_dataset, ds_indices, model, normalizer,
                 frame_cond=None, global_cond=None, guidance=1.0,
                 frame_dims=frame_dims, global_configs=global_configs,
                 gen_rng=gen_rng, x0=torch.cat([noise[j] for j in own[a:b]]),
-                inpaint=(inpaint_keep_window(b - a, n_frames, lo, hi),
+                inpaint=(inpaint_keep_window(b - a, n_frames, window),
                          torch.stack([frames[j] for j in own[a:b]]))))
         ip_wavs[w] = decode_frames_to_wavs(dict(zip(own, z)), normalizer,
                                            codec_model)
 
     reals = decode_frames_to_wavs(frames, normalizer, codec_model)
     for k in own:
-        tags = audio_panel_tags("test", k, conditioned=True, generation=False)
+        tags = audio_panel_tags("test", k, conditioned=True, generation=False,
+                                windows=ip_wavs)
         real = reals[k]
         if fixed_card_pending(writer, tags["real"]):
             writer.add_audio(tags["real"], norm_wav(real), global_step=0,
@@ -2026,7 +2045,7 @@ def run_uncond_inpaint_panels(test_dataset, ds_indices, model, normalizer,
                 "split": "test", "dataset_index": idx, "latent": latent,
                 "start_frame": int(start), "class": class_name,
                 "inpainting": inpaint_panel_info(
-                    n_frames, "real.wav: the real audio of this chunk"),
+                    sampling_cfg, n_frames, "real.wav: the real audio of this chunk"),
                 "noise": {"metrics_seed": metrics_seed, "draw": k}}
         pdir = _panel_dir(output_dir, "test", k)
         write_panel_conditions(pdir, info, {}, {}, real_wav=real.numpy())
@@ -2155,10 +2174,10 @@ MIR_CURVE_METRICS = {
 }
 
 INPAINT_LEGEND = (
-    "- **Inpainting blocks** — one per third of the clip: every validation "
-    "clip has that third regenerated, the rest is given as context and kept. "
-    "with-cond, null and Δ are measured on the frames of that third only; "
-    "null = the same context without conditions.\n")
+    "- **Inpainting blocks** — one per window of `sampling.inpaint_windows`: every "
+    "validation clip has the spans of that window regenerated, the rest is given "
+    "as context and kept. with-cond, null and Δ are measured on the frames of "
+    "those spans only; null = the same context without conditions.\n")
 
 _INPAINT_REF_CACHE = {}
 
@@ -2229,7 +2248,7 @@ def evaluate_inpainting(
     sr = lc.active().sample_rate
     hop = lc.active().hop_length
     fps = lc.active().frames_per_s
-    thirds = inpaint_thirds(n_frames)
+    windows = inpaint_windows(sampling_cfg, n_frames)
     any_cond = bool(frame_dims) or bool(global_configs)
     frame_active = fidelity_evaluator is not None and fidelity_evaluator.active
     gsim_names = sorted(c for c in (global_configs or {})
@@ -2250,7 +2269,7 @@ def evaluate_inpainting(
     _fd = "dac" if lc.active().name == "dac_44khz" else "encodec"
 
     if is_main:
-        print(f"\n  Inpainting metrics @ step {step}: {len(thirds)} thirds x {n} "
+        print(f"\n  Inpainting metrics @ step {step}: {len(windows)} windows x {n} "
               f"clips, the rest of each clip as context"
               + (" (+ the same without conditions)" if need_null else ""))
 
@@ -2265,23 +2284,25 @@ def evaluate_inpainting(
            fad_reference, n_fad_use, di.world, di.rank, want_lat, fad_on)
     ref = _INPAINT_REF_CACHE.get(key)
     if ref is None:
-        ref = {"lat": [None] * len(thirds), "full": None,
-               "seg": [None] * len(thirds)}
+        ref = {"lat": [None] * len(windows), "full": None,
+               "seg": [None] * len(windows)}
         if want_lat:
-            for w, (lo, hi) in enumerate(thirds):
+            for w, spans in enumerate(windows.values()):
                 ref["lat"][w] = dist_latent_stats(
-                    [items[j][0][lo:hi] for j in own], device, di)
+                    [inpaint_frames(items[j][0], spans) for j in own], device, di)
         if fad_on:
             acc_full = {"sx": None, "sxx": None, "n": 0}
-            acc_seg = [{"sx": None, "sxx": None, "n": 0} for _ in thirds]
+            acc_seg = [{"sx": None, "sxx": None, "n": 0} for _ in windows]
             for wav, wsr, per_frame in _inpaint_real_wavs(
                     val_dataset, [indices[j] for j in sorted(p for p in fad_pos
                                                              if p in items)],
                     normalizer, codec_model, fad_reference, wav_root, n_frames):
                 _fad_add(acc_full, fad_embedder.embed(wav.view(1, 1, -1), wsr))
-                for w, (lo, hi) in enumerate(thirds):
-                    seg = wav[int(round(lo * per_frame)):int(round(hi * per_frame))]
-                    _fad_add(acc_seg[w], fad_embedder.embed(seg.reshape(1, 1, -1), wsr))
+                for w, spans in enumerate(windows.values()):
+                    for lo, hi in spans:
+                        seg = wav[int(round(lo * per_frame)):int(round(hi * per_frame))]
+                        _fad_add(acc_seg[w],
+                                 fad_embedder.embed(seg.reshape(1, 1, -1), wsr))
             ref["full"] = _fad_stats(_fad_reduce(acc_full, di))
             ref["seg"] = [_fad_stats(_fad_reduce(a, di)) for a in acc_seg]
         _INPAINT_REF_CACHE[key] = ref
@@ -2311,8 +2332,8 @@ def evaluate_inpainting(
         return {"tokens": torch.stack([items[j][4]["tokens"] for j in js]),
                 "mask": torch.stack([items[j][4]["mask"] for j in js])}
 
-    def _generate(lo, hi, conditioned=True, subset=None):
-        keep_1 = inpaint_keep_window(1, n_frames, lo, hi)[0]
+    def _generate(spans, conditioned=True, subset=None):
+        keep_1 = inpaint_keep_window(1, n_frames, spans)[0]
         gen_rng = _rng()
         out_c, out_u = {}, {}
         if paired and conditioned and subset is None:
@@ -2376,7 +2397,7 @@ def evaluate_inpainting(
             grp, noise = [], []
         return out_c, None
 
-    def _measure(lat_of, lo, hi, measure, fad, desc):
+    def _measure(lat_of, spans, measure, fad, desc):
         if measure and frame_active:
             fidelity_evaluator.reset()
             fidelity_evaluator.keep_contours_for(())
@@ -2390,23 +2411,24 @@ def evaluate_inpainting(
                            total=len(order), desc=desc, leave=False,
                            disable=not is_main):
             need_fad = fad and j in fad_pos
-            seg = wav[lo * hop:hi * hop]
+            segs = [wav[lo * hop:hi * hop] for lo, hi in spans]
             if measure:
                 if frame_active:
                     fidelity_evaluator.add_sample(
                         wav.numpy(), sr, n_frames,
                         {k: v.cpu().numpy() for k, v in items[j][1].items()},
-                        sample_id=j, frames=(lo, hi))
+                        sample_id=j, frames=spans)
                 for c in gsim_names:
                     t = items[j][2] if c == "text" else items[j][3]
-                    pend[c].append((j, seg.numpy(), t.cpu().numpy()))
+                    pend[c].append((j, torch.cat(segs).numpy(), t.cpu().numpy()))
                     if len(pend[c]) == _DECODE_BATCH or j == order[-1]:
                         add_similarity(gsims, global_embedders, c, pend[c], sr,
                                        "inpaint")
                         pend[c] = []
             if need_fad:
                 _fad_add(f_full, fad_embedder.embed(wav.view(1, 1, -1), sr))
-                _fad_add(f_seg, fad_embedder.embed(seg.reshape(1, 1, -1), sr))
+                for seg in segs:
+                    _fad_add(f_seg, fad_embedder.embed(seg.reshape(1, 1, -1), sr))
         per, cov = {}, {}
         if measure and frame_active:
             for _r, _s in enumerate(dist_all_gather_object(
@@ -2447,22 +2469,23 @@ def evaluate_inpainting(
         return named, cov_named
 
     blocks, report = [], {}
-    for w, (lo, hi) in enumerate(thirds):
-        name = INPAINT_WINDOWS[w]
-        lat_c, lat_u = _generate(lo, hi, conditioned=True)
+    for w, (name, spans) in enumerate(windows.items()):
+        lat_c, lat_u = _generate(spans, conditioned=True)
         if need_null and lat_u is None:
-            lat_u = _generate(lo, hi, conditioned=False)[0]
+            lat_u = _generate(spans, conditioned=False)[0]
         per_c, cov_c, gs_c, fad_full_c, fad_seg_c = _measure(
-            lat_c, lo, hi, scoring, fad_on, f"inpaint {name}: decode + measure")
+            lat_c, spans, scoring, fad_on, f"inpaint {name}: decode + measure")
         per_n, gs_n, fad_full_u, fad_seg_u = {}, {}, None, None
         if lat_u is not None:
             per_n, _cv, gs_n, fad_full_u, fad_seg_u = _measure(
-                lat_u, lo, hi, scoring, fad_on and compute_uncond,
+                lat_u, spans, scoring, fad_on and compute_uncond,
                 f"inpaint {name}: decode + measure (no conditions)")
-        lat_m = dist_codec_metrics([lat_c[j][lo:hi] for j in sorted(lat_c)],
+        lat_m = dist_codec_metrics([inpaint_frames(lat_c[j], spans)
+                                    for j in sorted(lat_c)],
                                    ref["lat"][w], metrics_enabled, device, di) \
             if want_lat and ref["lat"][w] is not None else {}
-        lat_mu = (dist_codec_metrics([lat_u[j][lo:hi] for j in sorted(lat_u)],
+        lat_mu = (dist_codec_metrics([inpaint_frames(lat_u[j], spans)
+                                      for j in sorted(lat_u)],
                                      ref["lat"][w], metrics_enabled, device, di)
                   if want_lat and compute_uncond and lat_u is not None
                   and ref["lat"][w] is not None else {})
@@ -2472,8 +2495,8 @@ def evaluate_inpainting(
             if tuple(_names) == tuple(frame_dims or {}):
                 entries.append((_lab, None))
                 continue
-            _ls = _generate(lo, hi, conditioned=True, subset=set(_names))[0]
-            _p, _cv, _g, _, _ = _measure(_ls, lo, hi, True, False,
+            _ls = _generate(spans, conditioned=True, subset=set(_names))[0]
+            _p, _cv, _g, _, _ = _measure(_ls, spans, True, False,
                                          f"inpaint {name}: subset {_lab}")
             entries.append((_lab, (_p, _cv, _g)))
             del _ls
@@ -2536,7 +2559,9 @@ def evaluate_inpainting(
                         writer.add_scalar(f"{_mi}/{_c.capitalize()}_{_k}_cond{sfx}",
                                           _v, step)
 
-        head = f"**Inpainting {name} · {lo / fps:.2f}-{hi / fps:.2f} s**"
+        head = (f"**Inpainting {name} · "
+                + " + ".join(f"{lo / fps:.2f}-{hi / fps:.2f}" for lo, hi in spans)
+                + " s**")
         if inf_named and entries:
             tables = []
             for _lab, _res in entries:
@@ -2563,7 +2588,7 @@ def evaluate_inpainting(
               f"KL(gen||real): {_f(vals['kl_cond_gr'])} | "
               f"FAD full: {_f(vals['fad_full_cond'])} | "
               f"FAD inpaint: {_f(vals['fad_inpaint_cond'])}")
-        report[name] = dict(vals, frames=[lo, hi], influence=inf_named,
+        report[name] = dict(vals, frames=spans, influence=inf_named,
                             influence_coverage=cov_named)
     md = None
     if is_main and blocks:
@@ -4425,16 +4450,17 @@ if __name__ == "__main__":
             f"(noise end), the last at t={_grid[-1][0]:.3f}")
     IP_PROBS = inpaint_mask_probs(cfg.training) if INPAINTING else None
     INPAINT_ONLY = INPAINTING and IP_PROBS[0] == 0.0
-    IP_THIRDS = inpaint_thirds(n_frames)
+    IP_WINDOWS = inpaint_windows(cfg.sampling, n_frames) if INPAINTING else {}
     if INPAINTING:
         _fps = lc.active().frames_per_s
         print(f"Inpainting training: masks full / 1-"
               f"{INPAINT_MAX_SPANS} spans / continuation / backward continuation "
               f"= {IP_PROBS[0]:g} / {IP_PROBS[1]:g} / {IP_PROBS[2]:g} / "
               f"{IP_PROBS[3]:g} | Train/Loss = "
-              f"Loss_generated + Loss_context | validation thirds "
-              + ", ".join(f"{w} {lo / _fps:.2f}-{hi / _fps:.2f} s"
-                          for w, (lo, hi) in zip(INPAINT_WINDOWS, IP_THIRDS))
+              f"Loss_generated + Loss_context | validation windows "
+              + ", ".join(f"{w} " + " + ".join(f"{lo / _fps:.2f}-{hi / _fps:.2f}"
+                                               for lo, hi in spans) + " s"
+                          for w, spans in IP_WINDOWS.items())
               + (" | inpainting only: no full-mask Validation/Loss, no best "
                  "checkpoint, no generation from scratch in the panels"
                  if INPAINT_ONLY else ""))
@@ -4549,8 +4575,8 @@ if __name__ == "__main__":
                     val_loss_sum = 0.0
                     ema_val_loss_sum = 0.0
                     val_sample_count = 0
-                    ip_sum = [0.0] * len(INPAINT_WINDOWS)
-                    ip_ema_sum = [0.0] * len(INPAINT_WINDOWS)
+                    ip_sum = [0.0] * len(IP_WINDOWS)
+                    ip_ema_sum = [0.0] * len(IP_WINDOWS)
                     ema_active = (cfg.training.use_ema
                                   and step >= cfg.training.ema_start)
                     for _vbi, (vb, (fixed_x0, fixed_t)) in enumerate(zip(
@@ -4559,10 +4585,10 @@ if __name__ == "__main__":
                             continue
                         batch_sample_count = int(vb[0].shape[0])
                         if INPAINTING:
-                            for _w, (_lo, _hi) in enumerate(IP_THIRDS):
+                            for _w, _spans in enumerate(IP_WINDOWS.values()):
                                 _keep = inpaint_keep_window(
                                     batch_sample_count, int(vb[0].shape[1]),
-                                    _lo, _hi)
+                                    _spans)
                                 for _net, _acc in ([(model, ip_sum)]
                                                    + ([(ema.model, ip_ema_sum)]
                                                       if ema_active else [])):
@@ -4617,7 +4643,7 @@ if __name__ == "__main__":
                             ema_val_loss_sum += evl * batch_sample_count
 
                     if DIST.enabled and INPAINTING:
-                        _n_ip = len(INPAINT_WINDOWS)
+                        _n_ip = len(IP_WINDOWS)
                         _all = dist_sum([val_loss_sum, ema_val_loss_sum,
                                          val_sample_count] + ip_sum + ip_ema_sum,
                                         DIST)
@@ -4637,7 +4663,7 @@ if __name__ == "__main__":
                     ip_val = [s / val_sample_count for s in ip_sum]
                     ip_ema_val = [s / val_sample_count for s in ip_ema_sum]
                     if INPAINTING:
-                        for _w, _name in enumerate(INPAINT_WINDOWS):
+                        for _w, _name in enumerate(IP_WINDOWS):
                             writer.add_scalar(f"Validation/Loss_inpaint_{_name}",
                                               ip_val[_w], step)
                             if ema_active:
